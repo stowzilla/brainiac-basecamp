@@ -1,0 +1,56 @@
+plugins:
+  - rubocop-performance
+
+AllCops:
+  TargetRubyVersion: 3.4
+  NewCops: enable
+  SuggestExtensions: false
+  Exclude:
+    - "vendor/**/*"
+    - "tmp/**/*"
+
+Metrics/MethodLength:
+  Max: 75
+
+Metrics/AbcSize:
+  Max: 90
+
+Metrics/ModuleLength:
+  Max: 600
+
+Metrics/ParameterLists:
+  Max: 10
+  CountKeywordArgs: false
+
+Metrics/BlockLength:
+  Exclude:
+    - "test/**/*"
+    - "*.gemspec"
+
+Style/TopLevelMethodDefinition:
+  Enabled: false
+
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
+
+Style/FrozenStringLiteralComment:
+  Enabled: false
+
+Style/ClassAndModuleChildren:
+  Enabled: false
+
+Style/Documentation:
+  Enabled: false
+
+Gemspec/DevelopmentDependencies:
+  Enabled: false
+
+Layout/LineLength:
+  Max: 150
+
+Naming/PredicateMethod:
+  Enabled: false
+
+Naming/FileName:
+  Exclude:
+    - "lib/brainiac/plugins/**/*"
