@@ -267,15 +267,15 @@ module Brainiac
           end
 
           # Resolve a Fizzy user ID from their display name.
-          # Caches the user list for the session.
+          # Reads from ~/.brainiac/fizzy.json authorized_users list.
           def resolve_fizzy_user_id(name)
             @fizzy_users ||= begin
-              stdout, _stderr, status = Open3.capture3("fizzy", "user", "list", "--quiet")
-              if status.success?
-                JSON.parse(stdout).each_with_object({}) { |u, h| h[u["name"].downcase] = u["id"] }
-              else
-                {}
-              end
+              fizzy_config_file = File.join(BRAINIAC_DIR, "fizzy.json")
+              return {} unless File.exist?(fizzy_config_file)
+
+              config = JSON.parse(File.read(fizzy_config_file))
+              users = config["authorized_users"] || []
+              users.each_with_object({}) { |u, h| h[u["name"].downcase] = u["id"] }
             rescue StandardError
               {}
             end
