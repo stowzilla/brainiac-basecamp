@@ -17,9 +17,14 @@ module Brainiac
           "bot_accounts" => {},
           "project_mappings" => {},
           "epic_prefix" => "Epic:",
-          "subtask_card_pattern" => '#(\d+)',
-          "subtask_depends_pattern" => '\[depends:([\d,]+)\]',
-          "webhook_secret" => nil
+          "fizzy_org" => nil,
+          "review_gate" => "on_complete",
+          "notifications" => {
+            "epic_started" => true,
+            "task_dispatched" => true,
+            "task_completed" => true,
+            "epic_completed" => true
+          }
         }.freeze
 
         class << self
@@ -76,11 +81,25 @@ module Brainiac
             end&.first
           end
 
-          # The prefix used to identify epic todos (e.g. "Epic: My Feature")
+          # The prefix used to identify epic todolists (e.g. "Epic: My Feature")
           #
           # @return [String]
           def epic_prefix
             current["epic_prefix"] || "Epic:"
+          end
+
+          # The Fizzy organization slug (for building card URLs).
+          #
+          # @return [String, nil]
+          def fizzy_org
+            current["fizzy_org"]
+          end
+
+          # Review gate mode: "on_complete" (advance immediately) or "on_pr_merge" (wait for merge).
+          #
+          # @return [String]
+          def review_gate
+            current["review_gate"] || "on_complete"
           end
 
           private

@@ -4,9 +4,11 @@ require_relative "test_helper"
 require_relative "../lib/brainiac/plugins/basecamp/epic"
 
 class TestEpicParser < Minitest::Test
+  # --- Title parsing ---
+
   def test_extract_fizzy_card_hash_format
-    subtasks = [{ "id" => 1, "title" => "#1234 — Build user auth", "completed" => false }]
-    tasks = Brainiac::Plugins::Basecamp::Epic.parse_subtasks(subtasks)
+    todos = [{ "id" => 1, "title" => "#1234 — Build user auth", "completed" => false }]
+    tasks = Brainiac::Plugins::Basecamp::Epic.parse_todos(todos)
 
     assert_equal 1, tasks.size
     assert_equal 1234, tasks.first.fizzy_card
@@ -14,79 +16,119 @@ class TestEpicParser < Minitest::Test
   end
 
   def test_extract_fizzy_card_fizzy_format
-    subtasks = [{ "id" => 2, "title" => "Fizzy 5678", "completed" => false }]
-    tasks = Brainiac::Plugins::Basecamp::Epic.parse_subtasks(subtasks)
+    todos = [{ "id" => 2, "title" => "Fizzy 5678", "completed" => false }]
+    tasks = Brainiac::Plugins::Basecamp::Epic.parse_todos(todos)
 
     assert_equal 5678, tasks.first.fizzy_card
   end
 
-  def test_extract_dependencies
-    subtasks = [{ "id" => 3, "title" => "#1236 — Frontend [depends:1234,1235]", "completed" => false }]
-    tasks = Brainiac::Plugins::Basecamp::Epic.parse_subtasks(subtasks)
+  def test_extract_fizzy_card_from_description_link
+    todos = [{
+      "id" => 3,
+      "title" => "Build auth system",
+      "description" => '<a href="https://app.fizzy.do/stowzilla/cards/1234">Fizzy #1234</a>',
+      "completed" => false
+    }]
+    tasks = Brainiac::Plugins::Basecamp::Epic.parse_todos(todos)
+
+    assert_equal 1234, tasks.first.fizzy_card
+  end
+
+  def test_extract_dependencies_from_title
+    todos = [{ "id" => 3, "title" => "#1236 — Frontend [depends:1234,1235]", "completed" => false }]
+    tasks = Brainiac::Plugins::Basecamp::Epic.parse_todos(todos)
+
+    assert_equal [1234, 1235], tasks.first.depends_on
+  end
+
+  def test_extract_dependencies_from_description
+    todos = [{
+      "id" => 4,
+      "title" => "#1236 — Frontend",
+      "description" => '<div><strong>Depends on:</strong> #1234, #1235</div>',
+      "completed" => false
+    }]
+    tasks = Brainiac::Plugins::Basecamp::Epic.parse_todos(todos)
 
     assert_equal [1234, 1235], tasks.first.depends_on
   end
 
   def test_no_dependencies_returns_empty_array
-    subtasks = [{ "id" => 4, "title" => "#1234 — Simple task", "completed" => false }]
-    tasks = Brainiac::Plugins::Basecamp::Epic.parse_subtasks(subtasks)
+    todos = [{ "id" => 4, "title" => "#1234 — Simple task", "completed" => false }]
+    tasks = Brainiac::Plugins::Basecamp::Epic.parse_todos(todos)
 
     assert_equal [], tasks.first.depends_on
   end
 
-  def test_completed_subtask_has_complete_status
-    subtasks = [{ "id" => 5, "title" => "#1234", "completed" => true }]
-    tasks = Brainiac::Plugins::Basecamp::Epic.parse_subtasks(subtasks)
+  def test_completed_todo_has_complete_status
+    todos = [{ "id" => 5, "title" => "#1234", "completed" => true }]
+    tasks = Brainiac::Plugins::Basecamp::Epic.parse_todos(todos)
 
     assert_equal :complete, tasks.first.status
   end
 
+  # --- Dependency resolution ---
+
   def test_unblocked_tasks_no_deps
-    subtasks = [
+    todos = [
       { "id" => 1, "title" => "#1234", "completed" => false },
       { "id" => 2, "title" => "#1235", "completed" => false }
     ]
-    tasks = Brainiac::Plugins::Basecamp::Epic.parse_subtasks(subtasks)
+    tasks = Brainiac::Plugins::Basecamp::Epic.parse_todos(todos)
     unblocked = Brainiac::Plugins::Basecamp::Epic.unblocked_tasks(tasks)
 
     assert_equal 2, unblocked.size
   end
 
   def test_unblocked_tasks_with_deps
-    subtasks = [
+    todos = [
       { "id" => 1, "title" => "#1234", "completed" => true },
       { "id" => 2, "title" => "#1235 [depends:1234]", "completed" => false },
       { "id" => 3, "title" => "#1236 [depends:1234,1235]", "completed" => false }
     ]
-    tasks = Brainiac::Plugins::Basecamp::Epic.parse_subtasks(subtasks)
+    tasks = Brainiac::Plugins::Basecamp::Epic.parse_todos(todos)
     unblocked = Brainiac::Plugins::Basecamp::Epic.unblocked_tasks(tasks)
 
-    # Only #1235 is unblocked (#1234 is complete, so its dep is satisfied)
-    # #1236 depends on both 1234 (complete) and 1235 (pending) — still blocked
+    # Only #1235 is unblocked (1234 is complete, satisfying its dep)
+    # #1236 depends on 1234 (complete) and 1235 (pending) — still blocked
     assert_equal 1, unblocked.size
     assert_equal 1235, unblocked.first.fizzy_card
   end
 
   def test_unblocked_tasks_all_deps_complete
-    subtasks = [
+    todos = [
       { "id" => 1, "title" => "#1234", "completed" => true },
       { "id" => 2, "title" => "#1235", "completed" => true },
       { "id" => 3, "title" => "#1236 [depends:1234,1235]", "completed" => false }
     ]
-    tasks = Brainiac::Plugins::Basecamp::Epic.parse_subtasks(subtasks)
+    tasks = Brainiac::Plugins::Basecamp::Epic.parse_todos(todos)
     unblocked = Brainiac::Plugins::Basecamp::Epic.unblocked_tasks(tasks)
 
     assert_equal 1, unblocked.size
     assert_equal 1236, unblocked.first.fizzy_card
   end
 
+  def test_unblocked_skips_tasks_without_fizzy_card
+    todos = [
+      { "id" => 1, "title" => "No card ref", "completed" => false },
+      { "id" => 2, "title" => "#1234", "completed" => false }
+    ]
+    tasks = Brainiac::Plugins::Basecamp::Epic.parse_todos(todos)
+    unblocked = Brainiac::Plugins::Basecamp::Epic.unblocked_tasks(tasks)
+
+    assert_equal 1, unblocked.size
+    assert_equal 1234, unblocked.first.fizzy_card
+  end
+
+  # --- Dependency graph ---
+
   def test_dependency_graph_summary
-    subtasks = [
+    todos = [
       { "id" => 1, "title" => "#1234", "completed" => true },
       { "id" => 2, "title" => "#1235 [depends:1234]", "completed" => false },
       { "id" => 3, "title" => "#1236 [depends:1234,1235]", "completed" => false }
     ]
-    tasks = Brainiac::Plugins::Basecamp::Epic.parse_subtasks(subtasks)
+    tasks = Brainiac::Plugins::Basecamp::Epic.parse_todos(todos)
     graph = Brainiac::Plugins::Basecamp::Epic.dependency_graph(tasks)
 
     assert_equal 3, graph[:total]
@@ -96,23 +138,65 @@ class TestEpicParser < Minitest::Test
     assert_equal 1, graph[:blocked]
   end
 
-  def test_no_fizzy_card_in_title
-    subtasks = [{ "id" => 1, "title" => "Some random task", "completed" => false }]
-    tasks = Brainiac::Plugins::Basecamp::Epic.parse_subtasks(subtasks)
+  # --- Description builder ---
 
-    assert_nil tasks.first.fizzy_card
+  def test_build_todo_description_with_deps
+    html = Brainiac::Plugins::Basecamp::Epic.build_todo_description(
+      fizzy_card: 1234,
+      fizzy_org: "stowzilla",
+      depends_on: [1230, 1232],
+      agent: "Sherlock"
+    )
+
+    assert_includes html, 'href="https://app.fizzy.do/stowzilla/cards/1234"'
+    assert_includes html, "#1234"
+    assert_includes html, 'href="https://app.fizzy.do/stowzilla/cards/1230"'
+    assert_includes html, 'href="https://app.fizzy.do/stowzilla/cards/1232"'
+    assert_includes html, "Sherlock"
+    assert_includes html, "Depends on:"
   end
 
-  def test_unblocked_skips_tasks_without_fizzy_card
-    subtasks = [
-      { "id" => 1, "title" => "No card ref", "completed" => false },
-      { "id" => 2, "title" => "#1234", "completed" => false }
-    ]
-    tasks = Brainiac::Plugins::Basecamp::Epic.parse_subtasks(subtasks)
-    unblocked = Brainiac::Plugins::Basecamp::Epic.unblocked_tasks(tasks)
+  def test_build_todo_description_no_deps
+    html = Brainiac::Plugins::Basecamp::Epic.build_todo_description(
+      fizzy_card: 5678,
+      fizzy_org: "myorg"
+    )
 
-    # Only #1234 should be unblocked (the other has no fizzy_card)
-    assert_equal 1, unblocked.size
-    assert_equal 1234, unblocked.first.fizzy_card
+    assert_includes html, 'href="https://app.fizzy.do/myorg/cards/5678"'
+    assert_includes html, "Depends on:</strong> none"
+    refute_includes html, "Agent:"
+  end
+
+  # --- Assignees and metadata ---
+
+  def test_parses_assignees
+    todos = [{
+      "id" => 1,
+      "title" => "#1234",
+      "completed" => false,
+      "assignees" => [{ "id" => 100, "name" => "Andy" }]
+    }]
+    tasks = Brainiac::Plugins::Basecamp::Epic.parse_todos(todos)
+
+    assert_equal ["Andy"], tasks.first.assignees
+  end
+
+  def test_parses_due_on
+    todos = [{
+      "id" => 1,
+      "title" => "#1234",
+      "completed" => false,
+      "due_on" => "2026-09-01"
+    }]
+    tasks = Brainiac::Plugins::Basecamp::Epic.parse_todos(todos)
+
+    assert_equal "2026-09-01", tasks.first.due_on
+  end
+
+  def test_no_fizzy_card_in_title_or_description
+    todos = [{ "id" => 1, "title" => "Some random task", "completed" => false }]
+    tasks = Brainiac::Plugins::Basecamp::Epic.parse_todos(todos)
+
+    assert_nil tasks.first.fizzy_card
   end
 end

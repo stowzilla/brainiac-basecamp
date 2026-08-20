@@ -7,24 +7,28 @@ module Brainiac
   module Plugins
     module Basecamp
       # Manages active epic execution state.
+      #
+      # An epic = a Basecamp todolist where each todo is linked to a Fizzy card.
+      # The orchestrator drives execution: reads the todolist, builds the dep graph,
+      # assigns unblocked Fizzy cards, and advances state as cards complete.
+      #
       # State is persisted to ~/.brainiac/basecamp_epics.json.
       module Orchestrator
         BRAINIAC_DIR = ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac"))
         EPICS_FILE = File.join(BRAINIAC_DIR, "basecamp_epics.json")
 
         class << self
-          # Start orchestrating an epic.
-          # Called when a todo assignment webhook is received for a bot account.
+          # Start orchestrating an epic from a todolist.
           #
-          # @param todo_id [String, Integer] Basecamp todo ID
+          # @param todolist_id [String, Integer] Basecamp todolist ID
           # @param project_id [String, Integer] Basecamp project/bucket ID
           # @param agent [String] Agent name to orchestrate
-          # @param title [String] Epic title
+          # @param title [String] Epic/todolist title
           # @return [Hash] The created epic run state
-          def start_epic(todo_id:, project_id:, agent:, title:)
+          def start_epic(todolist_id:, project_id:, agent:, title:)
             epic = {
-              "id" => "epic-#{todo_id}",
-              "basecamp_todo_id" => todo_id.to_s,
+              "id" => "epic-#{todolist_id}",
+              "basecamp_todolist_id" => todolist_id.to_s,
               "basecamp_project_id" => project_id.to_s,
               "agent" => agent,
               "title" => title,
@@ -38,12 +42,34 @@ module Brainiac
             save_epic(epic)
             log_event(epic, "started", "Epic orchestration started by #{agent}")
 
-            LOG.info "[Basecamp:Orchestrator] Started epic '#{title}' (todo #{todo_id}) with agent #{agent}" if defined?(LOG)
+            LOG.info "[Basecamp:Orchestrator] Started epic '#{title}' (todolist #{todolist_id}) with agent #{agent}" if defined?(LOG)
 
-            # Initial task resolution
+            # Initial task resolution — read the todolist and dispatch unblocked work
             resolve_and_dispatch(epic)
 
+            save_epic(epic)
             epic
+          end
+
+          # Start an epic from a single "trigger" todo that contains the todolist context.
+          # This is the webhook entry point — a todo is assigned to the bot account,
+          # and its parent todolist becomes the epic.
+          #
+          # @param todo_id [String, Integer] The trigger todo ID
+          # @param todolist_id [String, Integer] Parent todolist ID
+          # @param project_id [String, Integer] Basecamp project/bucket ID
+          # @param agent [String] Agent name
+          # @param title [String] Todolist title
+          # @return [Hash] The created epic run state
+          def start_epic_from_todo(todo_id:, todolist_id:, project_id:, agent:, title:)
+            # Check if this epic is already running
+            existing = find_epic_by_todolist(todolist_id)
+            if existing && existing["status"] == "active"
+              LOG.info "[Basecamp:Orchestrator] Epic for todolist #{todolist_id} already active, skipping" if defined?(LOG)
+              return existing
+            end
+
+            start_epic(todolist_id: todolist_id, project_id: project_id, agent: agent, title: title)
           end
 
           # Called when an agent completes a Fizzy card session.
@@ -67,14 +93,17 @@ module Brainiac
               log_event(epic, "task_completed", "Card ##{card_number} completed")
             end
 
-            # Mark the corresponding Basecamp subtask as complete
-            mark_subtask_complete(epic, card_number)
+            # Mark the corresponding Basecamp todo as complete
+            mark_todo_complete(epic, card_number)
+
+            # Post a status comment on the Basecamp todo
+            post_completion_comment(epic, card_number)
 
             # Check if epic is fully done
             if epic["tasks"].all? { |t| t["status"] == "complete" }
               complete_epic(epic)
             else
-              # Dispatch next unblocked tasks
+              # Re-read todolist (it may have changed) and dispatch next unblocked tasks
               resolve_and_dispatch(epic)
             end
 
@@ -91,6 +120,14 @@ module Brainiac
               epic["status"] == "active" &&
                 epic["tasks"].any? { |t| t["fizzy_card"] == card_number.to_i }
             end
+          end
+
+          # Find an epic by its todolist ID.
+          #
+          # @param todolist_id [String, Integer] Basecamp todolist ID
+          # @return [Hash, nil]
+          def find_epic_by_todolist(todolist_id)
+            load_epics.find { |e| e["basecamp_todolist_id"] == todolist_id.to_s }
           end
 
           # Get all active epics.
@@ -117,41 +154,56 @@ module Brainiac
 
           private
 
-          # Resolve current subtask state from Basecamp and dispatch unblocked cards.
+          # Resolve current todolist state from Basecamp and dispatch unblocked cards.
           def resolve_and_dispatch(epic)
-            # Fetch subtasks from Basecamp
-            subtasks = fetch_subtasks(epic)
-            return unless subtasks
+            todos = fetch_todos(epic)
+            return unless todos
 
             # Parse into structured tasks
-            tasks = Epic.parse_subtasks(subtasks)
+            tasks = Epic.parse_todos(todos)
 
-            # Update epic state with current task info
+            # Update epic state with current task info, preserving in-flight status
             epic["tasks"] = tasks.map do |task|
               existing = epic["tasks"].find { |t| t["fizzy_card"] == task.fizzy_card }
+              status = if task.completed
+                         "complete"
+                       elsif existing&.dig("status") == "in_flight"
+                         "in_flight"
+                       else
+                         "pending"
+                       end
+
               {
-                "step_id" => task.step_id,
+                "todo_id" => task.todo_id,
                 "fizzy_card" => task.fizzy_card,
                 "title" => task.title,
                 "depends_on" => task.depends_on,
-                "status" => task.completed ? "complete" : (existing&.dig("status") || "pending"),
-                "completed_at" => task.completed ? (existing&.dig("completed_at") || Time.now.iso8601) : nil
+                "status" => status,
+                "completed_at" => task.completed ? (existing&.dig("completed_at") || Time.now.iso8601) : nil,
+                "assignees" => task.assignees,
+                "due_on" => task.due_on
               }
             end
 
-            # Find unblocked tasks that aren't already in-flight
+            # Find unblocked tasks that aren't already in-flight or complete
             unblocked = Epic.unblocked_tasks(tasks)
-            in_flight = epic["tasks"].select { |t| t["status"] == "in_flight" }.map { |t| t["fizzy_card"] }
+            in_flight_cards = epic["tasks"].select { |t| t["status"] == "in_flight" }.map { |t| t["fizzy_card"] }
+            complete_cards = epic["tasks"].select { |t| t["status"] == "complete" }.map { |t| t["fizzy_card"] }
 
-            ready_to_dispatch = unblocked.reject { |t| in_flight.include?(t.fizzy_card) }
+            ready_to_dispatch = unblocked.reject { |t| in_flight_cards.include?(t.fizzy_card) || complete_cards.include?(t.fizzy_card) }
 
             ready_to_dispatch.each do |task|
               dispatch_card(epic, task)
             end
+
+            # Log summary
+            LOG.info "[Basecamp:Orchestrator] Epic '#{epic['title']}': " \
+                     "#{epic['tasks'].count { |t| t['status'] == 'complete' }}/#{epic['tasks'].size} complete, " \
+                     "#{ready_to_dispatch.size} dispatched, " \
+                     "#{epic['tasks'].count { |t| t['status'] == 'in_flight' }} in-flight" if defined?(LOG)
           end
 
           # Dispatch a Fizzy card to the appropriate agent.
-          # This assigns the card in Fizzy, which triggers the normal Fizzy webhook flow.
           def dispatch_card(epic, task)
             card_number = task.fizzy_card
             agent = epic["agent"]
@@ -160,38 +212,61 @@ module Brainiac
 
             # Mark as in-flight in our state
             epic_task = epic["tasks"].find { |t| t["fizzy_card"] == card_number }
-            epic_task["status"] = "in_flight" if epic_task
+            if epic_task
+              epic_task["status"] = "in_flight"
+              epic_task["dispatched_at"] = Time.now.iso8601
+            end
             epic["updated_at"] = Time.now.iso8601
 
             log_event(epic, "dispatched", "Card ##{card_number} dispatched to #{agent}")
 
-            # Assign the card in Fizzy via CLI
-            # The Fizzy webhook will handle actual agent dispatch
+            # Assign the card in Fizzy via CLI — this triggers the normal Fizzy webhook flow
             assign_fizzy_card(card_number, agent)
+
+            # Post a comment on the Basecamp todo
+            if epic_task && epic_task["todo_id"]
+              Client.run_safe(
+                "comments", "create", epic_task["todo_id"].to_s,
+                "🚀 Dispatched to **#{agent}** via Brainiac",
+                "--in", epic["basecamp_project_id"], "--json"
+              )
+            end
           end
 
-          # Assign a Fizzy card to an agent.
-          # This triggers the normal Fizzy assignment webhook flow.
+          # Assign a Fizzy card to an agent via Fizzy CLI.
           def assign_fizzy_card(card_number, agent)
-            # Look up the agent's Fizzy name from the registry
             agent_config = load_agent_registry[agent.downcase]
             fizzy_name = agent_config&.dig("fizzy_name") || agent
 
-            # Use Fizzy CLI to assign the card
-            system("fizzy", "card", "assign", card_number.to_s, "--to", fizzy_name,
-                   out: File::NULL, err: File::NULL)
-          rescue StandardError => e
-            LOG.error "[Basecamp:Orchestrator] Failed to assign Fizzy card ##{card_number}: #{e.message}" if defined?(LOG)
+            stdout, stderr, status = Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--to", fizzy_name)
+
+            if status.success?
+              LOG.info "[Basecamp:Orchestrator] Assigned Fizzy ##{card_number} to #{fizzy_name}" if defined?(LOG)
+            else
+              LOG.error "[Basecamp:Orchestrator] Failed to assign Fizzy ##{card_number}: #{stderr.strip}" if defined?(LOG)
+            end
+          rescue Errno::ENOENT => e
+            LOG.error "[Basecamp:Orchestrator] fizzy CLI not found: #{e.message}" if defined?(LOG)
           end
 
-          # Mark a Basecamp subtask as complete.
-          def mark_subtask_complete(epic, card_number)
+          # Mark a Basecamp todo as complete.
+          def mark_todo_complete(epic, card_number)
             task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
-            return unless task && task["step_id"]
+            return unless task && task["todo_id"]
 
-            Client.complete_subtask(task["step_id"], project: epic["basecamp_project_id"])
-          rescue ClientError => e
-            LOG.warn "[Basecamp:Orchestrator] Failed to complete subtask for card ##{card_number}: #{e.message}" if defined?(LOG)
+            Client.run_safe("todos", "complete", task["todo_id"].to_s, "--json")
+          end
+
+          # Post a completion comment on the Basecamp todo.
+          def post_completion_comment(epic, card_number)
+            task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
+            return unless task && task["todo_id"]
+
+            Client.run_safe(
+              "comments", "create", task["todo_id"].to_s,
+              "✅ Fizzy card ##{card_number} completed",
+              "--in", epic["basecamp_project_id"], "--json"
+            )
           end
 
           # Complete the entire epic.
@@ -203,12 +278,13 @@ module Brainiac
 
             LOG.info "[Basecamp:Orchestrator] Epic '#{epic['title']}' completed!" if defined?(LOG)
 
-            # Complete the parent todo in Basecamp
-            Client.complete_todo(epic["basecamp_todo_id"])
-
-            # Post a summary comment
+            # Post a summary comment on the todolist
             summary = build_completion_summary(epic)
-            Client.add_comment(epic["basecamp_todo_id"], summary, project: epic["basecamp_project_id"])
+            # Post as a message in the project (todolists don't have comments directly)
+            Client.run_safe(
+              "messages", "create", "Epic Complete: #{epic['title']}", summary,
+              "--in", epic["basecamp_project_id"], "--json"
+            )
 
             # Emit notification for Discord
             if defined?(Brainiac) && Brainiac.respond_to?(:emit)
@@ -218,43 +294,28 @@ module Brainiac
                             message: "🎉 Epic completed: **#{epic['title']}** (#{epic['tasks'].size} tasks)",
                             agent: epic["agent"])
             end
-          rescue ClientError => e
-            LOG.warn "[Basecamp:Orchestrator] Failed to finalize epic in Basecamp: #{e.message}" if defined?(LOG)
           end
 
-          # Fetch subtasks for an epic's todo from Basecamp.
-          def fetch_subtasks(epic)
-            # First try to get the todo with steps
+          # Fetch todos from the epic's todolist.
+          def fetch_todos(epic)
             result = Client.run_safe(
-              "api", "get",
-              "/buckets/#{epic['basecamp_project_id']}/card_tables/cards/#{epic['basecamp_todo_id']}/steps.json",
-              "--json"
+              "todos", "list", "--in", epic["basecamp_project_id"],
+              "--list", epic["basecamp_todolist_id"], "--json"
             )
 
-            # The result may be in data array
-            if result.is_a?(Hash) && result["data"]
-              result["data"]
+            return nil unless result
+
+            # Handle both envelope format and raw array
+            if result.is_a?(Hash)
+              result["data"] || []
             elsif result.is_a?(Array)
               result
             else
-              # Fallback: get recordings of type Step filtered by parent
-              all_steps = Client.run_safe(
-                "recordings", "list",
-                "--in", epic["basecamp_project_id"],
-                "--type", "Kanban::Step", "--all", "--json"
-              )
-
-              return nil unless all_steps
-
-              data = all_steps.is_a?(Hash) ? (all_steps["data"] || []) : all_steps
-              data.select { |s| s.dig("parent", "id").to_s == epic["basecamp_todo_id"] }
+              nil
             end
-          rescue ClientError => e
-            LOG.error "[Basecamp:Orchestrator] Failed to fetch subtasks: #{e.message}" if defined?(LOG)
-            nil
           end
 
-          # Build a completion summary for the epic comment.
+          # Build a completion summary for the epic.
           def build_completion_summary(epic)
             tasks = epic["tasks"]
             duration = if epic["started_at"] && epic["completed_at"]
@@ -264,13 +325,14 @@ module Brainiac
                          hours > 24 ? "#{(hours / 24).round(1)} days" : "#{hours} hours"
                        end
 
-            lines = ["## Epic Complete ✅", ""]
-            lines << "**Duration:** #{duration}" if duration
-            lines << "**Tasks:** #{tasks.size} completed"
+            lines = []
+            lines << "All #{tasks.size} tasks completed#{duration ? " in #{duration}" : ''}."
             lines << ""
             tasks.each do |task|
-              lines << "- [x] #{task['title']} (Fizzy ##{task['fizzy_card']})"
+              lines << "- ✅ #{task['title']} (Fizzy ##{task['fizzy_card']})"
             end
+            lines << ""
+            lines << "Orchestrated by #{epic['agent']} via brainiac-basecamp."
             lines.join("\n")
           end
 

@@ -5,33 +5,51 @@ require "json"
 module Brainiac
   module Plugins
     module Basecamp
-      # Parses Basecamp todo subtasks to extract Fizzy card references and dependencies.
-      # Also manages the epic state (dependency graph, execution status).
+      # Parses Basecamp todolist-based epics.
+      #
+      # Epic structure (Option C):
+      #   Todolist: "Epic: Build Auth System"
+      #     Todo: "#1234 — Set up auth models"
+      #       Description: <a href="https://app.fizzy.do/org/cards/1234">Fizzy #1234</a>
+      #                    [depends:none] or [depends:1234,1235]
+      #     Todo: "#1235 — Add API endpoints"
+      #       Description: ...
+      #
+      # Each todo in the list = one work item linked to a Fizzy card.
+      # Dependencies are declared in the todo description or title.
       module Epic
-        # Represents a single task within an epic (one subtask → one Fizzy card).
-        Task = Struct.new(:step_id, :title, :fizzy_card, :depends_on, :status, :completed, keyword_init: true)
+        # Represents a single task within an epic (one todo → one Fizzy card).
+        Task = Struct.new(:todo_id, :title, :fizzy_card, :depends_on, :status, :completed,
+                          :description, :assignees, :due_on, keyword_init: true)
 
         class << self
-          # Parse subtask titles into a structured task list with dependency graph.
+          # Parse todos from a todolist into structured tasks with dependency graph.
           #
-          # @param subtasks [Array<Hash>] Raw subtask data from Basecamp API
+          # @param todos [Array<Hash>] Raw todo data from Basecamp API
           # @return [Array<Task>] Parsed tasks with card refs and dependencies
-          def parse_subtasks(subtasks)
-            subtasks.map do |subtask|
-              title = subtask["title"] || ""
-              step_id = subtask["id"]
-              completed = subtask["completed"] || false
+          def parse_todos(todos)
+            todos.map do |todo|
+              title = todo["title"] || todo["content"] || ""
+              description = todo["description"] || ""
+              todo_id = todo["id"]
+              completed = todo["completed"] || false
+              assignees = (todo["assignees"] || []).map { |a| a["name"] || a["id"].to_s }
+              due_on = todo["due_on"]
 
-              fizzy_card = extract_fizzy_card(title)
+              fizzy_card = extract_fizzy_card(title) || extract_fizzy_card_from_description(description)
               depends_on = extract_dependencies(title)
+              depends_on = extract_dependencies(description) if depends_on.empty?
 
               Task.new(
-                step_id: step_id,
+                todo_id: todo_id,
                 title: title,
                 fizzy_card: fizzy_card,
                 depends_on: depends_on,
                 status: completed ? :complete : :pending,
-                completed: completed
+                completed: completed,
+                description: description,
+                assignees: assignees,
+                due_on: due_on
               )
             end
           end
@@ -55,57 +73,125 @@ module Brainiac
           # @param tasks [Array<Task>] All tasks
           # @return [Hash] Graph structure for visualization/debugging
           def dependency_graph(tasks)
+            completed_cards = tasks.select { |t| t.status == :complete }.map(&:fizzy_card).compact
+
             {
               total: tasks.size,
               complete: tasks.count { |t| t.status == :complete },
               pending: tasks.count { |t| t.status == :pending },
-              blocked: tasks.count { |t| t.status == :pending && t.depends_on.any? { |dep| !tasks.any? { |ct| ct.fizzy_card == dep && ct.status == :complete } } },
+              in_flight: tasks.count { |t| t.status == :in_flight },
+              blocked: tasks.count do |t|
+                t.status == :pending &&
+                  t.depends_on.any? { |dep| !completed_cards.include?(dep) }
+              end,
               unblocked: unblocked_tasks(tasks).size,
               tasks: tasks.map do |t|
                 {
+                  todo_id: t.todo_id,
                   fizzy_card: t.fizzy_card,
+                  title: t.title,
                   status: t.status,
                   depends_on: t.depends_on,
-                  step_id: t.step_id
+                  assignees: t.assignees,
+                  due_on: t.due_on
                 }
               end
             }
           end
 
-          private
-
-          # Extract Fizzy card number from subtask title.
-          # Supports formats:
-          #   "Fizzy 1234"
-          #   "#1234 — Description"
-          #   "#1234"
+          # Generate a rich text HTML description for a todo linked to a Fizzy card.
           #
-          # @param title [String]
-          # @return [Integer, nil]
-          def extract_fizzy_card(title)
-            # Try "#NNNN" format first (more explicit)
-            if title.match?(/\A#(\d+)/)
-              return title.match(/\A#(\d+)/)[1].to_i
+          # @param fizzy_card [Integer] Fizzy card number
+          # @param fizzy_org [String] Fizzy organization slug (for URL)
+          # @param depends_on [Array<Integer>] Card numbers this task depends on
+          # @param agent [String, nil] Agent name assigned to this task
+          # @return [String] HTML description
+          def build_todo_description(fizzy_card:, fizzy_org:, depends_on: [], agent: nil)
+            lines = []
+            lines << "<div>"
+            lines << "<strong>Fizzy:</strong> <a href=\"https://app.fizzy.do/#{fizzy_org}/cards/#{fizzy_card}\">##{fizzy_card}</a><br>"
+
+            if depends_on.any?
+              dep_links = depends_on.map { |d| "<a href=\"https://app.fizzy.do/#{fizzy_org}/cards/#{d}\">##{d}</a>" }
+              lines << "<strong>Depends on:</strong> #{dep_links.join(', ')}<br>"
+            else
+              lines << "<strong>Depends on:</strong> none<br>"
             end
 
-            # Try "Fizzy NNNN" format
-            if title.match?(/Fizzy\s+(\d+)/i)
-              return title.match(/Fizzy\s+(\d+)/i)[1].to_i
+            lines << "<strong>Agent:</strong> #{agent}<br>" if agent
+            lines << "</div>"
+            lines.join("\n")
+          end
+
+          private
+
+          # Extract Fizzy card number from title.
+          # Supports formats:
+          #   "#1234 — Description"
+          #   "#1234"
+          #   "Fizzy 1234"
+          #   "Fizzy #1234"
+          #
+          # @param text [String]
+          # @return [Integer, nil]
+          def extract_fizzy_card(text)
+            # Try "#NNNN" format first (more explicit)
+            if (match = text.match(/\A#(\d+)/) || text.match(/#(\d+)/))
+              return match[1].to_i
+            end
+
+            # Try "Fizzy NNNN" or "Fizzy #NNNN" format
+            if (match = text.match(/Fizzy\s+#?(\d+)/i))
+              return match[1].to_i
             end
 
             nil
           end
 
-          # Extract dependency card numbers from subtask title.
-          # Supports: [depends:1234,1235]
+          # Extract Fizzy card from a rich text description (look for link to fizzy.do).
           #
-          # @param title [String]
-          # @return [Array<Integer>]
-          def extract_dependencies(title)
-            match = title.match(/\[depends:([\d,]+)\]/)
-            return [] unless match
+          # @param description [String] HTML description
+          # @return [Integer, nil]
+          def extract_fizzy_card_from_description(description)
+            return nil if description.nil? || description.empty?
 
-            match[1].split(",").map(&:strip).map(&:to_i)
+            # Look for fizzy.do card URLs
+            if (match = description.match(%r{app\.fizzy\.do/[^/]+/cards/(\d+)}))
+              return match[1].to_i
+            end
+
+            # Fallback: look for "#NNNN" in description text
+            if (match = description.match(/#(\d+)/))
+              return match[1].to_i
+            end
+
+            nil
+          end
+
+          # Extract dependency card numbers from text (title or description).
+          # Supports:
+          #   [depends:1234,1235]
+          #   Depends on: #1234, #1235
+          #   <strong>Depends on:</strong> #1234, #1235
+          #
+          # @param text [String]
+          # @return [Array<Integer>]
+          def extract_dependencies(text)
+            return [] if text.nil? || text.empty?
+
+            # Try [depends:N,N] format
+            if (match = text.match(/\[depends:([\d,]+)\]/))
+              return match[1].split(",").map(&:strip).map(&:to_i)
+            end
+
+            # Try "Depends on:" format (handles HTML tags around it)
+            # Strip HTML tags first for matching
+            stripped = text.gsub(/<[^>]+>/, "")
+            if (match = stripped.match(/Depends on:\s*((?:#\d+[\s,]*)+)/i))
+              return match[1].scan(/#(\d+)/).flatten.map(&:to_i)
+            end
+
+            []
           end
         end
       end

@@ -28,6 +28,8 @@ module Brainiac
               cmd_bot(args)
             when "projects"
               cmd_projects(args)
+            when "set"
+              cmd_set(args)
             else
               print_help
             end
@@ -63,8 +65,14 @@ module Brainiac
                 "bot_accounts" => {},
                 "project_mappings" => {},
                 "epic_prefix" => "Epic:",
-                "subtask_card_pattern" => '#(\d+)',
-                "subtask_depends_pattern" => '\[depends:([\d,]+)\]'
+                "fizzy_org" => nil,
+                "review_gate" => "on_complete",
+                "notifications" => {
+                  "epic_started" => true,
+                  "task_dispatched" => true,
+                  "task_completed" => true,
+                  "epic_completed" => true
+                }
               }
               File.write(CONFIG_FILE, JSON.pretty_generate(default_config))
               puts "✓ Created #{CONFIG_FILE}"
@@ -74,11 +82,12 @@ module Brainiac
 
             puts ""
             puts "Next steps:"
-            puts "  1. Add bot accounts:     brainiac basecamp bot add <name> <person-id> <agent>"
-            puts "  2. Map projects:         brainiac basecamp projects map <brainiac-key> <basecamp-id>"
-            puts "  3. Set up webhooks:      basecamp webhooks create \"https://your-ngrok/basecamp\" --types \"Todo,Todolist\" --in <project>"
-            puts "  4. Install the plugin:   brainiac install basecamp --path #{File.expand_path('..', __dir__).gsub('/brainiac/plugins', '')}"
-            puts "  5. Restart brainiac:     brainiac restart"
+            puts "  1. Set Fizzy org:        brainiac basecamp set fizzy-org <your-fizzy-org-slug>"
+            puts "  2. Add bot accounts:     brainiac basecamp bot add <name> <person-id> <agent>"
+            puts "  3. Map projects:         brainiac basecamp projects map <brainiac-key> <basecamp-id>"
+            puts "  4. Set review gate:      brainiac basecamp set review-gate <on_complete|on_pr_merge>"
+            puts "  5. Set up webhooks:      basecamp webhooks create \"https://your-ngrok/basecamp\" --types \"Todo,Todolist\" --in <project>"
+            puts "  6. Restart brainiac:     brainiac restart"
           end
 
           def cmd_config
@@ -308,10 +317,62 @@ module Brainiac
                 projects map <key> <basecamp-id>        Map a Brainiac project to Basecamp
                 projects list                           List project mappings
                 projects unmap <key>                    Remove a project mapping
+                set fizzy-org <slug>                    Set Fizzy organization slug (for card URLs)
+                set review-gate <mode>                  Set review gate (on_complete or on_pr_merge)
+                set epic-prefix <prefix>                Set epic todolist prefix (default: "Epic:")
 
               Config file: ~/.brainiac/basecamp.json
               Epics state: ~/.brainiac/basecamp_epics.json
+
+              Review gate modes:
+                on_complete   — Advance to next task as soon as agent finishes (default)
+                on_pr_merge   — Wait for PR to be merged before advancing (review gate)
             HELP
+          end
+
+          def cmd_set(args)
+            key = args.shift
+            value = args.shift
+
+            unless key && value
+              puts "Usage: brainiac basecamp set <key> <value>"
+              puts ""
+              puts "Keys:"
+              puts "  fizzy-org <slug>           Fizzy organization slug (for card URLs)"
+              puts "  review-gate <mode>         on_complete or on_pr_merge"
+              puts "  epic-prefix <prefix>       Todolist prefix for epic detection"
+              return
+            end
+
+            config = load_config
+
+            case key
+            when "fizzy-org"
+              config["fizzy_org"] = value
+              save_config(config)
+              puts "✓ Set fizzy_org = #{value}"
+              puts "  Card URLs will be: https://app.fizzy.do/#{value}/cards/NNNN"
+            when "review-gate"
+              unless %w[on_complete on_pr_merge].include?(value)
+                puts "Error: review-gate must be 'on_complete' or 'on_pr_merge'"
+                return
+              end
+              config["review_gate"] = value
+              save_config(config)
+              puts "✓ Set review_gate = #{value}"
+              if value == "on_pr_merge"
+                puts "  Epic tasks will wait for PR merge before advancing to next task"
+              else
+                puts "  Epic tasks advance immediately when agent completes"
+              end
+            when "epic-prefix"
+              config["epic_prefix"] = value
+              save_config(config)
+              puts "✓ Set epic_prefix = #{value}"
+            else
+              puts "Unknown key: #{key}"
+              puts "Valid keys: fizzy-org, review-gate, epic-prefix"
+            end
           end
 
           def load_config
@@ -333,7 +394,7 @@ module Brainiac
       end
 
       def self.completions
-        %w[setup config status epics link bot projects]
+        %w[setup config status epics link bot projects set]
       end
     end
   end
