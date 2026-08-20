@@ -248,15 +248,39 @@ module Brainiac
             agent_config = load_agent_registry[agent.downcase]
             fizzy_name = agent_config&.dig("fizzy_name") || agent
 
-            stdout, stderr, status = Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--to", fizzy_name)
+            # Resolve the Fizzy user ID from the agent's display name
+            fizzy_user_id = resolve_fizzy_user_id(fizzy_name)
+            unless fizzy_user_id
+              LOG.error "[Basecamp:Orchestrator] Could not resolve Fizzy user ID for '#{fizzy_name}'" if defined?(LOG)
+              return
+            end
+
+            stdout, stderr, status = Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
 
             if status.success?
-              LOG.info "[Basecamp:Orchestrator] Assigned Fizzy ##{card_number} to #{fizzy_name}" if defined?(LOG)
+              LOG.info "[Basecamp:Orchestrator] Assigned Fizzy ##{card_number} to #{fizzy_name} (#{fizzy_user_id})" if defined?(LOG)
             else
               LOG.error "[Basecamp:Orchestrator] Failed to assign Fizzy ##{card_number}: #{stderr.strip}" if defined?(LOG)
             end
           rescue Errno::ENOENT => e
             LOG.error "[Basecamp:Orchestrator] fizzy CLI not found: #{e.message}" if defined?(LOG)
+          end
+
+          # Resolve a Fizzy user ID from their display name.
+          # Caches the user list for the session.
+          def resolve_fizzy_user_id(name)
+            @fizzy_users ||= begin
+              stdout, _stderr, status = Open3.capture3("fizzy", "user", "list", "--quiet")
+              if status.success?
+                JSON.parse(stdout).each_with_object({}) { |u, h| h[u["name"].downcase] = u["id"] }
+              else
+                {}
+              end
+            rescue StandardError
+              {}
+            end
+
+            @fizzy_users[name.downcase]
           end
 
           # Mark a Basecamp todo as complete.
