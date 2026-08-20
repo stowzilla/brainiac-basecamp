@@ -17,7 +17,7 @@ module Brainiac
           "bot_accounts" => {},
           "project_mappings" => {},
           "epic_prefix" => "Epic:",
-          "fizzy_org" => nil,
+          "fizzy_account_id" => nil,
           "review_gate" => "on_complete",
           "notifications" => {
             "epic_started" => true,
@@ -88,11 +88,11 @@ module Brainiac
             current["epic_prefix"] || "Epic:"
           end
 
-          # The Fizzy organization slug (for building card URLs).
+          # The Fizzy account ID (for building card URLs like app.fizzy.do/<id>/cards/N).
           #
           # @return [String, nil]
-          def fizzy_org
-            current["fizzy_org"]
+          def fizzy_account_id
+            current["fizzy_account_id"]
           end
 
           # Review gate mode: "on_complete" (advance immediately) or "on_pr_merge" (wait for merge).

@@ -102,17 +102,17 @@ module Brainiac
           # Generate a rich text HTML description for a todo linked to a Fizzy card.
           #
           # @param fizzy_card [Integer] Fizzy card number
-          # @param fizzy_org [String] Fizzy organization slug (for URL)
+          # @param fizzy_account_id [String] Fizzy account ID (for URL)
           # @param depends_on [Array<Integer>] Card numbers this task depends on
           # @param agent [String, nil] Agent name assigned to this task
           # @return [String] HTML description
-          def build_todo_description(fizzy_card:, fizzy_org:, depends_on: [], agent: nil)
+          def build_todo_description(fizzy_card:, fizzy_account_id:, depends_on: [], agent: nil)
             lines = []
             lines << "<div>"
-            lines << "<strong>Fizzy:</strong> <a href=\"https://app.fizzy.do/#{fizzy_org}/cards/#{fizzy_card}\">##{fizzy_card}</a><br>"
+            lines << "<strong>Fizzy:</strong> <a href=\"https://app.fizzy.do/#{fizzy_account_id}/cards/#{fizzy_card}\">##{fizzy_card}</a><br>"
 
             if depends_on.any?
-              dep_links = depends_on.map { |d| "<a href=\"https://app.fizzy.do/#{fizzy_org}/cards/#{d}\">##{d}</a>" }
+              dep_links = depends_on.map { |d| "<a href=\"https://app.fizzy.do/#{fizzy_account_id}/cards/#{d}\">##{d}</a>" }
               lines << "<strong>Depends on:</strong> #{dep_links.join(', ')}<br>"
             else
               lines << "<strong>Depends on:</strong> none<br>"

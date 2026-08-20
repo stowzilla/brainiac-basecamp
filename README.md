@@ -116,7 +116,7 @@ This checks prerequisites and creates `~/.brainiac/basecamp.json`.
 
 ```bash
 # Set your Fizzy org slug (used to build clickable card URLs in Basecamp)
-brainiac basecamp set fizzy-org stowzilla
+brainiac basecamp set fizzy-account-id 6098707
 
 # Register your bot account (name it anything, use the person ID from Step 3)
 brainiac basecamp bot add andy-server <person-id-from-step-3> Galen
@@ -213,7 +213,7 @@ curl http://localhost:4567/api/basecamp/epics
     }
   },
   "epic_prefix": "Epic:",
-  "fizzy_org": "stowzilla",
+  "fizzy_account_id": "6098707",
   "review_gate": "on_pr_merge",
   "notifications": {
     "epic_started": true,
@@ -236,7 +236,7 @@ brainiac basecamp bot add <name> <id> <agent>        # Add bot account
 brainiac basecamp bot list                           # List bot accounts
 brainiac basecamp projects map <key> <bc-id>         # Map project
 brainiac basecamp projects list                      # List mappings
-brainiac basecamp set fizzy-org <slug>               # Set Fizzy org for URLs
+brainiac basecamp set fizzy-account-id <id>          # Set Fizzy account ID for URLs
 brainiac basecamp set review-gate <mode>             # on_complete or on_pr_merge
 brainiac basecamp set epic-prefix <prefix>           # Epic detection prefix
 ```

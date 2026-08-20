@@ -143,15 +143,15 @@ class TestEpicParser < Minitest::Test
   def test_build_todo_description_with_deps
     html = Brainiac::Plugins::Basecamp::Epic.build_todo_description(
       fizzy_card: 1234,
-      fizzy_org: "stowzilla",
+      fizzy_account_id: "6098707",
       depends_on: [1230, 1232],
       agent: "Sherlock"
     )
 
-    assert_includes html, 'href="https://app.fizzy.do/stowzilla/cards/1234"'
+    assert_includes html, 'href="https://app.fizzy.do/6098707/cards/1234"'
     assert_includes html, "#1234"
-    assert_includes html, 'href="https://app.fizzy.do/stowzilla/cards/1230"'
-    assert_includes html, 'href="https://app.fizzy.do/stowzilla/cards/1232"'
+    assert_includes html, 'href="https://app.fizzy.do/6098707/cards/1230"'
+    assert_includes html, 'href="https://app.fizzy.do/6098707/cards/1232"'
     assert_includes html, "Sherlock"
     assert_includes html, "Depends on:"
   end
@@ -159,10 +159,10 @@ class TestEpicParser < Minitest::Test
   def test_build_todo_description_no_deps
     html = Brainiac::Plugins::Basecamp::Epic.build_todo_description(
       fizzy_card: 5678,
-      fizzy_org: "myorg"
+      fizzy_account_id: "6098707"
     )
 
-    assert_includes html, 'href="https://app.fizzy.do/myorg/cards/5678"'
+    assert_includes html, 'href="https://app.fizzy.do/6098707/cards/5678"'
     assert_includes html, "Depends on:</strong> none"
     refute_includes html, "Agent:"
   end

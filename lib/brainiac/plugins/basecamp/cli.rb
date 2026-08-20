@@ -65,7 +65,7 @@ module Brainiac
                 "bot_accounts" => {},
                 "project_mappings" => {},
                 "epic_prefix" => "Epic:",
-                "fizzy_org" => nil,
+                "fizzy_account_id" => nil,
                 "review_gate" => "on_complete",
                 "notifications" => {
                   "epic_started" => true,
@@ -82,7 +82,7 @@ module Brainiac
 
             puts ""
             puts "Next steps:"
-            puts "  1. Set Fizzy org:        brainiac basecamp set fizzy-org <your-fizzy-org-slug>"
+            puts "  1. Set Fizzy account ID:  brainiac basecamp set fizzy-account-id <your-fizzy-account-id>"
             puts "  2. Add bot accounts:     brainiac basecamp bot add <name> <person-id> <agent>"
             puts "  3. Map projects:         brainiac basecamp projects map <brainiac-key> <basecamp-id>"
             puts "  4. Set review gate:      brainiac basecamp set review-gate <on_complete|on_pr_merge>"
@@ -317,7 +317,7 @@ module Brainiac
                 projects map <key> <basecamp-id>        Map a Brainiac project to Basecamp
                 projects list                           List project mappings
                 projects unmap <key>                    Remove a project mapping
-                set fizzy-org <slug>                    Set Fizzy organization slug (for card URLs)
+                set fizzy-account-id <id>                Set Fizzy account ID (for card URLs)
                 set review-gate <mode>                  Set review gate (on_complete or on_pr_merge)
                 set epic-prefix <prefix>                Set epic todolist prefix (default: "Epic:")
 
@@ -338,7 +338,7 @@ module Brainiac
               puts "Usage: brainiac basecamp set <key> <value>"
               puts ""
               puts "Keys:"
-              puts "  fizzy-org <slug>           Fizzy organization slug (for card URLs)"
+              puts "  fizzy-account-id <id>      Fizzy account ID (for card URLs)"
               puts "  review-gate <mode>         on_complete or on_pr_merge"
               puts "  epic-prefix <prefix>       Todolist prefix for epic detection"
               return
@@ -347,10 +347,10 @@ module Brainiac
             config = load_config
 
             case key
-            when "fizzy-org"
-              config["fizzy_org"] = value
+            when "fizzy-account-id"
+              config["fizzy_account_id"] = value
               save_config(config)
-              puts "✓ Set fizzy_org = #{value}"
+              puts "✓ Set fizzy_account_id = #{value}"
               puts "  Card URLs will be: https://app.fizzy.do/#{value}/cards/NNNN"
             when "review-gate"
               unless %w[on_complete on_pr_merge].include?(value)
