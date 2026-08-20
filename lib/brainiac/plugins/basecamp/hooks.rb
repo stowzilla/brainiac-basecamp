@@ -16,6 +16,7 @@ module Brainiac
           def register_all!
             register_agent_completed
             register_pr_merged
+            register_pr_reviewed
             register_build_brain_context
             register_resolve_base_branch
             register_resolve_pr_target
@@ -45,12 +46,29 @@ module Brainiac
                 # Wait for PR merge — just mark as in_review
                 mark_in_review(epic, card_number)
               when "epic_branch"
-                # Auto-merge the task PR into the epic branch, then advance
-                Thread.new do
-                  sleep 10 # Give the PR a moment to be created by the agent
-                  auto_merge_and_advance(epic, card_number, ctx)
-                rescue StandardError => e
-                  LOG.error "[Basecamp:Hooks] Auto-merge failed: #{e.message}" if defined?(LOG)
+                # If review gates are configured, dispatch the first reviewer.
+                # Otherwise, auto-merge directly.
+                task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
+                if task && ReviewGate.enabled?
+                  # Dispatch the first review gate agent
+                  task["status"] = "in_review"
+                  epic["updated_at"] = Time.now.iso8601
+                  save_epic_state(epic)
+                  Thread.new do
+                    sleep 15 # Wait for PR to be created
+                    ReviewGate.dispatch_review(epic, task)
+                    save_epic_state(epic)
+                  rescue StandardError => e
+                    LOG.error "[Basecamp:Hooks] Review gate dispatch failed: #{e.message}" if defined?(LOG)
+                  end
+                else
+                  # No review gates — auto-merge directly
+                  Thread.new do
+                    sleep 10
+                    auto_merge_and_advance(epic, card_number, ctx)
+                  rescue StandardError => e
+                    LOG.error "[Basecamp:Hooks] Auto-merge failed: #{e.message}" if defined?(LOG)
+                  end
                 end
               end
             end
@@ -69,6 +87,72 @@ module Brainiac
               if review_gate == "on_pr_merge"
                 LOG.info "[Basecamp:Hooks] PR merged for card ##{card_number} — advancing epic" if defined?(LOG)
                 Orchestrator.on_card_completed(card_number)
+              end
+            end
+          end
+
+          # When a PR review is submitted (approval or changes requested).
+          # This is the signal from review gate agents.
+          def register_pr_reviewed
+            Brainiac.on(:pr_review_received) do |ctx|
+              card_number = ctx[:card_number]
+              next unless card_number
+
+              epic = Orchestrator.find_epic_for_card(card_number)
+              next unless epic
+              next unless epic["review_gate"] == "epic_branch" && ReviewGate.enabled?
+
+              task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
+              next unless task && task["status"] == "in_review"
+
+              reviewer = ctx[:reviewer] || ctx[:agent_name]
+              state = ctx[:state] # "approved", "changes_requested", "commented"
+
+              current_gate = task["current_gate"]
+              gate_agent = current_gate&.dig("agent")
+
+              LOG.info "[Basecamp:Hooks] PR review on card ##{card_number}: #{state} from #{reviewer}" if defined?(LOG)
+
+              case state
+              when "approved"
+                # Record the approval for this gate
+                role = current_gate&.dig("role") || "review"
+                ReviewGate.record_approval(task, agent: reviewer, role: role)
+                task.delete("current_gate")
+                epic["updated_at"] = Time.now.iso8601
+
+                if ReviewGate.all_gates_passed?(task)
+                  # All gates passed — auto-merge and advance
+                  LOG.info "[Basecamp:Hooks] All review gates passed for card ##{card_number} — merging" if defined?(LOG)
+                  save_epic_state(epic)
+                  Thread.new do
+                    auto_merge_and_advance(epic, card_number, ctx)
+                  rescue StandardError => e
+                    LOG.error "[Basecamp:Hooks] Auto-merge after review failed: #{e.message}" if defined?(LOG)
+                  end
+                else
+                  # More gates to go — dispatch next reviewer
+                  LOG.info "[Basecamp:Hooks] Gate passed, dispatching next reviewer for card ##{card_number}" if defined?(LOG)
+                  save_epic_state(epic)
+                  ReviewGate.dispatch_review(epic, task)
+                  save_epic_state(epic)
+                end
+
+              when "changes_requested"
+                # Review agent wants changes — re-dispatch original implementation agent
+                LOG.info "[Basecamp:Hooks] Changes requested on card ##{card_number} — re-dispatching #{epic['agent']}" if defined?(LOG)
+                ReviewGate.reset_approvals(task)
+                task["status"] = "in_flight"
+                task["current_gate"] = nil
+                epic["updated_at"] = Time.now.iso8601
+                save_epic_state(epic)
+
+                # Re-assign to the implementation agent in Fizzy
+                # The fizzy webhook will handle re-dispatch with the review context
+                fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, epic["agent"])
+                if fizzy_user_id
+                  Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
+                end
               end
             end
           end
