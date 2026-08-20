@@ -58,34 +58,141 @@ The `on_pr_merge` mode hooks into `:pr_merged` events from brainiac-github. This
 - brainiac-fizzy plugin (cards already exist in Fizzy)
 - brainiac-github plugin (optional, for `on_pr_merge` review gate)
 
-## Setup
+## Getting Started
+
+### Step 1: Install the Basecamp CLI
 
 ```bash
-brainiac install basecamp --path /path/to/brainiac-basecamp
+curl -fsSL https://basecamp.com/install-cli | bash
+```
+
+Verify it's installed:
+
+```bash
+basecamp --version
+```
+
+### Step 2: Authenticate with Basecamp
+
+```bash
+basecamp auth login
+```
+
+This opens your browser for OAuth. Once authenticated, verify:
+
+```bash
+basecamp auth status
+```
+
+### Step 3: Create a Bot Account in Basecamp
+
+Go to your Basecamp account → Adminland → People → Invite people.
+
+Create a new user account for the bot (e.g. "Galen Bot" or "Brainiac Andy"). This account will be the one that receives epic assignments.
+
+Once created, find the bot's **person ID**:
+
+```bash
+basecamp people list --jq '.data[] | select(.name | contains("Galen")) | {id, name}'
+```
+
+Note the `id` value — you'll need it in Step 6.
+
+### Step 4: Install the Plugin
+
+```bash
+brainiac install basecamp --path /home/andy/Code/brainiac-basecamp
+```
+
+### Step 5: Run Setup
+
+```bash
 brainiac basecamp setup
 ```
 
-### Configure
+This checks prerequisites and creates `~/.brainiac/basecamp.json`.
+
+### Step 6: Configure the Plugin
 
 ```bash
-# Set your Fizzy org slug (for generating card URLs in descriptions)
+# Set your Fizzy org slug (used to build clickable card URLs in Basecamp)
 brainiac basecamp set fizzy-org stowzilla
 
-# Map your Basecamp bot user to a local agent
-brainiac basecamp bot add andy-server <basecamp-person-id> Galen
+# Register your bot account (name it anything, use the person ID from Step 3)
+brainiac basecamp bot add andy-server <person-id-from-step-3> Galen
 
-# Link Brainiac projects to Basecamp projects
-brainiac basecamp projects map marketplace <basecamp-project-id>
+# Map your Brainiac project(s) to Basecamp project IDs
+# Find your Basecamp project ID:
+basecamp projects list --jq '.data[] | {id, name}'
+# Then map it:
+brainiac basecamp projects map stowzilla <basecamp-project-id>
 
-# Set review gate mode
+# Optionally enable the review gate (waits for PR merge between tasks)
 brainiac basecamp set review-gate on_pr_merge
 ```
 
-### Set Up Webhook
+Verify your config:
+
+```bash
+brainiac basecamp config
+```
+
+### Step 7: Register the Webhook
+
+Point Basecamp at your brainiac server's ngrok URL:
 
 ```bash
 basecamp webhooks create "https://your-ngrok.ngrok-free.app/basecamp" \
-  --types "Todo,Todolist" --in <project>
+  --types "Todo,Todolist" --in <basecamp-project-id>
+```
+
+Replace `your-ngrok.ngrok-free.app` with your actual ngrok domain.
+
+### Step 8: Restart Brainiac
+
+```bash
+brainiac restart
+```
+
+Verify the plugin loaded:
+
+```bash
+brainiac plugins
+curl http://localhost:4567/api/basecamp
+```
+
+### Step 9: Create Your First Epic
+
+In Basecamp, create a new todolist with the `Epic:` prefix:
+
+**Todolist title:** `Epic: My First Feature`
+
+Add todos to it. Each todo title should reference a Fizzy card number:
+
+```
+#1234 — Build the API endpoint
+#1235 — Add frontend form
+#1236 — Write integration tests [depends:1234,1235]
+```
+
+Optionally, add rich text descriptions with clickable Fizzy links:
+
+```html
+<a href="https://app.fizzy.do/stowzilla/cards/1234">Fizzy #1234</a>
+Depends on: none
+```
+
+### Step 10: Start the Epic
+
+Assign any todo in the epic todolist to your bot account (the one from Step 3).
+
+The webhook fires → brainiac-basecamp reads the todolist → builds the dependency graph → assigns the first unblocked Fizzy card to your agent.
+
+Watch it go:
+
+```bash
+brainiac basecamp epics
+curl http://localhost:4567/api/basecamp/epics
 ```
 
 ## Configuration
