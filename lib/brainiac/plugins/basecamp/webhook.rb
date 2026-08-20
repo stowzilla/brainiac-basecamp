@@ -47,11 +47,12 @@ module Brainiac
 
           # Handle todo assignment changes.
           #
-          # Strategy: When a todo is assigned to a bot account, check if its parent
-          # todolist is an epic (has the configured prefix). If so, start orchestration
-          # on the entire todolist.
+          # Strategy:
+          # - When a todo is assigned to a bot account → start epic orchestration
+          # - When a todo is unassigned from a bot account → cancel/reset the epic
           def handle_todo_assignment(payload, recording, details)
             added_person_ids = details["added_person_ids"] || []
+            removed_person_ids = details["removed_person_ids"] || []
             title = recording["title"] || ""
             todo_id = recording["id"]
             project_id = recording.dig("bucket", "id")
@@ -60,7 +61,33 @@ module Brainiac
             parent_title = parent["title"] || ""
             parent_id = parent["id"]
 
-            # Check if any added person is a bot account
+            # Handle UNASSIGNMENT — if bot is removed, cancel the epic
+            removed_person_ids.each do |person_id|
+              bot_account = Config.bot_account_for_person(person_id)
+              next unless bot_account
+
+              todolist_id = parent_type == "Todolist" ? parent_id : nil
+              next unless todolist_id
+
+              epic = Orchestrator.find_epic_by_todolist(todolist_id)
+              if epic && epic["status"] == "active"
+                epic["status"] = "cancelled"
+                epic["cancelled_at"] = Time.now.iso8601
+                epic["updated_at"] = Time.now.iso8601
+
+                # Save the cancellation
+                epics_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "basecamp_epics.json")
+                all = File.exist?(epics_file) ? (JSON.parse(File.read(epics_file))["epics"] || []) : []
+                idx = all.index { |e| e["id"] == epic["id"] }
+                all[idx] = epic if idx
+                File.write(epics_file, JSON.pretty_generate({ "epics" => all, "updated_at" => Time.now.iso8601 }))
+
+                LOG.info "[Basecamp:Webhook] Bot unassigned — cancelled epic '#{epic['title']}'" if defined?(LOG)
+                return [200, { status: "epic_cancelled", epic_id: epic["id"] }.to_json]
+              end
+            end
+
+            # Handle ASSIGNMENT — if bot is added, start the epic
             added_person_ids.each do |person_id|
               bot_account = Config.bot_account_for_person(person_id)
               next unless bot_account
