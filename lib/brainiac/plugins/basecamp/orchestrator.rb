@@ -26,6 +26,8 @@ module Brainiac
           # @param title [String] Epic/todolist title
           # @return [Hash] The created epic run state
           def start_epic(todolist_id:, project_id:, agent:, title:)
+            review_gate = Config.review_gate
+
             epic = {
               "id" => "epic-#{todolist_id}",
               "basecamp_todolist_id" => todolist_id.to_s,
@@ -33,19 +35,27 @@ module Brainiac
               "agent" => agent,
               "title" => title,
               "status" => "active",
+              "review_gate" => review_gate,
               "started_at" => Time.now.iso8601,
               "updated_at" => Time.now.iso8601,
               "tasks" => [],
+              "epic_branches" => {},
               "history" => []
             }
 
             save_epic(epic)
-            log_event(epic, "started", "Epic orchestration started by #{agent}")
+            log_event(epic, "started", "Epic orchestration started by #{agent} (review_gate: #{review_gate})")
 
-            LOG.info "[Basecamp:Orchestrator] Started epic '#{title}' (todolist #{todolist_id}) with agent #{agent}" if defined?(LOG)
+            LOG.info "[Basecamp:Orchestrator] Started epic '#{title}' (todolist #{todolist_id}) " \
+                     "with agent #{agent}, review_gate: #{review_gate}" if defined?(LOG)
 
             # Initial task resolution — read the todolist and dispatch unblocked work
             resolve_and_dispatch(epic)
+
+            # Create epic branches if in epic_branch mode
+            if review_gate == "epic_branch"
+              create_epic_branches_for(epic)
+            end
 
             save_epic(epic)
             epic
@@ -278,9 +288,13 @@ module Brainiac
 
             LOG.info "[Basecamp:Orchestrator] Epic '#{epic['title']}' completed!" if defined?(LOG)
 
-            # Post a summary comment on the todolist
+            # If epic_branch mode, open final PRs to main
+            if epic["review_gate"] == "epic_branch" && epic["epic_branches"]&.any?
+              open_final_prs(epic)
+            end
+
+            # Post a summary message in Basecamp
             summary = build_completion_summary(epic)
-            # Post as a message in the project (todolists don't have comments directly)
             Client.run_safe(
               "messages", "create", "Epic Complete: #{epic['title']}", summary,
               "--in", epic["basecamp_project_id"], "--json"
@@ -375,6 +389,61 @@ module Brainiac
             return {} unless File.exist?(agents_file)
 
             JSON.parse(File.read(agents_file))
+          rescue JSON::ParserError
+            {}
+          end
+
+          # Create epic branches for all projects involved in this epic.
+          def create_epic_branches_for(epic)
+            project_repos = resolve_project_repos(epic)
+            return if project_repos.empty?
+
+            epic["epic_branches"] = EpicBranch.create_epic_branches(epic, project_repos)
+            log_event(epic, "branches_created", "Epic branches: #{epic['epic_branches'].values.uniq.join(', ')}")
+          rescue StandardError => e
+            LOG.error "[Basecamp:Orchestrator] Failed to create epic branches: #{e.message}" if defined?(LOG)
+          end
+
+          # Open final PRs from epic branches to main.
+          def open_final_prs(epic)
+            project_repos = resolve_project_repos(epic)
+            return if project_repos.empty?
+
+            prs = EpicBranch.open_final_prs(epic, project_repos, epic["epic_branches"])
+            epic["final_prs"] = prs
+            log_event(epic, "final_prs_opened", "Opened #{prs.size} final PR(s): #{prs.map { |p| p[:url] }.join(', ')}")
+
+            # Notify about final PRs
+            if prs.any? && defined?(Brainiac) && Brainiac.respond_to?(:emit)
+              pr_list = prs.map { |p| "#{p[:project]}: #{p[:url]}" }.join("\n")
+              Brainiac.emit(:notify,
+                            event: :epic_prs_ready,
+                            channel: :discord,
+                            message: "📋 Epic **#{epic['title']}** — final PRs ready for review:\n#{pr_list}",
+                            agent: epic["agent"])
+            end
+          rescue StandardError => e
+            LOG.error "[Basecamp:Orchestrator] Failed to open final PRs: #{e.message}" if defined?(LOG)
+          end
+
+          # Resolve project_key => repo_path for all projects in the epic's tasks.
+          def resolve_project_repos(epic)
+            projects_file = File.join(BRAINIAC_DIR, "projects.json")
+            return {} unless File.exist?(projects_file)
+
+            all_projects = JSON.parse(File.read(projects_file))
+            project_keys = (epic["tasks"] || []).map { |t| t["project"] }.compact.uniq
+
+            # If no per-task project is set, use the brainiac project mapped to this basecamp project
+            if project_keys.empty?
+              mapped = Config.brainiac_project_for(epic["basecamp_project_id"])
+              project_keys = [mapped] if mapped
+            end
+
+            project_keys.each_with_object({}) do |key, hash|
+              repo = all_projects.dig(key, "repo_path")
+              hash[key] = repo if repo
+            end
           rescue JSON::ParserError
             {}
           end

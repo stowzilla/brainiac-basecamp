@@ -353,15 +353,19 @@ module Brainiac
               puts "✓ Set fizzy_account_id = #{value}"
               puts "  Card URLs will be: https://app.fizzy.do/#{value}/cards/NNNN"
             when "review-gate"
-              unless %w[on_complete on_pr_merge].include?(value)
-                puts "Error: review-gate must be 'on_complete' or 'on_pr_merge'"
+              unless %w[on_complete on_pr_merge epic_branch].include?(value)
+                puts "Error: review-gate must be 'on_complete', 'on_pr_merge', or 'epic_branch'"
                 return
               end
               config["review_gate"] = value
               save_config(config)
               puts "✓ Set review_gate = #{value}"
-              if value == "on_pr_merge"
+              case value
+              when "on_pr_merge"
                 puts "  Epic tasks will wait for PR merge before advancing to next task"
+              when "epic_branch"
+                puts "  Epic tasks auto-merge into an epic branch. Final PR to main when epic completes."
+                puts "  Best for overnight/autonomous execution."
               else
                 puts "  Epic tasks advance immediately when agent completes"
               end
