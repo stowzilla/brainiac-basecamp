@@ -183,12 +183,16 @@ module Brainiac
                          "pending"
                        end
 
+              # Resolve project key for this task (from existing state, or from epic's project mapping)
+              project_key = existing&.dig("project") || Config.brainiac_project_for(epic["basecamp_project_id"])
+
               {
                 "todo_id" => task.todo_id,
                 "fizzy_card" => task.fizzy_card,
                 "title" => task.title,
                 "depends_on" => task.depends_on,
                 "status" => status,
+                "project" => project_key,
                 "completed_at" => task.completed ? (existing&.dig("completed_at") || Time.now.iso8601) : nil,
                 "assignees" => task.assignees,
                 "due_on" => task.due_on

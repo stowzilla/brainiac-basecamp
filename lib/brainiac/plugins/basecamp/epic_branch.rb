@@ -145,12 +145,22 @@ module Brainiac
             return nil unless epic["review_gate"] == "epic_branch"
 
             epic_branches = epic["epic_branches"] || {}
+            return nil if epic_branches.empty?
+
             # Find the project for this card's task
             task = epic["tasks"]&.find { |t| t["fizzy_card"] == card_number.to_i }
             return nil unless task
 
             project_key = task["project"]
-            epic_branches[project_key]
+
+            # If project is set, look up directly
+            return epic_branches[project_key] if project_key && epic_branches[project_key]
+
+            # Fallback: if there's only one epic branch, use it (single-project epic)
+            return epic_branches.values.first if epic_branches.size == 1
+
+            # Multi-project epic but no project on task — can't determine which branch
+            nil
           end
 
           private
