@@ -316,6 +316,7 @@ module Brainiac
 
           # When a PR is updated (new commits pushed) — re-trigger gates if in review.
           # This handles the "Galen fixes → pushes → gates re-review" flow.
+          # Also catches edge cases where gates weren't dispatched initially.
           def register_pr_synchronized
             Brainiac.on(:pr_synchronized) do |ctx|
               card_number = ctx[:card_number]
@@ -326,10 +327,9 @@ module Brainiac
               next unless epic["review_gate"] == "epic_branch" && ReviewGate.enabled?
 
               task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
-              # Only re-trigger if the task is in_flight (fixes pushed) and had prior reviews
-              # Check for ANY prior reviews (approvals OR changes_requested)
-              had_prior_reviews = task["gate_approvals"]&.any? || task["changes_requested_by"]&.any?
-              next unless task && task["status"] == "in_flight" && had_prior_reviews
+              # Re-trigger gates if task is in_flight (agent working/pushed fixes)
+              # No need to check for prior reviews — if task is in_flight with a PR, gates should review
+              next unless task && task["status"] == "in_flight" && task["pr_number"]
 
               LOG.info "[Basecamp:Hooks] PR updated for card ##{card_number} — re-triggering review gates" if defined?(LOG)
 
