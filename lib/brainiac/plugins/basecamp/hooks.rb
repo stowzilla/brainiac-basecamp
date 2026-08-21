@@ -327,7 +327,9 @@ module Brainiac
 
               task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
               # Only re-trigger if the task is in_flight (fixes pushed) and had prior reviews
-              next unless task && task["status"] == "in_flight" && task["gate_approvals"]&.any?
+              # Check for ANY prior reviews (approvals OR changes_requested)
+              had_prior_reviews = task["gate_approvals"]&.any? || task["changes_requested_by"]&.any?
+              next unless task && task["status"] == "in_flight" && had_prior_reviews
 
               LOG.info "[Basecamp:Hooks] PR updated for card ##{card_number} — re-triggering review gates" if defined?(LOG)
 
