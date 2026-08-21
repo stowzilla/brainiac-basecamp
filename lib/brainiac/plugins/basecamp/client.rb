@@ -18,6 +18,7 @@ module Brainiac
           # @raise [ClientError] If the command fails
           def run(*args, profile: nil)
             cmd = ["basecamp"]
+            profile ||= Config.current["basecamp_profile"]
             cmd += ["--profile", profile] if profile
             cmd += args.flatten
 

@@ -130,7 +130,38 @@ module Brainiac
                 end
               end
 
-              next unless gate # Not a gate agent's review — ignore
+              unless gate
+                # Not a gate agent — check if it's the implementation agent's final approval
+                impl_agent = epic["agent"]
+                is_impl_agent = reviewer&.downcase == impl_agent&.downcase
+
+                # Also check display_name match
+                unless is_impl_agent
+                  agents_file2 = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "agents.json")
+                  if File.exist?(agents_file2)
+                    agents2 = JSON.parse(File.read(agents_file2))
+                    impl_entry = agents2[impl_agent&.downcase]
+                    impl_display = impl_entry&.dig("display_name") || impl_agent
+                    is_impl_agent = impl_display&.downcase == reviewer&.downcase
+                  end
+                end
+
+                if is_impl_agent && task["awaiting_final_decision"]
+                  # Implementation agent approved after reviewing gate feedback — proceed to merge
+                  LOG.info "[Basecamp:Hooks] Final decision: #{impl_agent} approved — merging card ##{card_number}" if defined?(LOG)
+                  task.delete("awaiting_final_decision")
+                  save_epic_state(epic)
+
+                  Thread.new do
+                    post_gate_summary(epic, task)
+                    auto_merge_and_advance(epic, card_number, ctx)
+                  rescue StandardError => e
+                    LOG.error "[Basecamp:Hooks] Post-final-decision merge failed: #{e.message}" if defined?(LOG)
+                  end
+                end
+
+                next # Not a gate agent and not a final decision — skip
+              end
 
               agent_name = gate["agent"]
               role = gate["role"] || "review"
@@ -146,16 +177,15 @@ module Brainiac
               epic["updated_at"] = Time.now.iso8601
 
               if ReviewGate.all_gates_passed?(task)
-                LOG.info "[Basecamp:Hooks] All review gates passed for card ##{card_number} — merging into epic branch" if defined?(LOG)
+                LOG.info "[Basecamp:Hooks] All review gates passed for card ##{card_number} — dispatching final decision" if defined?(LOG)
                 save_epic_state(epic)
 
+                # Final decision: re-dispatch the implementation agent to read gate feedback
+                # and decide whether to fix suggestions or approve as-is.
                 Thread.new do
-                  # Post Fizzy comment with gate summary
-                  post_gate_summary(epic, task)
-                  # Auto-merge and advance
-                  auto_merge_and_advance(epic, card_number, ctx)
+                  dispatch_final_decision(epic, task, ctx)
                 rescue StandardError => e
-                  LOG.error "[Basecamp:Hooks] Post-gate merge failed: #{e.message}" if defined?(LOG)
+                  LOG.error "[Basecamp:Hooks] Final decision dispatch failed: #{e.message}" if defined?(LOG)
                 end
               else
                 approvals = task["gate_approvals"] || []
@@ -230,6 +260,25 @@ module Brainiac
                   if ReviewGate.enabled?
                     gate_names = ReviewGate.gates.map { |g| "#{g['agent']} (#{g['role']})" }.join(", ")
                     context_lines << "**Review gates:** #{gate_names} will review your PR after you open it."
+                  end
+
+                  # Final decision mode — agent reads gate feedback and decides
+                  if current_task["awaiting_final_decision"]
+                    pr_number = current_task["pr_number"]
+                    approvals = current_task["gate_approvals"] || []
+                    gate_agents = approvals.map { |a| a["agent"] }.join(", ")
+
+                    context_lines << ""
+                    context_lines << "## ⚡ FINAL DECISION REQUIRED"
+                    context_lines << ""
+                    context_lines << "All review gates have approved (#{gate_agents}), but you must make the final call."
+                    context_lines << "Read their review comments on PR ##{pr_number} with: `gh pr view #{pr_number} --comments`"
+                    context_lines << ""
+                    context_lines << "Even if they approved, they may have flagged suggestions worth fixing."
+                    context_lines << "- If you see suggestions you agree with → make the fixes, commit, push"
+                    context_lines << "- If you're satisfied as-is → approve the PR: `gh pr review #{pr_number} --approve --body \"Reviewed gate feedback, shipping as-is\"`"
+                    context_lines << ""
+                    context_lines << "Your approval triggers the auto-merge into the epic branch."
                   end
                 end
 
@@ -336,6 +385,44 @@ module Brainiac
             )
           rescue StandardError => e
             LOG.warn "[Basecamp:Hooks] Failed to post gate summary on card ##{card_number}: #{e.message}" if defined?(LOG)
+          end
+
+          def mark_in_review(epic, card_number)
+            task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
+            return unless task
+
+            task["status"] = "in_review"
+            task["review_started_at"] = Time.now.iso8601
+            epic["updated_at"] = Time.now.iso8601
+            save_epic_state(epic)
+          end
+
+          # Dispatch the implementation agent to read gate feedback and make a final decision.
+          # The agent reads all review comments, then either:
+          # - Makes fixes and pushes (triggers re-review cycle)
+          # - Approves the PR (triggers the merge)
+          def dispatch_final_decision(epic, task, _ctx)
+            card_number = task["fizzy_card"]
+            agent_name = epic["agent"]
+            pr_number = task["pr_number"]
+            pr_repo = task["pr_repo"]
+
+            LOG.info "[Basecamp:Hooks] Dispatching #{agent_name} for final decision on card ##{card_number}" if defined?(LOG)
+
+            # Mark task as awaiting final decision
+            task["awaiting_final_decision"] = true
+            task["status"] = "final_decision"
+            epic["updated_at"] = Time.now.iso8601
+            save_epic_state(epic)
+
+            # Re-assign the Fizzy card to the implementation agent (triggers dispatch)
+            fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, agent_name)
+            if fizzy_user_id
+              Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
+            end
+
+            # The agent's prompt (from brainiac-fizzy's followup handler) will include the PR context.
+            # The brain context hook will inject the "final decision" instruction.
           end
 
           def mark_in_review(epic, card_number)

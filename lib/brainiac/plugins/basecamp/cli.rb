@@ -373,9 +373,15 @@ module Brainiac
               config["epic_prefix"] = value
               save_config(config)
               puts "✓ Set epic_prefix = #{value}"
+            when "profile"
+              config["basecamp_profile"] = value
+              save_config(config)
+              puts "✓ Set basecamp_profile = #{value}"
+              puts "  All basecamp CLI commands will use --profile #{value}"
+              puts "  Set up the profile: basecamp profile create #{value} && basecamp auth login --profile #{value}"
             else
               puts "Unknown key: #{key}"
-              puts "Valid keys: fizzy-org, review-gate, epic-prefix"
+              puts "Valid keys: fizzy-account-id, review-gate, epic-prefix, profile"
             end
           end
 
