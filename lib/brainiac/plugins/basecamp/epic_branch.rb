@@ -178,6 +178,8 @@ module Brainiac
           end
 
           # Find a PR for a given branch targeting a specific base.
+          # IMPORTANT: Only returns PRs that actually target the expected base branch.
+          # Will NOT return PRs targeting main/master to prevent accidental merges.
           def find_pr_for_branch(repo_path:, branch:, base:)
             # Try exact match first
             stdout, _stderr, status = Open3.capture3(
@@ -201,13 +203,28 @@ module Brainiac
                 return stdout.strip.split("\n").first.to_i
               end
 
-              # Last resort: search without base filter (PR might target wrong base)
+              # Check if there's a PR targeting the WRONG base (e.g., main instead of epic branch)
+              # This is a safeguard — we refuse to merge PRs that target the wrong branch
               stdout, _stderr, status = Open3.capture3(
-                "gh", "pr", "list", "--json", "number,headRefName",
-                "--jq", ".[] | select(.headRefName | startswith(\"fizzy-#{card_num}\")) | .number",
+                "gh", "pr", "list", "--json", "number,headRefName,baseRefName",
+                "--jq", ".[] | select(.headRefName | startswith(\"fizzy-#{card_num}\"))",
                 chdir: repo_path
               )
-              return stdout.strip.split("\n").first.to_i if status.success? && !stdout.strip.empty?
+              if status.success? && !stdout.strip.empty?
+                # Found a PR but it targets the wrong base — log warning and refuse to auto-merge
+                pr_data = JSON.parse("[#{stdout.strip.gsub("\n", ",")}]").first rescue nil
+                if pr_data
+                  actual_base = pr_data["baseRefName"]
+                  pr_number = pr_data["number"]
+                  if actual_base != base
+                    LOG.error "[Basecamp:EpicBranch] SAFEGUARD: PR ##{pr_number} targets '#{actual_base}' " \
+                              "but expected '#{base}'. Refusing to auto-merge to prevent accidental merge to main. " \
+                              "Fix: close the PR and reopen targeting '#{base}', or manually retarget with: " \
+                              "`gh pr edit #{pr_number} --base #{base}`" if defined?(LOG)
+                    return nil
+                  end
+                end
+              end
             end
 
             nil
