@@ -245,7 +245,11 @@ module Brainiac
               - If changes are needed: `gh pr review #{pr_number} --request-changes --body "what needs fixing"`
 
               Be thorough but pragmatic. This is Fizzy card ##{card_number}.
-              Do NOT open new PRs or modify code — you are a reviewer only.
+
+              IMPORTANT RESTRICTIONS:
+              - Do NOT open new PRs or modify code — you are a reviewer only
+              - Do NOT comment on the Fizzy card — your review goes on GitHub only
+              - Do NOT use the fizzy CLI at all
             PROMPT
           end
 

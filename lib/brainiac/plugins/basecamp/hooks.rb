@@ -55,6 +55,13 @@ module Brainiac
                 task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
                 next unless task
 
+                # Only dispatch gates for fresh tasks, not ones already in review/final_decision/complete
+                current_status = task["status"]
+                if %w[in_review final_decision complete].include?(current_status)
+                  LOG.info "[Basecamp:Hooks] Skipping gate dispatch for card ##{card_number} — already #{current_status}" if defined?(LOG)
+                  next
+                end
+
                 if ReviewGate.enabled?
                   # Dispatch review gates in parallel after a delay (wait for PR to be created)
                   task["status"] = "in_review"
