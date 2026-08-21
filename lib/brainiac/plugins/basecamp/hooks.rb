@@ -540,11 +540,14 @@ module Brainiac
           # The agent reads all review comments, then either:
           # - Makes fixes and pushes (triggers re-review cycle)
           # - Approves the PR (triggers the merge)
+          #
+          # This spawns the agent directly via run_agent (not Fizzy assignment) to avoid
+          # confusing unassign/reassign activity in the Fizzy feed.
           def dispatch_final_decision(epic, task, _ctx)
             card_number = task["fizzy_card"]
             agent_name = epic["agent"]
             pr_number = task["pr_number"]
-            pr_repo = task["pr_repo"]
+            project_key = task["project"]
 
             LOG.info "[Basecamp:Hooks] Dispatching #{agent_name} for final decision on card ##{card_number}" if defined?(LOG)
 
@@ -555,8 +558,6 @@ module Brainiac
             save_epic_state(epic)
 
             # Reset the agent-to-agent dispatch depth for this card
-            # Final decision is orchestrator-driven, not agent-to-agent
-            # Look up the card internal ID from work_items
             card_internal_id = lookup_card_internal_id(card_number)
             if card_internal_id
               LOG.info "[Basecamp:Hooks] Resetting dispatch depth for card #{card_internal_id}" if defined?(LOG)
@@ -565,26 +566,90 @@ module Brainiac
               elsif Object.respond_to?(:record_human_comment, true)
                 Object.send(:record_human_comment, card_internal_id)
               end
-            else
-              LOG.warn "[Basecamp:Hooks] Could not find internal ID for card ##{card_number} — dispatch depth not reset" if defined?(LOG)
             end
 
-            # Re-assign the Fizzy card to the implementation agent (triggers dispatch)
-            fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, agent_name)
-            LOG.info "[Basecamp:Hooks] Resolved fizzy_user_id for #{agent_name}: #{fizzy_user_id.inspect}" if defined?(LOG)
-            if fizzy_user_id
-              stdout, stderr, status = Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
-              if status.success?
-                LOG.info "[Basecamp:Hooks] Assigned card ##{card_number} to #{agent_name}" if defined?(LOG)
+            # Get project config and repo path
+            projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
+            projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+            project_config = projects[project_key]
+            repo_path = project_config&.dig("repo_path")
+
+            unless repo_path
+              LOG.error "[Basecamp:Hooks] No repo_path for project #{project_key} — cannot dispatch final decision" if defined?(LOG)
+              return
+            end
+
+            # Find the worktree for this card
+            work_items_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "work_items.json")
+            worktree_path = repo_path  # Default to main repo
+            if File.exist?(work_items_file)
+              work_items = JSON.parse(File.read(work_items_file))
+              work_item = work_items.values.find { |wi| wi.dig("sources", "fizzy", "card_number") == card_number }
+              worktree_path = work_item["worktree"] if work_item&.dig("worktree")
+            end
+
+            # Build prompt for final decision
+            gate_approvals = task["gate_approvals"] || []
+            gate_agents = gate_approvals.map { |a| a["agent"] }.join(", ")
+
+            prompt = <<~PROMPT
+              ## Final Decision Required — Fizzy Card ##{card_number}
+
+              All review gates have approved (#{gate_agents}). Your job:
+
+              1. Read their feedback: `gh pr view #{pr_number} --comments`
+              2. If fixes needed → make them, commit, push
+              3. When ready → **approve the PR to trigger merge**:
+                 ```
+                 gh pr review #{pr_number} --approve --body "LGTM — merging to epic branch"
+                 ```
+
+              **CRITICAL:** You must run `gh pr review --approve` to merge. A Fizzy comment is NOT enough.
+              Your approval triggers auto-merge into the epic branch.
+
+              After approving, update the Fizzy card with a brief status comment.
+            PROMPT
+
+            # Spawn the agent directly (like gate agents do)
+            pid = nil
+            log_file = nil
+            card_key = "final-decision-#{card_number}"
+
+            begin
+              pid, log_file = method(:run_agent).call(
+                prompt,
+                project_config: project_config,
+                chdir: worktree_path,
+                log_name: "final-decision-#{card_number}",
+                agent_name: agent_name,
+                source: :basecamp,
+                card_number: card_number
+              )
+            rescue NameError
+              if Object.respond_to?(:run_agent, true)
+                pid, log_file = Object.send(:run_agent,
+                  prompt,
+                  project_config: project_config,
+                  chdir: worktree_path,
+                  log_name: "final-decision-#{card_number}",
+                  agent_name: agent_name,
+                  source: :basecamp,
+                  card_number: card_number)
               else
-                LOG.error "[Basecamp:Hooks] Failed to assign card ##{card_number}: #{stderr}" if defined?(LOG)
+                LOG.warn "[Basecamp:Hooks] run_agent not available — final decision dispatch skipped" if defined?(LOG)
+                return
               end
-            else
-              LOG.error "[Basecamp:Hooks] Could not resolve fizzy user ID for #{agent_name}" if defined?(LOG)
             end
 
-            # The agent's prompt (from brainiac-fizzy's followup handler) will include the PR context.
-            # The brain context hook will inject the "final decision" instruction.
+            # Register session for waybar visibility
+            if pid
+              if defined?(register_session)
+                register_session(card_key, pid, log_file: log_file, agent_name: agent_name)
+              elsif Object.respond_to?(:register_session, true)
+                Object.send(:register_session, card_key, pid, log_file: log_file, agent_name: agent_name)
+              end
+              LOG.info "[Basecamp:Hooks] Spawned #{agent_name} (pid #{pid}) for final decision on card ##{card_number}" if defined?(LOG)
+            end
           end
 
           def mark_in_review(epic, card_number)
