@@ -242,7 +242,8 @@ module Brainiac
               Client.run_safe(
                 "comments", "create", epic_task["todo_id"].to_s,
                 "🚀 Dispatched to **#{agent}** via Brainiac",
-                "--in", epic["basecamp_project_id"], "--json"
+                "--in", epic["basecamp_project_id"], "--json",
+                profile: agent.downcase
               )
             end
           end
@@ -292,7 +293,8 @@ module Brainiac
             task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
             return unless task && task["todo_id"]
 
-            Client.run_safe("todos", "complete", task["todo_id"].to_s, "--json")
+            Client.run_safe("todos", "complete", task["todo_id"].to_s, "--json",
+                           profile: epic["agent"]&.downcase)
           end
 
           # Post a completion comment on the Basecamp todo.
@@ -303,7 +305,8 @@ module Brainiac
             Client.run_safe(
               "comments", "create", task["todo_id"].to_s,
               "✅ Fizzy card ##{card_number} completed",
-              "--in", epic["basecamp_project_id"], "--json"
+              "--in", epic["basecamp_project_id"], "--json",
+              profile: epic["agent"]&.downcase
             )
           end
 
@@ -325,7 +328,8 @@ module Brainiac
             summary = build_completion_summary(epic)
             Client.run_safe(
               "messages", "create", "Epic Complete: #{epic['title']}", summary,
-              "--in", epic["basecamp_project_id"], "--json"
+              "--in", epic["basecamp_project_id"], "--json",
+              profile: epic["agent"]&.downcase
             )
 
             # Emit notification for Discord

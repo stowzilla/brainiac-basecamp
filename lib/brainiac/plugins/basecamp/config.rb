@@ -18,7 +18,6 @@ module Brainiac
           "project_mappings" => {},
           "epic_prefix" => "Epic:",
           "fizzy_account_id" => nil,
-          "basecamp_profile" => nil,
           "review_gate" => "on_complete",
           "review_gates" => [],
           "notifications" => {

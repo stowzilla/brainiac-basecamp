@@ -10,15 +10,37 @@ module Brainiac
       # Shells out with --json for structured responses.
       module Client
         class << self
+          # Set the current agent profile for basecamp CLI commands.
+          # The profile name matches the agent name (e.g., "galen" → basecamp --profile galen).
+          #
+          # @param agent_name [String, nil] Agent name to use as profile
+          def with_agent_profile(agent_name)
+            @current_agent_profile = agent_name&.downcase
+          end
+
+          # Clear the current agent profile.
+          def clear_agent_profile
+            @current_agent_profile = nil
+          end
+
+          # Run a basecamp CLI command as a specific agent.
+          #
+          # @param agent_name [String] Agent name (used as profile)
+          # @param args [Array<String>] CLI arguments
+          # @return [Hash] Parsed JSON response
+          def run_as(agent_name, *args)
+            run(*args, profile: agent_name.downcase)
+          end
           # Run a basecamp CLI command and return parsed JSON.
           #
           # @param args [Array<String>] CLI arguments
-          # @param profile [String, nil] Named profile to use
+          # @param profile [String, nil] Named profile to use (defaults to agent name)
           # @return [Hash] Parsed JSON response
           # @raise [ClientError] If the command fails
           def run(*args, profile: nil)
             cmd = ["basecamp"]
-            profile ||= Config.current["basecamp_profile"]
+            # Use the specified profile, or fall back to the current agent's name as profile
+            profile ||= @current_agent_profile
             cmd += ["--profile", profile] if profile
             cmd += args.flatten
 
