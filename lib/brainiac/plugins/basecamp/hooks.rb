@@ -111,42 +111,21 @@ module Brainiac
               task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
               next unless task && task["status"] == "in_review"
 
-              # Determine which agent submitted the review
+              review_state = ctx[:review_state]
               reviewer = ctx[:reviewer] || ctx[:agent_name]
 
-              # Match reviewer to a configured gate
-              gate = ReviewGate.gates.find { |g| g["agent"].downcase == reviewer&.downcase }
+              LOG.info "[Basecamp:Hooks] PR review received: #{reviewer} (#{review_state}) on card ##{card_number}" if defined?(LOG)
 
-              # Also check if the reviewer matches a gate agent's display name
-              unless gate
-                agents_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "agents.json")
-                if File.exist?(agents_file)
-                  agents = JSON.parse(File.read(agents_file))
-                  gate = ReviewGate.gates.find do |g|
-                    agent_entry = agents[g["agent"].downcase]
-                    display = agent_entry&.dig("display_name") || g["agent"]
-                    display.downcase == reviewer&.downcase
-                  end
-                end
-              end
+              # Match reviewer to a configured gate agent
+              # GitHub bot logins are like "threepio-brainiac" or "glados-brainiac[bot]"
+              gate = match_reviewer_to_gate(reviewer)
 
               unless gate
                 # Not a gate agent — check if it's the implementation agent's final approval
                 impl_agent = epic["agent"]
-                is_impl_agent = reviewer&.downcase == impl_agent&.downcase
+                is_impl_agent = match_reviewer_to_agent?(reviewer, impl_agent)
 
-                # Also check display_name match
-                unless is_impl_agent
-                  agents_file2 = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "agents.json")
-                  if File.exist?(agents_file2)
-                    agents2 = JSON.parse(File.read(agents_file2))
-                    impl_entry = agents2[impl_agent&.downcase]
-                    impl_display = impl_entry&.dig("display_name") || impl_agent
-                    is_impl_agent = impl_display&.downcase == reviewer&.downcase
-                  end
-                end
-
-                if is_impl_agent && task["awaiting_final_decision"]
+                if is_impl_agent && task["awaiting_final_decision"] && review_state == "approved"
                   # Implementation agent approved after reviewing gate feedback — proceed to merge
                   LOG.info "[Basecamp:Hooks] Final decision: #{impl_agent} approved — merging card ##{card_number}" if defined?(LOG)
                   task.delete("awaiting_final_decision")
@@ -166,34 +145,88 @@ module Brainiac
               agent_name = gate["agent"]
               role = gate["role"] || "review"
 
-              LOG.info "[Basecamp:Hooks] Gate review from #{agent_name} (#{role}) on card ##{card_number}" if defined?(LOG)
+              # Only record approval for APPROVED reviews
+              if review_state == "approved"
+                LOG.info "[Basecamp:Hooks] Gate APPROVED: #{agent_name} (#{role}) on card ##{card_number}" if defined?(LOG)
+                ReviewGate.record_approval(task, agent: agent_name, role: role)
+                epic["updated_at"] = Time.now.iso8601
 
-              # The review state comes from the GitHub review
-              # brainiac-github dispatches the agent on "changes_requested" reviews,
-              # so if we're here after agent_completed, the agent approved (otherwise
-              # the implementation agent would have been re-dispatched already).
-              # Record the approval.
-              ReviewGate.record_approval(task, agent: agent_name, role: role)
-              epic["updated_at"] = Time.now.iso8601
+                if ReviewGate.all_gates_passed?(task)
+                  LOG.info "[Basecamp:Hooks] All review gates passed for card ##{card_number} — dispatching final decision" if defined?(LOG)
+                  save_epic_state(epic)
 
-              if ReviewGate.all_gates_passed?(task)
-                LOG.info "[Basecamp:Hooks] All review gates passed for card ##{card_number} — dispatching final decision" if defined?(LOG)
-                save_epic_state(epic)
-
-                # Final decision: re-dispatch the implementation agent to read gate feedback
-                # and decide whether to fix suggestions or approve as-is.
-                Thread.new do
-                  dispatch_final_decision(epic, task, ctx)
-                rescue StandardError => e
-                  LOG.error "[Basecamp:Hooks] Final decision dispatch failed: #{e.message}" if defined?(LOG)
+                  Thread.new do
+                    dispatch_final_decision(epic, task, ctx)
+                  rescue StandardError => e
+                    LOG.error "[Basecamp:Hooks] Final decision dispatch failed: #{e.message}" if defined?(LOG)
+                  end
+                else
+                  approvals = task["gate_approvals"] || []
+                  remaining = ReviewGate.gates.size - approvals.size
+                  LOG.info "[Basecamp:Hooks] #{approvals.size}/#{ReviewGate.gates.size} gates passed, #{remaining} remaining" if defined?(LOG)
+                  save_epic_state(epic)
                 end
-              else
-                approvals = task["gate_approvals"] || []
-                remaining = ReviewGate.gates.size - approvals.size
-                LOG.info "[Basecamp:Hooks] #{approvals.size}/#{ReviewGate.gates.size} gates passed, #{remaining} remaining" if defined?(LOG)
+              elsif review_state == "changes_requested"
+                LOG.info "[Basecamp:Hooks] Gate CHANGES_REQUESTED: #{agent_name} (#{role}) on card ##{card_number}" if defined?(LOG)
+                # The implementation agent will be dispatched by brainiac-github to address the review
+                # Set status to in_flight so pr_synchronized can detect when fixes are pushed
+                task["status"] = "in_flight"
+                task["changes_requested_by"] ||= []
+                task["changes_requested_by"] << agent_name unless task["changes_requested_by"].include?(agent_name)
                 save_epic_state(epic)
               end
             end
+          end
+
+          # Match a GitHub reviewer login to a configured gate agent.
+          # Handles patterns like "threepio-brainiac", "glados-brainiac[bot]"
+          def match_reviewer_to_gate(reviewer)
+            return nil unless reviewer
+
+            normalized = reviewer.to_s.downcase.delete_suffix("[bot]")
+
+            ReviewGate.gates.find do |gate|
+              agent = gate["agent"].to_s.downcase
+              # Direct match
+              next true if normalized == agent
+              # GitHub bot pattern: "agent-brainiac"
+              next true if normalized == "#{agent}-brainiac"
+              # Check against display_name from registry
+              agents_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "agents.json")
+              if File.exist?(agents_file)
+                agents = JSON.parse(File.read(agents_file))
+                agent_entry = agents[agent]
+                display = agent_entry&.dig("display_name")&.to_s&.downcase
+                next true if display && (normalized == display || normalized == "#{display}-brainiac")
+              end
+              false
+            end
+          rescue StandardError
+            nil
+          end
+
+          # Check if a reviewer matches a specific agent name
+          def match_reviewer_to_agent?(reviewer, agent_name)
+            return false unless reviewer && agent_name
+
+            normalized = reviewer.to_s.downcase.delete_suffix("[bot]")
+            agent = agent_name.to_s.downcase
+
+            return true if normalized == agent
+            return true if normalized == "#{agent}-brainiac"
+
+            # Check display_name
+            agents_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "agents.json")
+            if File.exist?(agents_file)
+              agents = JSON.parse(File.read(agents_file))
+              agent_entry = agents[agent]
+              display = agent_entry&.dig("display_name")&.to_s&.downcase
+              return true if display && (normalized == display || normalized == "#{display}-brainiac")
+            end
+
+            false
+          rescue StandardError
+            false
           end
 
           # When a PR is updated (new commits pushed) — re-trigger gates if in review.
