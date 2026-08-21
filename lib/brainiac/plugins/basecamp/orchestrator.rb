@@ -128,8 +128,12 @@ module Brainiac
             if epic["tasks"].all? { |t| t["status"] == "complete" }
               complete_epic(epic)
             else
-              # Re-read todolist (it may have changed) and dispatch next unblocked tasks
-              resolve_and_dispatch(epic)
+              # Dispatch epic review agent before moving to next tasks
+              # This ensures the plan still makes sense after implementation decisions
+              dispatch_epic_review(epic, card_number) do
+                # After review completes, dispatch next unblocked tasks
+                resolve_and_dispatch(epic)
+              end
             end
 
             save_epic(epic)
@@ -405,6 +409,94 @@ module Brainiac
           rescue StandardError => e
             LOG.warn "[Basecamp:Orchestrator] Could not resolve project for Fizzy card ##{card_number}: #{e.message}" if defined?(LOG)
             nil
+          end
+
+          # Dispatch an agent to review the epic state after a task completes.
+          # This ensures the remaining plan still makes sense given implementation decisions.
+          # The callback is called after the review completes.
+          def dispatch_epic_review(epic, completed_card_number, &callback)
+            agent_name = epic["agent"]
+            remaining_tasks = epic["tasks"].select { |t| t["status"] == "pending" }
+
+            # Skip review if no remaining tasks
+            if remaining_tasks.empty?
+              callback&.call
+              return
+            end
+
+            LOG.info "[Basecamp:Orchestrator] Dispatching epic review after card ##{completed_card_number}" if defined?(LOG)
+
+            # Build the review prompt
+            completed_tasks = epic["tasks"].select { |t| t["status"] == "complete" }
+            completed_summary = completed_tasks.map { |t| "- ##{t['fizzy_card']}: #{t['title']}" }.join("\n")
+            remaining_summary = remaining_tasks.map { |t| "- ##{t['fizzy_card']}: #{t['title']}" }.join("\n")
+
+            prompt = <<~PROMPT
+              ## Epic Review: #{epic['title']}
+
+              Card ##{completed_card_number} just completed. Before dispatching the next task(s), review the epic state.
+
+              ### Completed tasks:
+              #{completed_summary}
+
+              ### Remaining tasks:
+              #{remaining_summary}
+
+              ### Your job:
+              1. Read the memory files for completed tasks to understand what was implemented
+              2. Check if remaining tasks still make sense given the implementation decisions
+              3. If a remaining task is now obsolete, update its Fizzy card with a comment explaining why
+              4. If a remaining task needs different scope, update its Fizzy card description
+              5. If new tasks are needed, create new Fizzy cards (tag with the project)
+
+              Memory files are at: `~/.brainiac/brain/memory/#{agent_name&.downcase}/card-<number>.md`
+
+              After reviewing, post a brief summary comment on the Basecamp todolist:
+              `basecamp comments create #{epic['basecamp_todolist_id']} "Epic review after ##{completed_card_number}: <your summary>" --in #{epic['basecamp_project_id']}`
+
+              Keep it concise — this is a checkpoint, not a full analysis.
+            PROMPT
+
+            # Get project config for the agent
+            task = epic["tasks"].find { |t| t["fizzy_card"] == completed_card_number.to_i }
+            project_key = task&.dig("project") || Config.brainiac_project_for(epic["basecamp_project_id"])
+            projects_file = File.join(BRAINIAC_DIR, "projects.json")
+            projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+            project_config = projects[project_key] || {}
+            repo_path = project_config["repo_path"] || Dir.pwd
+
+            # Spawn the review agent
+            Thread.new do
+              card_key = "epic-review-#{epic['basecamp_todolist_id']}"
+
+              begin
+                pid, log_file = if Object.respond_to?(:run_agent, true)
+                                  Object.send(:run_agent,
+                                              prompt,
+                                              project_config: project_config,
+                                              chdir: repo_path,
+                                              log_name: "epic-review-#{completed_card_number}",
+                                              agent_name: agent_name,
+                                              source: :basecamp,
+                                              card_number: completed_card_number)
+                                end
+
+                # Register session for waybar
+                if pid && Object.respond_to?(:register_session, true)
+                  Object.send(:register_session, card_key, pid, log_file: log_file, agent_name: agent_name)
+                end
+
+                # Wait for the review to complete
+                Process.wait(pid) if pid
+
+                LOG.info "[Basecamp:Orchestrator] Epic review completed for card ##{completed_card_number}" if defined?(LOG)
+              rescue StandardError => e
+                LOG.error "[Basecamp:Orchestrator] Epic review failed: #{e.message}" if defined?(LOG)
+              ensure
+                # Call the callback to dispatch next tasks
+                callback&.call
+              end
+            end
           end
 
           # Mark a Basecamp todo as complete.

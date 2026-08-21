@@ -381,17 +381,6 @@ module Brainiac
                 deps = current_task["depends_on"] || []
                 context_lines << "Dependencies (all satisfied): #{deps.map { |d| "##{d}" }.join(', ')}" if deps.any?
 
-                # Epic review instructions for non-first tasks
-                if complete_count > 0
-                  context_lines << ""
-                  context_lines << "### ⚡ Epic Review"
-                  context_lines << "Before starting, review completed work and check if this task still makes sense:"
-                  context_lines << "- Read memory files from completed tasks above"
-                  context_lines << "- If implementation decisions changed the plan, update the Fizzy card description"
-                  context_lines << "- If this task is now obsolete or needs different scope, comment on the card explaining why"
-                  context_lines << ""
-                end
-
                 review_gate = epic["review_gate"] || Config.review_gate
                 if review_gate == "epic_branch"
                   epic_branches = epic["epic_branches"] || {}
@@ -423,7 +412,6 @@ module Brainiac
                     context_lines << ""
                     context_lines << "**Out-of-scope work:** If reviewers flagged issues better solved outside this epic,"
                     context_lines << "create a new Fizzy card for that work instead of expanding this PR's scope."
-                    context_lines << "Use: `fizzy card create --title \"...\" --body \"...\" --tags brainiac`"
                   end
                 end
 
