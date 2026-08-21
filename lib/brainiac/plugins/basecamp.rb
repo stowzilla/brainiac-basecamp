@@ -61,6 +61,12 @@ module Brainiac
             # Check if all tasks are complete — finalize the epic
             if epic["tasks"]&.all? { |t| t["status"] == "complete" }
               LOG.info "[Basecamp] Resume: all tasks complete — finalizing epic" if defined?(LOG)
+
+              # Mark each Basecamp todo as complete (in case they weren't marked during normal flow)
+              epic["tasks"].each do |task|
+                Orchestrator.send(:mark_todo_complete, epic, task["fizzy_card"])
+              end
+
               Orchestrator.send(:complete_epic, epic)
               Orchestrator.send(:save_epic, epic)
               next
