@@ -58,6 +58,14 @@ module Brainiac
           epics.each do |epic|
             LOG.info "[Basecamp] Resuming epic: #{epic['title']}" if defined?(LOG)
 
+            # Check if all tasks are complete — finalize the epic
+            if epic["tasks"]&.all? { |t| t["status"] == "complete" }
+              LOG.info "[Basecamp] Resume: all tasks complete — finalizing epic" if defined?(LOG)
+              Orchestrator.send(:complete_epic, epic)
+              Orchestrator.send(:save_epic, epic)
+              next
+            end
+
             epic["tasks"]&.each do |task|
               card_number = task["fizzy_card"]
               status = task["status"]
