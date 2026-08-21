@@ -87,8 +87,11 @@ module Brainiac
             end
           end
 
-          # When a PR is merged (on_pr_merge mode only).
+          # When a PR is merged.
+          # - For on_pr_merge mode: listens to :pr_merged (main branch only)
+          # - For epic_branch mode: listens to :pr_merged_to_branch (any branch)
           def register_pr_merged
+            # Legacy hook for on_pr_merge mode (merged to main)
             Brainiac.on(:pr_merged) do |ctx|
               card_number = ctx[:card_number]
               next unless card_number
@@ -99,6 +102,26 @@ module Brainiac
               review_gate = epic["review_gate"] || Config.review_gate
               if review_gate == "on_pr_merge"
                 LOG.info "[Basecamp:Hooks] PR merged for card ##{card_number} — advancing epic" if defined?(LOG)
+                Orchestrator.on_card_completed(card_number)
+              end
+            end
+
+            # New hook for epic_branch mode (merged to any branch, including epic branches)
+            Brainiac.on(:pr_merged_to_branch) do |ctx|
+              card_number = ctx[:card_number]
+              next unless card_number
+
+              epic = Orchestrator.find_epic_for_card(card_number)
+              next unless epic
+
+              review_gate = epic["review_gate"] || Config.review_gate
+              next unless review_gate == "epic_branch"
+
+              base_branch = ctx[:base_branch]
+              epic_branches = epic["epic_branches"]&.values || []
+
+              if epic_branches.include?(base_branch)
+                LOG.info "[Basecamp:Hooks] PR merged to epic branch #{base_branch} for card ##{card_number} — advancing" if defined?(LOG)
                 Orchestrator.on_card_completed(card_number)
               end
             end
