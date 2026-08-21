@@ -451,12 +451,12 @@ module Brainiac
               profile: epic["agent"]&.downcase
             )
 
-            # Emit notification for Discord
+            # Emit generic notification (plugins decide how to deliver)
             if defined?(Brainiac) && Brainiac.respond_to?(:emit)
-              Brainiac.emit(:notify,
-                            event: :epic_completed,
-                            channel: :discord,
-                            message: "🎉 Epic completed: **#{epic['title']}** (#{epic['tasks'].size} tasks)",
+              Brainiac.emit(:epic_completed,
+                            epic_title: epic["title"],
+                            task_count: epic["tasks"].size,
+                            final_prs: epic["final_prs"],
                             agent: epic["agent"])
             end
           end
@@ -564,13 +564,11 @@ module Brainiac
             epic["final_prs"] = prs
             log_event(epic, "final_prs_opened", "Opened #{prs.size} final PR(s): #{prs.map { |p| p[:url] }.join(', ')}")
 
-            # Notify about final PRs
+            # Emit hook so plugins can notify (Discord, Slack, etc.)
             if prs.any? && defined?(Brainiac) && Brainiac.respond_to?(:emit)
-              pr_list = prs.map { |p| "#{p[:project]}: #{p[:url]}" }.join("\n")
-              Brainiac.emit(:notify,
-                            event: :epic_prs_ready,
-                            channel: :discord,
-                            message: "📋 Epic **#{epic['title']}** — final PRs ready for review:\n#{pr_list}",
+              Brainiac.emit(:epic_prs_ready,
+                            epic_title: epic["title"],
+                            final_prs: prs,
                             agent: epic["agent"])
             end
           rescue StandardError => e
