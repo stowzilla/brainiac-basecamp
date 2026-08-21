@@ -80,6 +80,36 @@ module Brainiac
               puts "✓ Config exists at #{CONFIG_FILE}"
             end
 
+            # Validate or auto-detect fizzy_account_id
+            config = load_config
+            current_id = config["fizzy_account_id"]
+
+            if current_id
+              if validate_fizzy_account_id(current_id)
+                puts "✓ fizzy_account_id '#{current_id}' is valid"
+              else
+                puts "⚠️  fizzy_account_id '#{current_id}' could not be validated"
+                detected = detect_fizzy_account_id
+                if detected
+                  config["fizzy_account_id"] = detected
+                  save_config(config)
+                  puts "  → Auto-detected and updated to '#{detected}'"
+                else
+                  puts "  → Could not auto-detect. Set manually: brainiac basecamp set fizzy-account-id <id>"
+                end
+              end
+            else
+              detected = detect_fizzy_account_id
+              if detected
+                config["fizzy_account_id"] = detected
+                save_config(config)
+                puts "✓ Auto-detected fizzy_account_id: #{detected}"
+              else
+                puts "⚠️  Could not auto-detect fizzy_account_id"
+                puts "  Set manually: brainiac basecamp set fizzy-account-id <id>"
+              end
+            end
+
             puts ""
             puts "Next steps:"
             puts "  1. Set Fizzy account ID:  brainiac basecamp set fizzy-account-id <your-fizzy-account-id>"
@@ -127,6 +157,18 @@ module Brainiac
               puts "  Config: ✓ #{CONFIG_FILE}"
               puts "  Bots:   #{config['bot_accounts']&.size || 0} configured"
               puts "  Maps:   #{config['project_mappings']&.size || 0} project mappings"
+
+              # Validate fizzy_account_id
+              fizzy_id = config["fizzy_account_id"]
+              if fizzy_id
+                if validate_fizzy_account_id(fizzy_id)
+                  puts "  Fizzy:  ✓ account #{fizzy_id}"
+                else
+                  puts "  Fizzy:  ⚠️  account '#{fizzy_id}' not found in fizzy accounts"
+                end
+              else
+                puts "  Fizzy:  ✗ fizzy_account_id not set"
+              end
             else
               puts "  Config: ✗ not configured"
             end
@@ -348,10 +390,27 @@ module Brainiac
 
             case key
             when "fizzy-account-id"
-              config["fizzy_account_id"] = value
-              save_config(config)
-              puts "✓ Set fizzy_account_id = #{value}"
-              puts "  Card URLs will be: https://app.fizzy.do/#{value}/cards/NNNN"
+              if validate_fizzy_account_id(value)
+                config["fizzy_account_id"] = value
+                save_config(config)
+                puts "✓ Set fizzy_account_id = #{value}"
+                puts "  Card URLs will be: https://app.fizzy.do/#{value}/cards/NNNN"
+              else
+                puts "✗ Invalid fizzy_account_id: '#{value}'"
+                accounts = fetch_fizzy_accounts
+                if accounts && !accounts.empty?
+                  puts ""
+                  puts "  Available accounts:"
+                  accounts.each do |account|
+                    slug_id = account["slug"].to_s.sub(%r{^/}, "")
+                    puts "    #{slug_id} — #{account['name']}"
+                  end
+                  puts ""
+                  puts "  Usage: brainiac basecamp set fizzy-account-id <id>"
+                else
+                  puts "  Could not fetch accounts from fizzy. Is the CLI authenticated?"
+                end
+              end
             when "review-gate"
               unless %w[on_complete on_pr_merge epic_branch].include?(value)
                 puts "Error: review-gate must be 'on_complete', 'on_pr_merge', or 'epic_branch'"
@@ -395,6 +454,55 @@ module Brainiac
 
           def save_config(config)
             File.write(CONFIG_FILE, JSON.pretty_generate(config))
+          end
+
+          # Validate a fizzy_account_id against known accounts from `fizzy identity show`.
+          #
+          # @param id [String] The account ID to validate
+          # @return [Boolean] true if the ID matches a known account
+          def validate_fizzy_account_id(id)
+            accounts = fetch_fizzy_accounts
+            return false unless accounts
+
+            accounts.any? { |account| account["slug"].to_s.sub(%r{^/}, "") == id.to_s }
+          end
+
+          # Auto-detect the fizzy account ID from the active profile.
+          # Tries `fizzy auth status --json` first (gives the active account directly),
+          # falls back to single-account detection from `fizzy identity show --json`.
+          #
+          # @return [String, nil] The detected account ID or nil
+          def detect_fizzy_account_id
+            # Primary: fizzy auth status gives the active account
+            output = `fizzy auth status --json 2>/dev/null`
+            if $?.success? && !output.empty?
+              data = JSON.parse(output)
+              account_id = data.dig("data", "account")
+              return account_id if account_id && !account_id.empty?
+            end
+
+            # Fallback: if only one account exists, use it
+            accounts = fetch_fizzy_accounts
+            if accounts && accounts.size == 1
+              return accounts.first["slug"].to_s.sub(%r{^/}, "")
+            end
+
+            nil
+          rescue JSON::ParserError
+            nil
+          end
+
+          # Fetch the list of accounts from `fizzy identity show --json`.
+          #
+          # @return [Array<Hash>, nil] Array of account hashes or nil on failure
+          def fetch_fizzy_accounts
+            output = `fizzy identity show --json 2>/dev/null`
+            return nil unless $?.success? && !output.empty?
+
+            data = JSON.parse(output)
+            data.dig("data", "accounts")
+          rescue JSON::ParserError
+            nil
           end
         end
       end
