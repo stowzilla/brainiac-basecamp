@@ -101,10 +101,16 @@ module Brainiac
             epic = find_epic_for_card(card_number)
             return false unless epic
 
+            # Idempotency check — don't process completion twice
+            task = epic["tasks"].find { |t| t["fizzy_card"] == card_number }
+            if task && task["status"] == "complete"
+              LOG.info "[Basecamp:Orchestrator] Card ##{card_number} already complete, skipping duplicate completion" if defined?(LOG)
+              return true
+            end
+
             LOG.info "[Basecamp:Orchestrator] Card ##{card_number} completed, advancing epic '#{epic['title']}'" if defined?(LOG)
 
             # Mark the task as complete in our state
-            task = epic["tasks"].find { |t| t["fizzy_card"] == card_number }
             if task
               task["status"] = "complete"
               task["completed_at"] = Time.now.iso8601
@@ -181,28 +187,31 @@ module Brainiac
 
           # Populate/refresh task list from Basecamp todolist.
           # Resolves project key for each task from Fizzy card tags.
+          # IMPORTANT: Preserves completed tasks that Basecamp API no longer returns.
           def populate_tasks(epic)
             todos = fetch_todos(epic)
             return unless todos
 
-            # Parse into structured tasks
-            tasks = Epic.parse_todos(todos)
+            # Parse new todos from Basecamp
+            new_tasks = Epic.parse_todos(todos)
+            existing_tasks = epic["tasks"] || []
 
-            # Update epic state with current task info, preserving in-flight status
-            epic["tasks"] = tasks.map do |task|
-              existing = epic["tasks"].find { |t| t["fizzy_card"] == task.fizzy_card }
+            # Build a map of existing tasks by fizzy_card for quick lookup
+            existing_by_card = existing_tasks.each_with_object({}) { |t, h| h[t["fizzy_card"]] = t }
+
+            # Start with tasks from the API (incomplete todos)
+            updated_tasks = new_tasks.map do |task|
+              existing = existing_by_card[task.fizzy_card]
               status = if task.completed
                          "complete"
                        elsif existing&.dig("status") == "in_flight"
                          "in_flight"
+                       elsif existing&.dig("status") == "in_review"
+                         "in_review"
                        else
                          "pending"
                        end
 
-              # Resolve project key for this task:
-              # 1. From existing state (preserves across re-resolves)
-              # 2. From Fizzy card tags (authoritative source)
-              # 3. Fallback to Basecamp project mapping
               project_key = existing&.dig("project") ||
                             resolve_project_from_fizzy_card(task.fizzy_card) ||
                             Config.brainiac_project_for(epic["basecamp_project_id"])
@@ -220,6 +229,13 @@ module Brainiac
               }
             end
 
+            # Preserve completed tasks that are no longer in the Basecamp API response
+            new_card_numbers = new_tasks.map(&:fizzy_card)
+            completed_tasks = existing_tasks.select do |t|
+              t["status"] == "complete" && !new_card_numbers.include?(t["fizzy_card"])
+            end
+
+            epic["tasks"] = completed_tasks + updated_tasks
             epic["updated_at"] = Time.now.iso8601
           end
 
