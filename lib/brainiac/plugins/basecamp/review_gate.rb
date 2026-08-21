@@ -19,24 +19,35 @@ module Brainiac
       # directly on GitHub using their bot app identities.
       #
       # Configuration in ~/.brainiac/basecamp.json:
-      #   "review_gates": [
-      #     { "agent": "GLaDOS", "role": "testing" },
-      #     { "agent": "Threepio", "role": "code_quality" }
-      #   ]
+      #   "review_gates": ["GLaDOS", "Threepio"]
       #
-      # All gates run in parallel by default. For sequential gates, add "order": N
-      # (lower order runs first, same order runs in parallel).
+      # The agent's role is looked up from ~/.brainiac/agents.json and used
+      # to determine review focus (test-engineer -> testing, code-reviewer -> quality, etc.)
+      #
+      # All gates run in parallel by default.
       #
       # Gates can also be triggered by a Fizzy card tag "review-gates" for non-epic PRs.
       module ReviewGate
         BRAINIAC_DIR = ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac"))
 
         class << self
-          # Get the configured review gates.
+          # Get the configured review gates as normalized hashes.
+          # Supports both old format [{agent:, role:}] and new format ["AgentName"]
           #
           # @return [Array<Hash>] Gate configs [{agent:, role:}]
           def gates
-            Config.current["review_gates"] || []
+            raw = Config.current["review_gates"] || []
+            raw.map do |entry|
+              if entry.is_a?(Hash)
+                # Old format: {"agent": "GLaDOS", "role": "testing"}
+                entry
+              else
+                # New format: just agent name string — look up role from registry
+                agent_name = entry.to_s
+                role = lookup_agent_role(agent_name)
+                { "agent" => agent_name, "role" => role }
+              end
+            end
           end
 
           # Check if review gates are configured.
@@ -212,19 +223,40 @@ module Brainiac
           end
 
           # Role-specific review instructions.
+          # Maps agent roles from the registry to review focus areas.
           def role_instructions(role)
-            case role.downcase
-            when "testing", "tests", "qa"
+            case role.to_s.downcase.gsub(/[-_]/, "")
+            # From registry role names
+            when "testengineer", "testing", "tests", "qa"
               "- Verify tests exist for new functionality\n- Check test coverage\n- Run the test suite if possible\n- Flag missing edge cases"
-            when "code_quality", "quality"
+            when "codereviewer", "codequality", "quality"
               "- Check code style and conventions\n- Look for code smells, duplication, complexity\n- Verify naming and structure\n- Ensure documentation for public interfaces"
-            when "security"
+            when "securityengineer", "security"
               "- Check for security vulnerabilities\n- Verify input validation\n- Check for secrets/credentials in code\n- Review auth/authz changes"
-            when "architecture"
+            when "architect", "architecture"
               "- Verify design patterns are followed\n- Check for proper separation of concerns\n- Review API design\n- Flag any architectural concerns"
+            when "androidengineer", "android"
+              "- Check Android-specific patterns and conventions\n- Verify lifecycle handling\n- Review resource usage and memory management"
+            when "frontenduxengineer", "frontend", "ux"
+              "- Check UI/UX patterns and accessibility\n- Verify responsive design\n- Review user interaction flows"
             else
               "- Review the changes thoroughly\n- Check for correctness and best practices"
             end
+          end
+
+          # Look up an agent's role from the registry.
+          #
+          # @param agent_name [String] Agent name
+          # @return [String] Role name or "reviewer" as default
+          def lookup_agent_role(agent_name)
+            agents_file = File.join(BRAINIAC_DIR, "agents.json")
+            return "reviewer" unless File.exist?(agents_file)
+
+            agents = JSON.parse(File.read(agents_file))
+            agent = agents[agent_name.downcase]
+            agent&.dig("role") || "reviewer"
+          rescue StandardError
+            "reviewer"
           end
 
           # Resolve a project config from repo path.
