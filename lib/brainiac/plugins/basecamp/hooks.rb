@@ -207,13 +207,14 @@ module Brainiac
                     Thread.new do
                       sleep 60
                       # Reload epic state
-                      epic_reloaded = Orchestrator.load_epics["epics"].find { |e| e["id"] == epic["id"] }
+                      all_epics = Orchestrator.send(:load_epics)
+                      epic_reloaded = all_epics.find { |e| e["id"] == epic["id"] }
                       task_reloaded = epic_reloaded&.dig("tasks")&.find { |t| t["fizzy_card"] == card_number.to_i }
                       if task_reloaded && task_reloaded["status"] == "in_review" && task_reloaded["changes_requested_by"]&.any?
                         LOG.info "[Basecamp:Hooks] Debounce timeout for card ##{card_number} — forcing dispatch" if defined?(LOG)
                         task_reloaded["status"] = "in_flight"
                         task_reloaded.delete("changes_debounce_started")
-                        Orchestrator.save_epic(epic_reloaded)
+                        Orchestrator.send(:save_epic, epic_reloaded)
                         # Re-assign card to trigger dispatch
                         fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, epic_reloaded["agent"])
                         Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id) if fizzy_user_id
