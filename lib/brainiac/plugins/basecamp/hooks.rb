@@ -214,8 +214,16 @@ module Brainiac
                   # All gates have reviewed — dispatch implementation agent to address ALL feedback
                   LOG.info "[Basecamp:Hooks] All gates responded for card ##{card_number} — dispatching fixes" if defined?(LOG)
                   task["status"] = "in_flight"
+                  task.delete("changes_debounce_started")
                   save_epic_state(epic)
-                  # brainiac-github will dispatch the impl agent since this is changes_requested
+
+                  # Re-assign card to implementation agent to trigger dispatch
+                  impl_agent = epic["agent"]
+                  fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
+                  if fizzy_user_id
+                    LOG.info "[Basecamp:Hooks] Re-assigning card ##{card_number} to #{impl_agent} for fixes" if defined?(LOG)
+                    Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
+                  end
                 else
                   # Wait for remaining gates to respond
                   responded = (task["gate_approvals"]&.size || 0) + (task["changes_requested_by"]&.size || 0)
