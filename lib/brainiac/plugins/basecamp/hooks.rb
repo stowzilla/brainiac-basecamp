@@ -357,6 +357,7 @@ module Brainiac
               tasks = epic["tasks"] || []
               current_task = tasks.find { |t| t["fizzy_card"] == card_number.to_i }
               complete_count = tasks.count { |t| t["status"] == "complete" }
+              agent_name = ctx[:agent_name] || epic["agent"]
 
               context_lines = [
                 "## Epic Context",
@@ -365,15 +366,37 @@ module Brainiac
                 ""
               ]
 
+              # List completed tasks with their memory files for reference
+              completed_tasks = tasks.select { |t| t["status"] == "complete" }
+              if completed_tasks.any?
+                context_lines << "### Completed tasks (you can reference their memory files):"
+                completed_tasks.each do |t|
+                  memory_file = "~/.brainiac/brain/memory/#{agent_name&.downcase}/card-#{t['fizzy_card']}.md"
+                  context_lines << "  - ##{t['fizzy_card']}: #{t['title']} → `#{memory_file}`"
+                end
+                context_lines << ""
+              end
+
               if current_task
                 deps = current_task["depends_on"] || []
                 context_lines << "Dependencies (all satisfied): #{deps.map { |d| "##{d}" }.join(', ')}" if deps.any?
+
+                # Epic review instructions for non-first tasks
+                if complete_count > 0
+                  context_lines << ""
+                  context_lines << "### ⚡ Epic Review"
+                  context_lines << "Before starting, review completed work and check if this task still makes sense:"
+                  context_lines << "- Read memory files from completed tasks above"
+                  context_lines << "- If implementation decisions changed the plan, update the Fizzy card description"
+                  context_lines << "- If this task is now obsolete or needs different scope, comment on the card explaining why"
+                  context_lines << ""
+                end
 
                 review_gate = epic["review_gate"] || Config.review_gate
                 if review_gate == "epic_branch"
                   epic_branches = epic["epic_branches"] || {}
                   branch = epic_branches[current_task["project"]] || epic_branches.values.first
-                  context_lines << "" << "**Epic branch mode:** Your PR should target `#{branch}` (not main)." if branch
+                  context_lines << "**Epic branch mode:** Your PR should target `#{branch}` (not main)." if branch
 
                   if ReviewGate.enabled?
                     gate_names = ReviewGate.gates.map { |g| "#{g['agent']} (#{g['role']})" }.join(", ")
@@ -387,19 +410,20 @@ module Brainiac
                     gate_agents = approvals.map { |a| a["agent"] }.join(", ")
 
                     context_lines << ""
-                    context_lines << "## ⚡ FINAL DECISION REQUIRED — APPROVE TO MERGE"
+                    context_lines << "## ⚡ FINAL DECISION REQUIRED"
                     context_lines << ""
                     context_lines << "All review gates have approved (#{gate_agents}). Your job now:"
                     context_lines << ""
                     context_lines << "1. Read their feedback: `gh pr view #{pr_number} --comments`"
                     context_lines << "2. If fixes needed → make them, commit, push"
-                    context_lines << "3. When ready → **approve the PR to trigger merge**:"
+                    context_lines << "3. When ready → **merge the PR**:"
                     context_lines << "   ```"
-                    context_lines << "   gh pr review #{pr_number} --approve --body \"LGTM — merging to epic branch\""
+                    context_lines << "   gh pr merge #{pr_number} --squash --delete-branch"
                     context_lines << "   ```"
                     context_lines << ""
-                    context_lines << "**CRITICAL:** You must run `gh pr review --approve` to merge. A Fizzy comment is NOT enough."
-                    context_lines << "Your approval triggers auto-merge into the epic branch."
+                    context_lines << "**Out-of-scope work:** If reviewers flagged issues better solved outside this epic,"
+                    context_lines << "create a new Fizzy card for that work instead of expanding this PR's scope."
+                    context_lines << "Use: `fizzy card create --title \"...\" --body \"...\" --tags brainiac`"
                   end
                 end
 
