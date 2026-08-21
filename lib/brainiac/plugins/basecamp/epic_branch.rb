@@ -179,14 +179,38 @@ module Brainiac
 
           # Find a PR for a given branch targeting a specific base.
           def find_pr_for_branch(repo_path:, branch:, base:)
+            # Try exact match first
             stdout, _stderr, status = Open3.capture3(
               "gh", "pr", "list", "--head", branch, "--base", base, "--json", "number", "--jq", ".[0].number",
               chdir: repo_path
             )
-            return nil unless status.success?
+            if status.success? && !stdout.strip.empty?
+              return stdout.strip.to_i
+            end
 
-            number = stdout.strip
-            number.empty? ? nil : number.to_i
+            # Try prefix match (branch might be "fizzy-1168" but actual is "fizzy-1168-slug")
+            card_num = branch.match(/fizzy-(\d+)/)[1] rescue nil
+            if card_num
+              # Search with base filter
+              stdout, _stderr, status = Open3.capture3(
+                "gh", "pr", "list", "--base", base, "--json", "number,headRefName",
+                "--jq", ".[] | select(.headRefName | startswith(\"fizzy-#{card_num}\")) | .number",
+                chdir: repo_path
+              )
+              if status.success? && !stdout.strip.empty?
+                return stdout.strip.split("\n").first.to_i
+              end
+
+              # Last resort: search without base filter (PR might target wrong base)
+              stdout, _stderr, status = Open3.capture3(
+                "gh", "pr", "list", "--json", "number,headRefName",
+                "--jq", ".[] | select(.headRefName | startswith(\"fizzy-#{card_num}\")) | .number",
+                chdir: repo_path
+              )
+              return stdout.strip.split("\n").first.to_i if status.success? && !stdout.strip.empty?
+            end
+
+            nil
           end
 
           # Build the body for the final epic PR.
