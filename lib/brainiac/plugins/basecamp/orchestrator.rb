@@ -58,6 +58,11 @@ module Brainiac
               create_epic_branches_for(epic)
             end
 
+            # CRITICAL: Save epic state BEFORE dispatching tasks.
+            # The resolve_pr_target hook reads from disk, so tasks and epic_branches
+            # must be persisted before the agent is dispatched.
+            save_epic(epic)
+
             # Finally: Dispatch unblocked work
             dispatch_unblocked_tasks(epic)
 
