@@ -545,8 +545,16 @@ module Brainiac
 
             # Re-assign the Fizzy card to the implementation agent (triggers dispatch)
             fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, agent_name)
+            LOG.info "[Basecamp:Hooks] Resolved fizzy_user_id for #{agent_name}: #{fizzy_user_id.inspect}" if defined?(LOG)
             if fizzy_user_id
-              Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
+              stdout, stderr, status = Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
+              if status.success?
+                LOG.info "[Basecamp:Hooks] Assigned card ##{card_number} to #{agent_name}" if defined?(LOG)
+              else
+                LOG.error "[Basecamp:Hooks] Failed to assign card ##{card_number}: #{stderr}" if defined?(LOG)
+              end
+            else
+              LOG.error "[Basecamp:Hooks] Could not resolve fizzy user ID for #{agent_name}" if defined?(LOG)
             end
 
             # The agent's prompt (from brainiac-fizzy's followup handler) will include the PR context.
