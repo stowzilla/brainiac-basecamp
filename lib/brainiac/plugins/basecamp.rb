@@ -61,6 +61,7 @@ module Brainiac
             epic["tasks"]&.each do |task|
               card_number = task["fizzy_card"]
               status = task["status"]
+              LOG.info "[Basecamp] Resume: task ##{card_number} status=#{status}" if defined?(LOG)
 
               case status
               when "in_review", "in_flight"
@@ -127,12 +128,17 @@ module Brainiac
 
         def resume_final_decision_task(epic, task)
           card_number = task["fizzy_card"]
+          LOG.info "[Basecamp] Resume: checking final_decision task ##{card_number}, awaiting=#{task['awaiting_final_decision']}" if defined?(LOG)
 
-          # Check if the implementation agent has approved
-          # If awaiting_final_decision is still true, re-dispatch
-          if task["awaiting_final_decision"]
-            LOG.info "[Basecamp] Resume: re-dispatching final decision for ##{card_number}" if defined?(LOG)
+          # If awaiting_final_decision is set, re-dispatch
+          # Also handle the case where it's nil but gates are all approved (stale state)
+          if task["awaiting_final_decision"] || ReviewGate.all_gates_passed?(task)
+            LOG.info "[Basecamp] Resume: dispatching final decision for ##{card_number}" if defined?(LOG)
+            task["awaiting_final_decision"] = true
+            Hooks.send(:save_epic_state, epic)
             Hooks.send(:dispatch_final_decision, epic, task, {})
+          else
+            LOG.info "[Basecamp] Resume: final_decision task ##{card_number} not ready (awaiting=#{task['awaiting_final_decision']}, gates_passed=#{ReviewGate.all_gates_passed?(task)})" if defined?(LOG)
           end
         end
 
