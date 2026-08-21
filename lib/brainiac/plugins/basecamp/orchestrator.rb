@@ -696,8 +696,20 @@ module Brainiac
             {}
           end
 
-          # Send a notification via the configured channel (Discord, etc.).
-          # Reads discord_channel_id from basecamp.json notifications config.
+          # Send a notification via the configured channel.
+          # Supports multiple notification backends via the :notify hook.
+          #
+          # Config in basecamp.json:
+          #   "notifications": {
+          #     "channel": "discord",           # or "slack", etc.
+          #     "target": "1423854179880927274", # channel/room ID
+          #     "epic_completed": true,          # per-event toggles
+          #     ...
+          #   }
+          #
+          # Legacy config (still supported):
+          #   "notifications": { "discord_channel_id": "..." }
+          #
           def send_notification(event:, message:, agent: nil)
             return unless defined?(Brainiac) && Brainiac.respond_to?(:emit)
 
@@ -705,13 +717,14 @@ module Brainiac
             notifications_config = Config.current.dig("notifications") || {}
             return unless notifications_config[event.to_s] != false
 
-            # Get the target channel
-            discord_channel = notifications_config["discord_channel_id"]
-            return unless discord_channel
+            # Get channel type and target (supports both new and legacy config)
+            channel = notifications_config["channel"]&.to_sym || :discord
+            target = notifications_config["target"] || notifications_config["discord_channel_id"]
+            return unless target
 
             Brainiac.emit(:notify,
-                          channel: :discord,
-                          target: discord_channel,
+                          channel: channel,
+                          target: target,
                           message: message,
                           agent: agent)
           end

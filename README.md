@@ -153,7 +153,8 @@ Edit `~/.brainiac/basecamp.json`:
 ```json
 {
   "notifications": {
-    "discord_channel_id": "1423854179880927274",
+    "channel": "discord",
+    "target": "1423854179880927274",
     "epic_started": true,
     "task_dispatched": true,
     "task_completed": true,
@@ -161,6 +162,8 @@ Edit `~/.brainiac/basecamp.json`:
   }
 }
 ```
+
+The `channel` can be any notification backend that subscribes to the `:notify` hook (discord, slack, etc.). The `target` is the channel/room ID for that backend.
 
 ### Step 7: Register Webhook
 
@@ -199,7 +202,8 @@ brainiac restart
     { "agent": "Threepio", "role": "code-reviewer" }
   ],
   "notifications": {
-    "discord_channel_id": "1423854179880927274",
+    "channel": "discord",
+    "target": "1423854179880927274",
     "epic_started": true,
     "task_dispatched": true,
     "task_completed": true,
