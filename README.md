@@ -1,152 +1,173 @@
 # brainiac-basecamp
 
-Basecamp epic orchestration plugin for [Brainiac](https://github.com/stowzilla/brainiac). Manages high-level epics in Basecamp while agents execute individual tasks via Fizzy cards — with dependency tracking, sequential dispatch, review gates, and bidirectional status sync.
+Basecamp epic orchestration plugin for [Brainiac](https://github.com/stowzilla/brainiac). Manages high-level epics in Basecamp while agents execute individual tasks via Fizzy cards — with dependency tracking, parallel dispatch, review gates, and bidirectional status sync.
 
 ## How It Works
 
 1. Create a Basecamp **todolist** with the `Epic:` prefix
-2. Add todos to it — each one references a Fizzy card with a clickable link in the description
+2. Add todos to it — each one references a Fizzy card number in the title
 3. Assign any todo in the list to your bot account
 4. The plugin receives the webhook, reads the todolist, builds the dependency graph, and starts orchestrating
-5. Unblocked Fizzy cards are assigned to agents automatically
-6. As cards complete (and optionally pass review), the plugin marks Basecamp todos done and dispatches the next wave
-7. When all tasks finish, a summary message is posted and the epic is marked complete
+5. Unblocked Fizzy cards are assigned to agents automatically (in parallel if independent)
+6. After each task completes, an epic review agent checks if the plan still makes sense
+7. When PRs are opened, review gate agents (GLaDOS, Threepio) review in parallel
+8. After all gates approve, the implementation agent makes the final decision and merges
+9. When all tasks finish, a final PR is opened from the epic branch to main
 
-## Epic Format (Option C: Todolist + Rich Descriptions)
+## Epic Format
 
-Create a Basecamp todolist:
+Create a Basecamp todolist with the `Epic:` prefix:
 
 ```
 Todolist: "Epic: Build Authentication System"
 
 Todos:
-  □ "#1234 — Set up auth models"
-      Description: Fizzy: <link to #1234>
-                   Depends on: none
-
-  □ "#1235 — Add API endpoints"
-      Description: Fizzy: <link to #1235>
-                   Depends on: #1234
-
-  □ "#1236 — Frontend login form"
-      Description: Fizzy: <link to #1236>
-                   Depends on: #1234, #1235
+  □ #1234 — Set up auth models
+  □ #1235 — Add API endpoints [depends:1234]
+  □ #1236 — Frontend login form [depends:1234,1235]
 ```
 
-Each todo's description contains:
-- A **clickable link** to the Fizzy card (`<a href="https://app.fizzy.do/org/cards/1234">#1234</a>`)
-- **Dependencies** in `[depends:1234,1235]` or `Depends on: #1234, #1235` format
-- Optionally, the assigned **agent** name
+- **Card reference:** `#1234` in the title links to Fizzy card
+- **Dependencies:** `[depends:1234,1235]` in the title declares dependencies
+- Cards without dependencies (or with all deps satisfied) dispatch in parallel
 
-The plugin auto-generates these descriptions via `Epic.build_todo_description`.
+## Review Gate Modes
 
-## Review Gate
-
-Two modes (configured via `brainiac basecamp set review-gate`):
+Configure via `brainiac basecamp set review-gate <mode>`:
 
 | Mode | Behavior |
 |------|----------|
-| `on_complete` (default) | Advance to next task as soon as agent finishes |
-| `on_pr_merge` | Wait for PR merge before marking task done and unblocking dependents |
+| `on_complete` | Advance immediately when agent finishes |
+| `on_pr_merge` | Wait for PR merge to main before advancing |
+| `epic_branch` | PRs target an epic branch; review gates + final decision before merge |
 
-The `on_pr_merge` mode hooks into `:pr_merged` events from brainiac-github. This gives you a full review cycle between each epic task.
+### Epic Branch Mode (Recommended)
+
+The `epic_branch` mode provides the most control:
+
+1. Creates an `epic/<name>` branch when the epic starts
+2. All task PRs target the epic branch (not main)
+3. After PR opens, **review gate agents** (e.g., GLaDOS, Threepio) review in parallel
+4. When all gates approve, the **implementation agent** makes the final decision
+5. Agent reviews gate feedback, makes fixes if needed, then merges to epic branch
+6. After all tasks complete, a **final PR** opens from epic branch → main
+
+Configure review gates in `~/.brainiac/basecamp.json`:
+
+```json
+{
+  "review_gate": "epic_branch",
+  "review_gates": [
+    { "agent": "GLaDOS", "role": "test-engineer" },
+    { "agent": "Threepio", "role": "code-reviewer" }
+  ]
+}
+```
+
+## Epic Review Between Tasks
+
+After each task completes (before dispatching the next batch), an **epic review agent** is dispatched to:
+
+1. Read memory files from completed tasks
+2. Check if remaining tasks still make sense given implementation decisions
+3. Update dependencies if implementation created new relationships
+4. Mark tasks obsolete or adjust scope if needed
+5. Create new Fizzy cards if gaps are discovered
+
+This prevents wasted work when early implementation decisions change the plan.
 
 ## Prerequisites
 
-- [Basecamp CLI](https://github.com/basecamp/basecamp-cli) installed and authenticated
+- [Basecamp CLI](https://github.com/stowzilla/basecamp-cli) installed and authenticated
 - A Basecamp bot user account (for webhook-triggered orchestration)
 - brainiac-fizzy plugin (cards already exist in Fizzy)
-- brainiac-github plugin (optional, for `on_pr_merge` review gate)
+- brainiac-github plugin (required for `on_pr_merge` and `epic_branch` modes)
 
-## Getting Started
-
-### Step 1: Install the Basecamp CLI
+## Installation
 
 ```bash
-curl -fsSL https://basecamp.com/install-cli | bash
+brainiac install basecamp
+brainiac basecamp setup
 ```
 
-Verify it's installed:
+## Configuration
+
+### Step 1: Set Fizzy Account ID
 
 ```bash
-basecamp --version
+brainiac basecamp set fizzy-account-id <your-fizzy-org-id>
 ```
 
-### Step 2: Authenticate with Basecamp
+### Step 2: Register Bot Account
 
-```bash
-basecamp auth login
-```
-
-This opens your browser for OAuth. Once authenticated, verify:
-
-```bash
-basecamp auth status
-```
-
-### Step 3: Create a Bot Account in Basecamp
-
-Go to your Basecamp account → Adminland → People → Invite people.
-
-Create a new user account for the bot (e.g. "Galen Bot" or "Brainiac Andy"). This account will be the one that receives epic assignments.
-
-Once created, find the bot's **person ID**:
-
+Find your bot's Basecamp person ID:
 ```bash
 basecamp people list --jq '.data[] | select(.name | contains("Galen")) | {id, name}'
 ```
 
-Note the `id` value — you'll need it in Step 6.
-
-### Step 4: Install the Plugin
-
+Register it:
 ```bash
-brainiac install basecamp --path /home/andy/Code/brainiac-basecamp
+brainiac basecamp bot add my-server <person-id> Galen
 ```
 
-### Step 5: Run Setup
+### Step 3: Map Projects
 
+Find your Basecamp project ID:
 ```bash
-brainiac basecamp setup
-```
-
-This checks prerequisites and creates `~/.brainiac/basecamp.json`.
-
-### Step 6: Configure the Plugin
-
-```bash
-# Set your Fizzy org slug (used to build clickable card URLs in Basecamp)
-brainiac basecamp set fizzy-account-id 6098707
-
-# Register your bot account (name it anything, use the person ID from Step 3)
-brainiac basecamp bot add andy-server <person-id-from-step-3> Galen
-
-# Map your Brainiac project(s) to Basecamp project IDs
-# Find your Basecamp project ID:
 basecamp projects list --jq '.data[] | {id, name}'
-# Then map it:
-brainiac basecamp projects map stowzilla <basecamp-project-id>
-
-# Optionally enable the review gate (waits for PR merge between tasks)
-brainiac basecamp set review-gate on_pr_merge
 ```
 
-Verify your config:
+Map it to your Brainiac project:
+```bash
+brainiac basecamp projects map stowzilla <basecamp-project-id>
+```
+
+### Step 4: Set Review Gate Mode
 
 ```bash
-brainiac basecamp config
+# Simple mode — advance when agent finishes
+brainiac basecamp set review-gate on_complete
+
+# PR mode — wait for PR merge to main
+brainiac basecamp set review-gate on_pr_merge
+
+# Epic branch mode — review gates + final decision (recommended)
+brainiac basecamp set review-gate epic_branch
 ```
 
-### Step 7: Register the Webhook
+### Step 5: Configure Review Gates (epic_branch mode)
 
-Point Basecamp at your brainiac server's ngrok URL:
+Edit `~/.brainiac/basecamp.json`:
+
+```json
+{
+  "review_gates": [
+    { "agent": "GLaDOS", "role": "test-engineer" },
+    { "agent": "Threepio", "role": "code-reviewer" }
+  ]
+}
+```
+
+### Step 6: Configure Notifications (Optional)
+
+```json
+{
+  "notifications": {
+    "discord_channel_id": "1423854179880927274",
+    "epic_started": true,
+    "task_dispatched": true,
+    "task_completed": true,
+    "epic_completed": true
+  }
+}
+```
+
+### Step 7: Register Webhook
 
 ```bash
 basecamp webhooks create "https://your-ngrok.ngrok-free.app/basecamp" \
   --types "Todo,Todolist" --in <basecamp-project-id>
 ```
-
-Replace `your-ngrok.ngrok-free.app` with your actual ngrok domain.
 
 ### Step 8: Restart Brainiac
 
@@ -154,48 +175,7 @@ Replace `your-ngrok.ngrok-free.app` with your actual ngrok domain.
 brainiac restart
 ```
 
-Verify the plugin loaded:
-
-```bash
-brainiac plugins
-curl http://localhost:4567/api/basecamp
-```
-
-### Step 9: Create Your First Epic
-
-In Basecamp, create a new todolist with the `Epic:` prefix:
-
-**Todolist title:** `Epic: My First Feature`
-
-Add todos to it. Each todo title should reference a Fizzy card number:
-
-```
-#1234 — Build the API endpoint
-#1235 — Add frontend form
-#1236 — Write integration tests [depends:1234,1235]
-```
-
-Optionally, add rich text descriptions with clickable Fizzy links:
-
-```html
-<a href="https://app.fizzy.do/stowzilla/cards/1234">Fizzy #1234</a>
-Depends on: none
-```
-
-### Step 10: Start the Epic
-
-Assign any todo in the epic todolist to your bot account (the one from Step 3).
-
-The webhook fires → brainiac-basecamp reads the todolist → builds the dependency graph → assigns the first unblocked Fizzy card to your agent.
-
-Watch it go:
-
-```bash
-brainiac basecamp epics
-curl http://localhost:4567/api/basecamp/epics
-```
-
-## Configuration
+## Full Configuration Example
 
 `~/.brainiac/basecamp.json`:
 
@@ -203,19 +183,23 @@ curl http://localhost:4567/api/basecamp/epics
 {
   "bot_accounts": {
     "andy-server": {
-      "person_id": "12345",
+      "person_id": "52992796",
       "default_agent": "Galen"
     }
   },
   "project_mappings": {
-    "marketplace": {
-      "basecamp_project_id": "67890"
-    }
+    "stowzilla": { "basecamp_project_id": "45920028" },
+    "brainiac": { "basecamp_project_id": "45920028" }
   },
   "epic_prefix": "Epic:",
   "fizzy_account_id": "6098707",
-  "review_gate": "on_pr_merge",
+  "review_gate": "epic_branch",
+  "review_gates": [
+    { "agent": "GLaDOS", "role": "test-engineer" },
+    { "agent": "Threepio", "role": "code-reviewer" }
+  ],
   "notifications": {
+    "discord_channel_id": "1423854179880927274",
     "epic_started": true,
     "task_dispatched": true,
     "task_completed": true,
@@ -236,8 +220,8 @@ brainiac basecamp bot add <name> <id> <agent>        # Add bot account
 brainiac basecamp bot list                           # List bot accounts
 brainiac basecamp projects map <key> <bc-id>         # Map project
 brainiac basecamp projects list                      # List mappings
-brainiac basecamp set fizzy-account-id <id>          # Set Fizzy account ID for URLs
-brainiac basecamp set review-gate <mode>             # on_complete or on_pr_merge
+brainiac basecamp set fizzy-account-id <id>          # Set Fizzy account ID
+brainiac basecamp set review-gate <mode>             # on_complete, on_pr_merge, epic_branch
 brainiac basecamp set epic-prefix <prefix>           # Epic detection prefix
 ```
 
@@ -251,18 +235,21 @@ curl http://localhost:4567/api/basecamp
 curl http://localhost:4567/api/basecamp/epics
 curl "http://localhost:4567/api/basecamp/epics?status=all"
 
-# Specific epic with dependency graph
-curl http://localhost:4567/api/basecamp/epics/epic-123
-
-# Manually start an epic (for testing)
-curl -X POST http://localhost:4567/api/basecamp/epics \
-  -H "Content-Type: application/json" \
-  -d '{"todolist_id":"123","project_id":"456","agent":"Galen","title":"Epic: Test"}'
-
-# Pause/resume
-curl -X POST http://localhost:4567/api/basecamp/epics/epic-123/pause
-curl -X POST http://localhost:4567/api/basecamp/epics/epic-123/resume
+# Specific epic
+curl http://localhost:4567/api/basecamp/epics/<todolist-id>
 ```
+
+## Self-Healing on Restart
+
+When brainiac restarts, the plugin:
+
+1. Loads active epics from disk
+2. For tasks in `in_review` status: syncs gate approvals from GitHub PR reviews
+3. If all gates passed: dispatches final decision
+4. If all tasks complete: finalizes epic (marks todos done, opens final PR)
+5. Dispatches any unblocked pending tasks
+
+No manual intervention needed — just restart and it picks up where it left off.
 
 ## Architecture
 
@@ -270,52 +257,40 @@ curl -X POST http://localhost:4567/api/basecamp/epics/epic-123/resume
 
 | Hook | What It Does |
 |------|-------------|
-| `:agent_completed` | Advances epic when Fizzy card completes (respects review gate) |
+| `:agent_completed` | Dispatches review gates after PR opens; advances epic on task completion |
 | `:pr_merged` | Advances epic if review gate = `on_pr_merge` |
-| `:build_brain_context` | Injects epic context into agent prompts |
+| `:pr_merged_to_branch` | Advances epic when PR merges to epic branch |
+| `:pr_review_received` | Tracks gate approvals; triggers final decision when all gates pass |
+| `:build_brain_context` | Injects epic context + memory references into agent prompts |
+| `:resolve_base_branch` | Returns epic branch as worktree base |
+| `:resolve_pr_target` | Returns epic branch as PR target |
 
-### Orchestration Flow
+### Orchestration Flow (Epic Branch Mode)
 
 ```
-Webhook (todo_assignment_changed)
-  → Is parent todolist an epic? (Epic: prefix)
-  → Is assigned person a bot account?
-  → Start orchestration:
-      1. Read all todos in todolist
-      2. Parse card refs + dependencies from titles/descriptions
-      3. Build dependency graph
-      4. Dispatch unblocked Fizzy cards (assign via fizzy CLI)
-      5. Wait for :agent_completed / :pr_merged
-      6. Mark Basecamp todo complete
-      7. Re-evaluate graph → dispatch next
-      8. Repeat until all done
-      9. Post summary message, emit notification
+Webhook (todo assigned to bot)
+  → Read todolist, build dependency graph
+  → Create epic/<name> branch
+  → Dispatch unblocked Fizzy cards (parallel if independent)
+
+Card completes, PR opens
+  → Dispatch review gate agents (parallel)
+  → Gates review and approve/request changes
+
+All gates approve
+  → Dispatch implementation agent for final decision
+  → Agent reviews feedback, makes fixes if needed, merges PR
+
+PR merged to epic branch
+  → Mark Basecamp todo complete
+  → Dispatch epic review agent (checks if plan still makes sense)
+  → Dispatch next unblocked cards
+
+All tasks complete
+  → Open final PR: epic/<name> → main
+  → Post summary to Basecamp
+  → Send notification
 ```
-
-### Dual-Server Pattern
-
-Both brainiac servers receive the same Basecamp webhook. Only the server whose bot account person ID matches an `added_person_id` in the webhook will start orchestration. Same pattern as Fizzy's `local` flag.
-
-## Dependency Tracking
-
-Dependencies are declared in todo titles or descriptions:
-
-**In title:** `#1236 — Frontend [depends:1234,1235]`
-
-**In description (rich text):**
-```html
-<div>
-  <strong>Fizzy:</strong> <a href="https://app.fizzy.do/stowzilla/cards/1236">#1236</a><br>
-  <strong>Depends on:</strong> #1234, #1235<br>
-</div>
-```
-
-The orchestrator:
-1. Parses all todos to build a directed acyclic graph
-2. Identifies tasks with no unmet dependencies (unblocked)
-3. Assigns unblocked Fizzy cards to agents
-4. On completion, re-evaluates the graph for newly unblocked tasks
-5. Supports mid-epic changes — re-reads the todolist on each cycle
 
 ## License
 
