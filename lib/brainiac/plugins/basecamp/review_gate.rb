@@ -71,6 +71,69 @@ module Brainiac
             required_agents.all? { |agent| approved_agents.include?(agent) }
           end
 
+          # Sync gate approvals from GitHub PR reviews (self-healing).
+          # Queries actual PR review state and updates task accordingly.
+          #
+          # @param task [Hash] Task state (mutated in place)
+          # @param repo_path [String] Path to repo for gh CLI
+          # @return [Hash] Summary of changes made
+          def sync_from_github(task, repo_path:)
+            return { synced: false, reason: "no PR" } unless task["pr_number"]
+
+            pr_number = task["pr_number"]
+            stdout, _, status = Open3.capture3(
+              "gh", "pr", "view", pr_number.to_s,
+              "--json", "reviews",
+              "--jq", ".reviews[] | [.author.login, .state] | @tsv",
+              chdir: repo_path
+            )
+            return { synced: false, reason: "gh failed" } unless status.success?
+
+            # Parse reviews into {author => state}
+            reviews = {}
+            stdout.each_line do |line|
+              author, state = line.strip.split("\t")
+              reviews[author.downcase] = state.downcase if author && state
+            end
+
+            changes = { approvals_added: [], changes_cleared: [] }
+
+            # Check each gate agent's review state
+            gates.each do |gate|
+              agent = gate["agent"]
+              role = gate["role"] || "review"
+
+              # Match agent to GitHub login (agent-brainiac pattern)
+              github_login = "#{agent.downcase}-brainiac"
+              review_state = reviews[github_login]
+
+              next unless review_state
+
+              if review_state == "approved"
+                # Record approval if not already recorded
+                unless (task["gate_approvals"] || []).any? { |a| a["agent"].downcase == agent.downcase }
+                  record_approval(task, agent: agent, role: role)
+                  changes[:approvals_added] << agent
+                end
+                # Clear from changes_requested if present
+                if task["changes_requested_by"]&.include?(agent)
+                  task["changes_requested_by"].delete(agent)
+                  changes[:changes_cleared] << agent
+                end
+              elsif review_state == "changes_requested"
+                # Remove any stale approval
+                task["gate_approvals"]&.reject! { |a| a["agent"].downcase == agent.downcase }
+                # Track changes_requested
+                task["changes_requested_by"] ||= []
+                task["changes_requested_by"] << agent unless task["changes_requested_by"].include?(agent)
+              end
+            end
+
+            { synced: true, changes: changes }
+          rescue StandardError => e
+            { synced: false, reason: e.message }
+          end
+
           # Record a gate approval.
           #
           # @param task [Hash] Task state (mutated in place)

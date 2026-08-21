@@ -206,15 +206,16 @@ module Brainiac
                     save_epic_state(epic)
                     Thread.new do
                       sleep 60
-                      # Reload epic state
-                      all_epics = Orchestrator.send(:load_epics)
-                      epic_reloaded = all_epics.find { |e| e["id"] == epic["id"] }
-                      task_reloaded = epic_reloaded&.dig("tasks")&.find { |t| t["fizzy_card"] == card_number.to_i }
+                      # Reload epic state using public API
+                      epic_reloaded = Orchestrator.find_epic_for_card(card_number)
+                      next unless epic_reloaded
+
+                      task_reloaded = epic_reloaded["tasks"]&.find { |t| t["fizzy_card"] == card_number.to_i }
                       if task_reloaded && task_reloaded["status"] == "in_review" && task_reloaded["changes_requested_by"]&.any?
                         LOG.info "[Basecamp:Hooks] Debounce timeout for card ##{card_number} — forcing dispatch" if defined?(LOG)
                         task_reloaded["status"] = "in_flight"
                         task_reloaded.delete("changes_debounce_started")
-                        Orchestrator.send(:save_epic, epic_reloaded)
+                        save_epic_state(epic_reloaded)
                         # Re-assign card to trigger dispatch
                         fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, epic_reloaded["agent"])
                         Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id) if fizzy_user_id
@@ -445,6 +446,24 @@ module Brainiac
 
             task["pr_number"] = pr_number
             task["pr_repo"] = github_repo
+
+            # Self-healing: sync gate approvals from GitHub before dispatching
+            # This handles the case where gates already reviewed but our state is stale
+            sync_result = ReviewGate.sync_from_github(task, repo_path: repo_path)
+            if sync_result[:synced] && sync_result[:changes]
+              changes = sync_result[:changes]
+              if changes[:approvals_added]&.any?
+                LOG.info "[Basecamp:Hooks] Self-healed: recorded approvals from #{changes[:approvals_added].join(', ')}" if defined?(LOG)
+              end
+            end
+
+            # Check if all gates have already approved (self-healed state)
+            if ReviewGate.all_gates_passed?(task)
+              LOG.info "[Basecamp:Hooks] All gates already approved for card ##{card_number} — dispatching final decision" if defined?(LOG)
+              save_epic_state(epic)
+              dispatch_final_decision(epic, task, ctx)
+              return
+            end
 
             ReviewGate.dispatch_gates(
               epic: epic,
