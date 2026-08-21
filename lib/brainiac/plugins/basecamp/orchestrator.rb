@@ -429,7 +429,11 @@ module Brainiac
             # Build the review prompt
             completed_tasks = epic["tasks"].select { |t| t["status"] == "complete" }
             completed_summary = completed_tasks.map { |t| "- ##{t['fizzy_card']}: #{t['title']}" }.join("\n")
-            remaining_summary = remaining_tasks.map { |t| "- ##{t['fizzy_card']}: #{t['title']}" }.join("\n")
+            remaining_summary = remaining_tasks.map do |t|
+              deps = t["depends_on"] || []
+              dep_str = deps.any? ? " [depends: #{deps.map { |d| "##{d}" }.join(', ')}]" : ""
+              "- ##{t['fizzy_card']}: #{t['title']}#{dep_str}"
+            end.join("\n")
 
             prompt = <<~PROMPT
               ## Epic Review: #{epic['title']}
@@ -439,15 +443,18 @@ module Brainiac
               ### Completed tasks:
               #{completed_summary}
 
-              ### Remaining tasks:
+              ### Remaining tasks (with current dependencies):
               #{remaining_summary}
 
               ### Your job:
               1. Read the memory files for completed tasks to understand what was implemented
               2. Check if remaining tasks still make sense given the implementation decisions
-              3. If a remaining task is now obsolete, update its Fizzy card with a comment explaining why
-              4. If a remaining task needs different scope, update its Fizzy card description
-              5. If new tasks are needed, create new Fizzy cards (tag with the project)
+              3. **Update dependencies** if implementation created new relationships between tasks
+                 - Add `[depends:NNNN]` to a Fizzy card title if it now depends on another card
+                 - Remove dependencies that are no longer needed
+              4. If a remaining task is now obsolete, update its Fizzy card with a comment explaining why
+              5. If a remaining task needs different scope, update its Fizzy card description
+              6. If new tasks are needed, create new Fizzy cards (tag with the project)
 
               Memory files are at: `~/.brainiac/brain/memory/#{agent_name&.downcase}/card-<number>.md`
 
