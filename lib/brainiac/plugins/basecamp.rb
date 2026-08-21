@@ -132,11 +132,31 @@ module Brainiac
             task["awaiting_final_decision"] = true
             Hooks.send(:save_epic_state, epic)
             Hooks.send(:dispatch_final_decision, epic, task, {})
+          elsif task["changes_requested_by"]&.any?
+            # Gates requested changes — check if impl agent is assigned
+            impl_agent = epic["agent"]
+            LOG.info "[Basecamp] Resume: ##{card_number} has changes requested, checking assignment" if defined?(LOG)
+
+            # Check current assignees via Fizzy CLI
+            card_json, = Open3.capture2("fizzy", "card", "show", card_number.to_s, "--json")
+            card_data = JSON.parse(card_json) rescue {}
+            assignees = card_data.dig("data", "assignees") || []
+            assignee_names = assignees.map { |a| a["name"]&.downcase }
+
+            if assignee_names.include?(impl_agent.downcase)
+              LOG.info "[Basecamp] Resume: ##{card_number} already assigned to #{impl_agent} — waiting for fixes" if defined?(LOG)
+            else
+              # Re-assign to trigger dispatch
+              LOG.info "[Basecamp] Resume: ##{card_number} not assigned to #{impl_agent} — re-assigning" if defined?(LOG)
+              fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
+              if fizzy_user_id
+                Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
+              end
+            end
           else
-            # Gates haven't all approved — check if we need to dispatch fixes or wait
+            # No changes requested yet — just waiting for reviews
             approvals = task["gate_approvals"]&.size || 0
-            changes = task["changes_requested_by"]&.size || 0
-            LOG.info "[Basecamp] Resume: ##{card_number} has #{approvals} approvals, #{changes} changes_requested — waiting" if defined?(LOG)
+            LOG.info "[Basecamp] Resume: ##{card_number} has #{approvals} approvals, waiting for more reviews" if defined?(LOG)
           end
         end
 
