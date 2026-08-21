@@ -49,13 +49,17 @@ module Brainiac
             LOG.info "[Basecamp:Orchestrator] Started epic '#{title}' (todolist #{todolist_id}) " \
                      "with agent #{agent}, review_gate: #{review_gate}" if defined?(LOG)
 
-            # Create epic branches BEFORE dispatching (so resolve_pr_target hook works)
+            # FIRST: Populate tasks with project info from Fizzy card tags
+            # This must happen BEFORE creating epic branches so we know which repos are involved
+            populate_tasks(epic)
+
+            # THEN: Create epic branches for all projects (now that we know which projects are involved)
             if review_gate == "epic_branch"
               create_epic_branches_for(epic)
             end
 
-            # Initial task resolution — read the todolist and dispatch unblocked work
-            resolve_and_dispatch(epic)
+            # Finally: Dispatch unblocked work
+            dispatch_unblocked_tasks(epic)
 
             save_epic(epic)
             epic
@@ -166,6 +170,13 @@ module Brainiac
 
           # Resolve current todolist state from Basecamp and dispatch unblocked cards.
           def resolve_and_dispatch(epic)
+            populate_tasks(epic)
+            dispatch_unblocked_tasks(epic)
+          end
+
+          # Populate/refresh task list from Basecamp todolist.
+          # Resolves project key for each task from Fizzy card tags.
+          def populate_tasks(epic)
             todos = fetch_todos(epic)
             return unless todos
 
@@ -183,8 +194,13 @@ module Brainiac
                          "pending"
                        end
 
-              # Resolve project key for this task (from existing state, or from epic's project mapping)
-              project_key = existing&.dig("project") || Config.brainiac_project_for(epic["basecamp_project_id"])
+              # Resolve project key for this task:
+              # 1. From existing state (preserves across re-resolves)
+              # 2. From Fizzy card tags (authoritative source)
+              # 3. Fallback to Basecamp project mapping
+              project_key = existing&.dig("project") ||
+                            resolve_project_from_fizzy_card(task.fizzy_card) ||
+                            Config.brainiac_project_for(epic["basecamp_project_id"])
 
               {
                 "todo_id" => task.todo_id,
@@ -197,6 +213,22 @@ module Brainiac
                 "assignees" => task.assignees,
                 "due_on" => task.due_on
               }
+            end
+
+            epic["updated_at"] = Time.now.iso8601
+          end
+
+          # Dispatch unblocked tasks that aren't already in-flight or complete.
+          def dispatch_unblocked_tasks(epic)
+            tasks = epic["tasks"].map do |t|
+              Epic::Task.new(
+                todo_id: t["todo_id"],
+                fizzy_card: t["fizzy_card"],
+                title: t["title"],
+                depends_on: t["depends_on"] || [],
+                status: t["status"].to_sym,
+                completed: t["status"] == "complete"
+              )
             end
 
             # Find unblocked tasks that aren't already in-flight or complete
@@ -286,6 +318,46 @@ module Brainiac
             end
 
             @fizzy_users[name.downcase]
+          end
+
+          # Resolve the brainiac project key for a Fizzy card by querying its tags.
+          # Uses the same logic as brainiac-fizzy: card tags are matched against
+          # each project's fizzy_tags configuration.
+          #
+          # @param card_number [Integer, String] Fizzy card number
+          # @return [String, nil] Brainiac project key or nil
+          def resolve_project_from_fizzy_card(card_number)
+            return nil unless card_number
+
+            # Query the Fizzy card for its tags
+            stdout, _, status = Open3.capture3("fizzy", "card", "show", card_number.to_s, "--json")
+            return nil unless status.success?
+
+            card_data = JSON.parse(stdout)
+            # Handle both envelope format and direct data
+            card = card_data.is_a?(Hash) && card_data["data"] ? card_data["data"] : card_data
+            tags = card["tags"] || []
+
+            # Extract tag names (tags can be strings or hashes with "name" key)
+            tag_names = tags.map { |t| t.is_a?(Hash) ? t["name"] : t.to_s }.map(&:downcase)
+            return nil if tag_names.empty?
+
+            # Load projects and match tags
+            projects_file = File.join(BRAINIAC_DIR, "projects.json")
+            return nil unless File.exist?(projects_file)
+
+            all_projects = JSON.parse(File.read(projects_file))
+
+            # Find the first project whose fizzy_tags intersect with the card's tags
+            all_projects.each do |key, config|
+              project_tags = (config["tags"] || config["fizzy_tags"] || []).map(&:downcase)
+              return key if tag_names.intersect?(project_tags)
+            end
+
+            nil
+          rescue StandardError => e
+            LOG.warn "[Basecamp:Orchestrator] Could not resolve project for Fizzy card ##{card_number}: #{e.message}" if defined?(LOG)
+            nil
           end
 
           # Mark a Basecamp todo as complete.
