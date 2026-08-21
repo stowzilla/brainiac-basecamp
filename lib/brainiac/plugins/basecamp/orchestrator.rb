@@ -188,6 +188,7 @@ module Brainiac
           # Populate/refresh task list from Basecamp todolist.
           # Resolves project key for each task from Fizzy card tags.
           # IMPORTANT: Preserves completed tasks that Basecamp API no longer returns.
+          # Also preserves PR/gate state for tasks that are in progress.
           def populate_tasks(epic)
             todos = fetch_todos(epic)
             return unless todos
@@ -204,10 +205,9 @@ module Brainiac
               existing = existing_by_card[task.fizzy_card]
               status = if task.completed
                          "complete"
-                       elsif existing&.dig("status") == "in_flight"
-                         "in_flight"
-                       elsif existing&.dig("status") == "in_review"
-                         "in_review"
+                       elsif existing&.dig("status")
+                         # Preserve existing status (in_flight, in_review, final_decision, etc.)
+                         existing["status"]
                        else
                          "pending"
                        end
@@ -216,7 +216,8 @@ module Brainiac
                             resolve_project_from_fizzy_card(task.fizzy_card) ||
                             Config.brainiac_project_for(epic["basecamp_project_id"])
 
-              {
+              # Build task, preserving all existing state
+              new_task = {
                 "todo_id" => task.todo_id,
                 "fizzy_card" => task.fizzy_card,
                 "title" => task.title,
@@ -227,6 +228,17 @@ module Brainiac
                 "assignees" => task.assignees,
                 "due_on" => task.due_on
               }
+
+              # Preserve PR and gate state from existing task
+              if existing
+                %w[dispatched_at pr_number pr_repo gates_dispatched_at gate_approvals
+                   changes_requested_by awaiting_final_decision changes_debounce_started
+                   fizzy_internal_id].each do |key|
+                  new_task[key] = existing[key] if existing.key?(key)
+                end
+              end
+
+              new_task
             end
 
             # Preserve completed tasks that are no longer in the Basecamp API response
@@ -302,6 +314,7 @@ module Brainiac
           end
 
           # Assign a Fizzy card to an agent via Fizzy CLI.
+          # If the agent is already assigned, unassign first to trigger webhook.
           def assign_fizzy_card(card_number, agent)
             agent_config = load_agent_registry[agent.downcase]
             fizzy_name = agent_config&.dig("fizzy_name") || agent
@@ -311,6 +324,20 @@ module Brainiac
             unless fizzy_user_id
               LOG.error "[Basecamp:Orchestrator] Could not resolve Fizzy user ID for '#{fizzy_name}'" if defined?(LOG)
               return
+            end
+
+            # Check if agent is already assigned — if so, unassign first to trigger webhook
+            stdout, _, status = Open3.capture3("fizzy", "card", "show", card_number.to_s, "--json")
+            if status.success?
+              card_data = JSON.parse(stdout).dig("data") rescue nil
+              if card_data
+                current_assignees = (card_data["assignees"] || []).map { |a| a["id"] }
+                if current_assignees.include?(fizzy_user_id)
+                  LOG.info "[Basecamp:Orchestrator] Agent already assigned to ##{card_number}, unassigning to re-trigger" if defined?(LOG)
+                  Open3.capture3("fizzy", "card", "unassign", card_number.to_s, "--user", fizzy_user_id)
+                  sleep 1 # Brief pause to ensure Fizzy processes the unassign
+                end
+              end
             end
 
             stdout, stderr, status = Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
