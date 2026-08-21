@@ -64,9 +64,9 @@ module Brainiac
               return false
             end
 
-            # Merge the PR
+            # Merge the PR (don't use --delete-branch — worktree cleanup handles branch deletion)
             stdout, stderr, status = Open3.capture3(
-              "gh", "pr", "merge", pr_number.to_s, "--merge", "--delete-branch",
+              "gh", "pr", "merge", pr_number.to_s, "--merge",
               chdir: repo_path
             )
 
