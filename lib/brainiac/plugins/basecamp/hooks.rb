@@ -599,16 +599,19 @@ module Brainiac
 
               1. Read their feedback: `gh pr view #{pr_number} --comments`
               2. If fixes needed → make them, commit, push
-              3. When ready → **approve the PR to trigger merge**:
+              3. When ready → **merge the PR directly**:
                  ```
-                 gh pr review #{pr_number} --approve --body "LGTM — merging to epic branch"
+                 gh pr merge #{pr_number} --squash --delete-branch
                  ```
 
-              **CRITICAL:** You must run `gh pr review --approve` to merge. A Fizzy comment is NOT enough.
-              Your approval triggers auto-merge into the epic branch.
+              Note: You cannot self-approve PRs you authored. Merge directly since gates have approved.
 
-              After approving, update the Fizzy card with a brief status comment.
+              After merging, update the Fizzy card with a brief status comment.
             PROMPT
+
+            # Resolve GitHub App token so agent's `gh` commands run as their bot identity
+            github_repo = project_config&.dig("github_repo")
+            agent_env = github_repo ? ReviewGate.send(:resolve_agent_github_env, agent_name, github_repo) : {}
 
             # Spawn the agent directly (like gate agents do)
             pid = nil
@@ -623,7 +626,8 @@ module Brainiac
                 log_name: "final-decision-#{card_number}",
                 agent_name: agent_name,
                 source: :basecamp,
-                card_number: card_number
+                card_number: card_number,
+                env: agent_env
               )
             rescue NameError
               if Object.respond_to?(:run_agent, true)
@@ -634,7 +638,8 @@ module Brainiac
                   log_name: "final-decision-#{card_number}",
                   agent_name: agent_name,
                   source: :basecamp,
-                  card_number: card_number)
+                  card_number: card_number,
+                  env: agent_env)
               else
                 LOG.warn "[Basecamp:Hooks] run_agent not available — final decision dispatch skipped" if defined?(LOG)
                 return
