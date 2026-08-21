@@ -117,7 +117,8 @@ module Brainiac
               next unless epic["review_gate"] == "epic_branch" && ReviewGate.enabled?
 
               task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
-              next unless task && task["status"] == "in_review"
+              # Accept reviews during in_review OR in_flight (when addressing changes)
+              next unless task && %w[in_review in_flight].include?(task["status"])
 
               review_state = ctx[:review_state]
               reviewer = ctx[:reviewer] || ctx[:agent_name]
