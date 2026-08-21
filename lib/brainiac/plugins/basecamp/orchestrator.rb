@@ -56,6 +56,9 @@ module Brainiac
             # THEN: Create epic branches for all projects (now that we know which projects are involved)
             if review_gate == "epic_branch"
               create_epic_branches_for(epic)
+
+              # Sync PR state from work_items for cards that already have open PRs
+              sync_existing_pr_state(epic)
             end
 
             # CRITICAL: Save epic state BEFORE dispatching tasks.
@@ -63,7 +66,12 @@ module Brainiac
             # must be persisted before the agent is dispatched.
             save_epic(epic)
 
-            # Finally: Dispatch unblocked work
+            # For tasks with open PRs, dispatch review gates immediately
+            if review_gate == "epic_branch"
+              dispatch_gates_for_existing_prs(epic)
+            end
+
+            # Finally: Dispatch unblocked work (skips tasks already in_review)
             dispatch_unblocked_tasks(epic)
 
             save_epic(epic)
@@ -315,6 +323,91 @@ module Brainiac
                 profile: agent.downcase
               )
             end
+          end
+
+          # Sync PR state from work_items for cards that already have open PRs.
+          # Called when an epic starts to detect cards mid-flight.
+          def sync_existing_pr_state(epic)
+            work_items_file = File.join(BRAINIAC_DIR, "work_items.json")
+            return unless File.exist?(work_items_file)
+
+            work_items = JSON.parse(File.read(work_items_file))
+
+            epic["tasks"].each do |task|
+              card_number = task["fizzy_card"]
+              next if task["pr_number"] # Already has PR tracked
+
+              # Find work item by card number
+              work_item = work_items.values.find do |wi|
+                wi.dig("sources", "fizzy", "card_number") == card_number
+              end
+              next unless work_item
+
+              # Check if work item has a PR
+              pr = work_item.dig("sources", "github", "prs")&.first
+              next unless pr
+
+              pr_number = pr["number"]
+              LOG.info "[Basecamp:Orchestrator] Found existing PR ##{pr_number} for card ##{card_number}" if defined?(LOG)
+
+              task["pr_number"] = pr_number
+              task["pr_repo"] = work_item.dig("sources", "github", "repo")
+              task["status"] = "in_review"
+            end
+          rescue StandardError => e
+            LOG.warn "[Basecamp:Orchestrator] Error syncing PR state: #{e.message}" if defined?(LOG)
+          end
+
+          # Dispatch review gates for tasks that already have open PRs.
+          # Called when an epic starts to kick off reviews for mid-flight cards.
+          def dispatch_gates_for_existing_prs(epic)
+            return unless ReviewGate.enabled?
+
+            tasks_with_prs = epic["tasks"].select { |t| t["pr_number"] && t["status"] == "in_review" }
+            return if tasks_with_prs.empty?
+
+            LOG.info "[Basecamp:Orchestrator] Dispatching gates for #{tasks_with_prs.size} existing PR(s)" if defined?(LOG)
+
+            tasks_with_prs.each do |task|
+              card_number = task["fizzy_card"]
+              pr_number = task["pr_number"]
+              project_key = task["project"]
+
+              # Skip if gates already dispatched
+              next if task["gates_dispatched_at"]
+
+              # Get repo info
+              projects_file = File.join(BRAINIAC_DIR, "projects.json")
+              projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+              project_config = projects[project_key] || {}
+              repo_path = project_config["repo_path"]
+              github_repo = project_config["github_repo"]
+
+              next unless repo_path && github_repo
+
+              # Sync gate state from GitHub first (in case reviews already happened)
+              ReviewGate.sync_from_github(task, repo_path: repo_path)
+
+              # Check if all gates already passed
+              if ReviewGate.all_gates_passed?(task)
+                LOG.info "[Basecamp:Orchestrator] Gates already passed for card ##{card_number} — dispatching final decision" if defined?(LOG)
+                task["status"] = "final_decision"
+                task["awaiting_final_decision"] = true
+                # Final decision dispatch happens in resume logic
+              else
+                # Dispatch gate agents
+                LOG.info "[Basecamp:Orchestrator] Dispatching gates for card ##{card_number} (PR ##{pr_number})" if defined?(LOG)
+                ReviewGate.dispatch_gates(
+                  epic: epic,
+                  task: task,
+                  pr_number: pr_number,
+                  repo_name: github_repo,
+                  repo_path: repo_path
+                )
+              end
+            end
+
+            save_epic(epic)
           end
 
           # Assign a Fizzy card to an agent via Fizzy CLI.
