@@ -49,13 +49,13 @@ module Brainiac
             LOG.info "[Basecamp:Orchestrator] Started epic '#{title}' (todolist #{todolist_id}) " \
                      "with agent #{agent}, review_gate: #{review_gate}" if defined?(LOG)
 
-            # Initial task resolution — read the todolist and dispatch unblocked work
-            resolve_and_dispatch(epic)
-
-            # Create epic branches if in epic_branch mode
+            # Create epic branches BEFORE dispatching (so resolve_pr_target hook works)
             if review_gate == "epic_branch"
               create_epic_branches_for(epic)
             end
+
+            # Initial task resolution — read the todolist and dispatch unblocked work
+            resolve_and_dispatch(epic)
 
             save_epic(epic)
             epic
