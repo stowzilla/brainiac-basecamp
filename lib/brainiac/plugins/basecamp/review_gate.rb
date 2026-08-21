@@ -185,18 +185,34 @@ module Brainiac
             # Resolve the agent's GitHub token for their bot identity
             agent_env = resolve_agent_github_env(agent_name, repo_name)
 
-            # Run the agent
-            if defined?(run_agent)
-              run_agent(prompt,
-                        project_config: resolve_project_config(repo_path),
-                        chdir: repo_path,
-                        log_name: "gate-#{role}-#{card_number}",
-                        agent_name: agent_name,
-                        source: :github,
-                        card_number: card_number,
-                        env: agent_env)
-            else
-              LOG.warn "[Basecamp:ReviewGate] run_agent not available — gate dispatch skipped" if defined?(LOG)
+            # Run the agent via the top-level helper method
+            # The run_agent method is defined in lib/brainiac/helpers.rb and loaded into main
+            begin
+              method(:run_agent).call(
+                prompt,
+                project_config: resolve_project_config(repo_path),
+                chdir: repo_path,
+                log_name: "gate-#{role}-#{card_number}",
+                agent_name: agent_name,
+                source: :github,
+                card_number: card_number,
+                env: agent_env
+              )
+            rescue NameError
+              # run_agent not available in this context — try calling via Object
+              if Object.respond_to?(:run_agent, true)
+                Object.send(:run_agent,
+                            prompt,
+                            project_config: resolve_project_config(repo_path),
+                            chdir: repo_path,
+                            log_name: "gate-#{role}-#{card_number}",
+                            agent_name: agent_name,
+                            source: :github,
+                            card_number: card_number,
+                            env: agent_env)
+              else
+                LOG.warn "[Basecamp:ReviewGate] run_agent not available — gate dispatch skipped" if defined?(LOG)
+              end
             end
           end
 
