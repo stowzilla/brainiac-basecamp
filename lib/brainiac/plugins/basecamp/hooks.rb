@@ -565,6 +565,22 @@ module Brainiac
 
             LOG.info "[Basecamp:Hooks] Dispatching #{agent_name} for final decision on card ##{card_number}" if defined?(LOG)
 
+            # Get project config first — we need it for PR check and agent dispatch
+            projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
+            projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+            project_config = projects[project_key]
+            github_repo = project_config&.dig("github_repo")
+
+            # Check if PR is already merged (handles manual merges, webhook misses, etc.)
+            if github_repo && pr_number
+              pr_state, = Open3.capture2("gh", "pr", "view", pr_number.to_s, "--repo", github_repo, "--json", "state", "-q", ".state")
+              if pr_state.strip == "MERGED"
+                LOG.info "[Basecamp:Hooks] PR ##{pr_number} already merged — marking card ##{card_number} complete" if defined?(LOG)
+                Orchestrator.on_card_completed(card_number)
+                return
+              end
+            end
+
             # Mark task as awaiting final decision
             task["awaiting_final_decision"] = true
             task["status"] = "final_decision"
@@ -582,10 +598,6 @@ module Brainiac
               end
             end
 
-            # Get project config and repo path
-            projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
-            projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
-            project_config = projects[project_key]
             repo_path = project_config&.dig("repo_path")
 
             unless repo_path
