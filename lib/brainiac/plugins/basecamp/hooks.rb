@@ -364,16 +364,19 @@ module Brainiac
                     gate_agents = approvals.map { |a| a["agent"] }.join(", ")
 
                     context_lines << ""
-                    context_lines << "## ⚡ FINAL DECISION REQUIRED"
+                    context_lines << "## ⚡ FINAL DECISION REQUIRED — APPROVE TO MERGE"
                     context_lines << ""
-                    context_lines << "All review gates have approved (#{gate_agents}), but you must make the final call."
-                    context_lines << "Read their review comments on PR ##{pr_number} with: `gh pr view #{pr_number} --comments`"
+                    context_lines << "All review gates have approved (#{gate_agents}). Your job now:"
                     context_lines << ""
-                    context_lines << "Even if they approved, they may have flagged suggestions worth fixing."
-                    context_lines << "- If you see suggestions you agree with → make the fixes, commit, push"
-                    context_lines << "- If you're satisfied as-is → approve the PR: `gh pr review #{pr_number} --approve --body \"Reviewed gate feedback, shipping as-is\"`"
+                    context_lines << "1. Read their feedback: `gh pr view #{pr_number} --comments`"
+                    context_lines << "2. If fixes needed → make them, commit, push"
+                    context_lines << "3. When ready → **approve the PR to trigger merge**:"
+                    context_lines << "   ```"
+                    context_lines << "   gh pr review #{pr_number} --approve --body \"LGTM — merging to epic branch\""
+                    context_lines << "   ```"
                     context_lines << ""
-                    context_lines << "Your approval triggers the auto-merge into the epic branch."
+                    context_lines << "**CRITICAL:** You must run `gh pr review --approve` to merge. A Fizzy comment is NOT enough."
+                    context_lines << "Your approval triggers auto-merge into the epic branch."
                   end
                 end
 
