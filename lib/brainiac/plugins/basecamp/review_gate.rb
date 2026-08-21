@@ -187,8 +187,12 @@ module Brainiac
 
             # Run the agent via the top-level helper method
             # The run_agent method is defined in lib/brainiac/helpers.rb and loaded into main
+            pid = nil
+            log_file = nil
+            card_key = "gate-#{agent_name.downcase}-#{card_number}"
+
             begin
-              method(:run_agent).call(
+              pid, log_file = method(:run_agent).call(
                 prompt,
                 project_config: resolve_project_config(repo_path),
                 chdir: repo_path,
@@ -201,7 +205,7 @@ module Brainiac
             rescue NameError
               # run_agent not available in this context — try calling via Object
               if Object.respond_to?(:run_agent, true)
-                Object.send(:run_agent,
+                pid, log_file = Object.send(:run_agent,
                             prompt,
                             project_config: resolve_project_config(repo_path),
                             chdir: repo_path,
@@ -213,6 +217,13 @@ module Brainiac
               else
                 LOG.warn "[Basecamp:ReviewGate] run_agent not available — gate dispatch skipped" if defined?(LOG)
               end
+            end
+
+            # Register session for waybar visibility
+            if pid && defined?(register_session)
+              register_session(card_key, pid, log_file: log_file, agent_name: agent_name)
+            elsif pid && Object.respond_to?(:register_session, true)
+              Object.send(:register_session, card_key, pid, log_file: log_file, agent_name: agent_name)
             end
           end
 

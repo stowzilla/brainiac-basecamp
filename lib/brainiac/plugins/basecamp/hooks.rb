@@ -500,6 +500,21 @@ module Brainiac
             epic["updated_at"] = Time.now.iso8601
             save_epic_state(epic)
 
+            # Reset the agent-to-agent dispatch depth for this card
+            # Final decision is orchestrator-driven, not agent-to-agent
+            # Look up the card internal ID from work_items
+            card_internal_id = lookup_card_internal_id(card_number)
+            if card_internal_id
+              LOG.info "[Basecamp:Hooks] Resetting dispatch depth for card #{card_internal_id}" if defined?(LOG)
+              if defined?(record_human_comment)
+                record_human_comment(card_internal_id)
+              elsif Object.respond_to?(:record_human_comment, true)
+                Object.send(:record_human_comment, card_internal_id)
+              end
+            else
+              LOG.warn "[Basecamp:Hooks] Could not find internal ID for card ##{card_number} — dispatch depth not reset" if defined?(LOG)
+            end
+
             # Re-assign the Fizzy card to the implementation agent (triggers dispatch)
             fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, agent_name)
             if fizzy_user_id
@@ -592,6 +607,26 @@ module Brainiac
               end
             end
 
+            nil
+          end
+
+          # Look up the Fizzy internal ID for a card number from work_items.
+          def lookup_card_internal_id(card_number)
+            work_items_file = File.join(
+              ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")),
+              "work_items.json"
+            )
+            return nil unless File.exist?(work_items_file)
+
+            work_items = JSON.parse(File.read(work_items_file))
+            work_items.each do |_id, item|
+              fizzy_card = item.dig("sources", "fizzy", "card_number") || item["card_number"]
+              if fizzy_card.to_i == card_number.to_i
+                return item.dig("sources", "fizzy", "card_internal_id") || item["card_internal_id"]
+              end
+            end
+            nil
+          rescue StandardError
             nil
           end
 
