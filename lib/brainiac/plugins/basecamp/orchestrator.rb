@@ -451,14 +451,12 @@ module Brainiac
               profile: epic["agent"]&.downcase
             )
 
-            # Emit generic notification (plugins decide how to deliver)
-            if defined?(Brainiac) && Brainiac.respond_to?(:emit)
-              Brainiac.emit(:epic_completed,
-                            epic_title: epic["title"],
-                            task_count: epic["tasks"].size,
-                            final_prs: epic["final_prs"],
-                            agent: epic["agent"])
-            end
+            # Send notification (Discord or other configured channel)
+            send_notification(
+              event: :epic_completed,
+              message: "🎉 Epic completed: **#{epic['title']}** (#{epic['tasks'].size} tasks)",
+              agent: epic["agent"]
+            )
           end
 
           # Fetch todos from the epic's todolist.
@@ -564,12 +562,14 @@ module Brainiac
             epic["final_prs"] = prs
             log_event(epic, "final_prs_opened", "Opened #{prs.size} final PR(s): #{prs.map { |p| p[:url] }.join(', ')}")
 
-            # Emit hook so plugins can notify (Discord, Slack, etc.)
-            if prs.any? && defined?(Brainiac) && Brainiac.respond_to?(:emit)
-              Brainiac.emit(:epic_prs_ready,
-                            epic_title: epic["title"],
-                            final_prs: prs,
-                            agent: epic["agent"])
+            # Send notification about final PRs
+            if prs.any?
+              pr_list = prs.map { |p| p[:url] }.join("\n")
+              send_notification(
+                event: :epic_prs_ready,
+                message: "📋 Epic **#{epic['title']}** — final PR ready for review:\n#{pr_list}",
+                agent: epic["agent"]
+              )
             end
           rescue StandardError => e
             LOG.error "[Basecamp:Orchestrator] Failed to open final PRs: #{e.message}" if defined?(LOG)
@@ -595,6 +595,26 @@ module Brainiac
             end
           rescue JSON::ParserError
             {}
+          end
+
+          # Send a notification via the configured channel (Discord, etc.).
+          # Reads discord_channel_id from basecamp.json notifications config.
+          def send_notification(event:, message:, agent: nil)
+            return unless defined?(Brainiac) && Brainiac.respond_to?(:emit)
+
+            # Check if this event type is enabled
+            notifications_config = Config.current.dig("notifications") || {}
+            return unless notifications_config[event.to_s] != false
+
+            # Get the target channel
+            discord_channel = notifications_config["discord_channel_id"]
+            return unless discord_channel
+
+            Brainiac.emit(:notify,
+                          channel: :discord,
+                          target: discord_channel,
+                          message: message,
+                          agent: agent)
           end
         end
       end
