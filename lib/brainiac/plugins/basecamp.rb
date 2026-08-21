@@ -32,17 +32,109 @@ module Brainiac
           # Set up routes
           setup_routes(app)
 
-          # Log active epics on startup
+          # Log active epics on startup and resume them
           active = Orchestrator.active_epics
           if active.any?
             LOG.info "[Basecamp] #{active.size} active epic(s) in progress"
             active.each { |e| LOG.info "[Basecamp]   - #{e['title']} (#{e['tasks']&.count { |t| t['status'] == 'complete' }}/#{e['tasks']&.size} complete)" }
+
+            # Resume active epics in background after server is ready
+            Thread.new do
+              sleep 10 # Wait for server to fully start
+              resume_active_epics(active)
+            rescue StandardError => e
+              LOG.error "[Basecamp] Error resuming epics: #{e.message}" if defined?(LOG)
+            end
           end
 
           LOG.info "[Basecamp] Plugin registered (webhook: /basecamp, review_gate: #{Config.review_gate})"
         end
 
         private
+
+        # Resume active epics on server startup.
+        # For each epic, checks task states and takes appropriate action.
+        def resume_active_epics(epics)
+          epics.each do |epic|
+            LOG.info "[Basecamp] Resuming epic: #{epic['title']}" if defined?(LOG)
+
+            epic["tasks"]&.each do |task|
+              card_number = task["fizzy_card"]
+              status = task["status"]
+
+              case status
+              when "in_review", "in_flight"
+                # Sync gate state from GitHub and decide next action
+                resume_in_review_task(epic, task)
+              when "final_decision"
+                # Final decision was pending — check if we can merge
+                resume_final_decision_task(epic, task)
+              when "pending"
+                # Check if dependencies are met and dispatch
+                # (This is handled by dispatch_unblocked_tasks normally)
+                next
+              end
+            end
+
+            # Dispatch any unblocked tasks
+            Orchestrator.send(:dispatch_unblocked_tasks, epic)
+          end
+        end
+
+        def resume_in_review_task(epic, task)
+          card_number = task["fizzy_card"]
+          pr_number = task["pr_number"]
+
+          unless pr_number
+            LOG.info "[Basecamp] Task ##{card_number} has no PR yet — skipping resume" if defined?(LOG)
+            return
+          end
+
+          # Get project config for repo path
+          project_key = task["project"]
+          projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
+          projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+          repo_path = projects.dig(project_key, "repo_path")
+
+          unless repo_path
+            LOG.warn "[Basecamp] No repo_path for project #{project_key}" if defined?(LOG)
+            return
+          end
+
+          # Sync gate approvals from GitHub
+          sync_result = ReviewGate.sync_from_github(task, repo_path: repo_path)
+          if sync_result[:synced]
+            changes = sync_result[:changes] || {}
+            if changes[:approvals_added]&.any?
+              LOG.info "[Basecamp] Resume: synced approvals for ##{card_number}: #{changes[:approvals_added].join(', ')}" if defined?(LOG)
+            end
+          end
+
+          # Check if all gates have approved
+          if ReviewGate.all_gates_passed?(task)
+            LOG.info "[Basecamp] Resume: all gates passed for ##{card_number} — dispatching final decision" if defined?(LOG)
+            task["status"] = "final_decision"
+            task["awaiting_final_decision"] = true
+            Hooks.send(:save_epic_state, epic)
+            Hooks.send(:dispatch_final_decision, epic, task, {})
+          else
+            # Gates haven't all approved — check if we need to dispatch fixes or wait
+            approvals = task["gate_approvals"]&.size || 0
+            changes = task["changes_requested_by"]&.size || 0
+            LOG.info "[Basecamp] Resume: ##{card_number} has #{approvals} approvals, #{changes} changes_requested — waiting" if defined?(LOG)
+          end
+        end
+
+        def resume_final_decision_task(epic, task)
+          card_number = task["fizzy_card"]
+
+          # Check if the implementation agent has approved
+          # If awaiting_final_decision is still true, re-dispatch
+          if task["awaiting_final_decision"]
+            LOG.info "[Basecamp] Resume: re-dispatching final decision for ##{card_number}" if defined?(LOG)
+            Hooks.send(:dispatch_final_decision, epic, task, {})
+          end
+        end
 
         def setup_routes(app)
           setup_webhook_route(app)
