@@ -99,6 +99,7 @@ module Brainiac
 
           # When a PR review is submitted (from brainiac-github).
           # Tracks gate approvals — when all gates approve, auto-merge and advance.
+          # For changes_requested, we batch/debounce to wait for all gates before dispatching fixes.
           def register_pr_review_received
             Brainiac.on(:pr_review_received) do |ctx|
               card_number = ctx[:card_number]
@@ -149,6 +150,8 @@ module Brainiac
               if review_state == "approved"
                 LOG.info "[Basecamp:Hooks] Gate APPROVED: #{agent_name} (#{role}) on card ##{card_number}" if defined?(LOG)
                 ReviewGate.record_approval(task, agent: agent_name, role: role)
+                # Clear this gate from changes_requested if it was there
+                task["changes_requested_by"]&.delete(agent_name)
                 epic["updated_at"] = Time.now.iso8601
 
                 if ReviewGate.all_gates_passed?(task)
@@ -168,14 +171,63 @@ module Brainiac
                 end
               elsif review_state == "changes_requested"
                 LOG.info "[Basecamp:Hooks] Gate CHANGES_REQUESTED: #{agent_name} (#{role}) on card ##{card_number}" if defined?(LOG)
-                # The implementation agent will be dispatched by brainiac-github to address the review
-                # Set status to in_flight so pr_synchronized can detect when fixes are pushed
-                task["status"] = "in_flight"
+
+                # Track which gates requested changes
                 task["changes_requested_by"] ||= []
                 task["changes_requested_by"] << agent_name unless task["changes_requested_by"].include?(agent_name)
-                save_epic_state(epic)
+
+                # Check if all gates have now responded (either approved or requested changes)
+                all_responded = all_gates_responded?(task)
+
+                if all_responded
+                  # All gates have reviewed — dispatch implementation agent to address ALL feedback
+                  LOG.info "[Basecamp:Hooks] All gates responded for card ##{card_number} — dispatching fixes" if defined?(LOG)
+                  task["status"] = "in_flight"
+                  save_epic_state(epic)
+                  # brainiac-github will dispatch the impl agent since this is changes_requested
+                else
+                  # Wait for remaining gates to respond
+                  responded = (task["gate_approvals"]&.size || 0) + (task["changes_requested_by"]&.size || 0)
+                  remaining = ReviewGate.gates.size - responded
+                  LOG.info "[Basecamp:Hooks] #{responded}/#{ReviewGate.gates.size} gates responded, waiting for #{remaining} more" if defined?(LOG)
+                  save_epic_state(epic)
+
+                  # Start a debounce timer if this is the first changes_requested
+                  # In case some gates never respond, we'll dispatch after 60 seconds
+                  unless task["changes_debounce_started"]
+                    task["changes_debounce_started"] = true
+                    save_epic_state(epic)
+                    Thread.new do
+                      sleep 60
+                      # Reload epic state
+                      epic_reloaded = Orchestrator.load_epics["epics"].find { |e| e["id"] == epic["id"] }
+                      task_reloaded = epic_reloaded&.dig("tasks")&.find { |t| t["fizzy_card"] == card_number.to_i }
+                      if task_reloaded && task_reloaded["status"] == "in_review" && task_reloaded["changes_requested_by"]&.any?
+                        LOG.info "[Basecamp:Hooks] Debounce timeout for card ##{card_number} — forcing dispatch" if defined?(LOG)
+                        task_reloaded["status"] = "in_flight"
+                        task_reloaded.delete("changes_debounce_started")
+                        Orchestrator.save_epic(epic_reloaded)
+                        # Re-assign card to trigger dispatch
+                        fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, epic_reloaded["agent"])
+                        Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id) if fizzy_user_id
+                      end
+                    rescue StandardError => e
+                      LOG.error "[Basecamp:Hooks] Debounce dispatch failed: #{e.message}" if defined?(LOG)
+                    end
+                  end
+                end
               end
             end
+          end
+
+          # Check if all configured gates have responded (either approved or requested changes)
+          def all_gates_responded?(task)
+            approvals = (task["gate_approvals"] || []).map { |a| a["agent"].downcase }
+            changes = (task["changes_requested_by"] || []).map(&:downcase)
+            responded = approvals + changes
+
+            required = ReviewGate.gates.map { |g| g["agent"].downcase }
+            required.all? { |agent| responded.include?(agent) }
           end
 
           # Match a GitHub reviewer login to a configured gate agent.
