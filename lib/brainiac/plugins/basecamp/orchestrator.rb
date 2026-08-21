@@ -314,7 +314,7 @@ module Brainiac
           end
 
           # Assign a Fizzy card to an agent via Fizzy CLI.
-          # If the agent is already assigned, unassign first to trigger webhook.
+          # If the agent is already assigned, skip — the webhook should have already fired.
           def assign_fizzy_card(card_number, agent)
             agent_config = load_agent_registry[agent.downcase]
             fizzy_name = agent_config&.dig("fizzy_name") || agent
@@ -326,16 +326,15 @@ module Brainiac
               return
             end
 
-            # Check if agent is already assigned — if so, unassign first to trigger webhook
+            # Check if agent is already assigned — if so, skip (webhook should have fired)
             stdout, _, status = Open3.capture3("fizzy", "card", "show", card_number.to_s, "--json")
             if status.success?
               card_data = JSON.parse(stdout).dig("data") rescue nil
               if card_data
                 current_assignees = (card_data["assignees"] || []).map { |a| a["id"] }
                 if current_assignees.include?(fizzy_user_id)
-                  LOG.info "[Basecamp:Orchestrator] Agent already assigned to ##{card_number}, unassigning to re-trigger" if defined?(LOG)
-                  Open3.capture3("fizzy", "card", "unassign", card_number.to_s, "--user", fizzy_user_id)
-                  sleep 1 # Brief pause to ensure Fizzy processes the unassign
+                  LOG.info "[Basecamp:Orchestrator] Agent already assigned to ##{card_number}, skipping (webhook should have fired)" if defined?(LOG)
+                  return
                 end
               end
             end
