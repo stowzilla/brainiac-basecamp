@@ -623,6 +623,12 @@ module Brainiac
 
           # Complete the entire epic.
           def complete_epic(epic)
+            # Idempotency — don't complete twice
+            if epic["status"] == "complete"
+              LOG.info "[Basecamp:Orchestrator] Epic '#{epic['title']}' already complete, skipping duplicate completion" if defined?(LOG)
+              return
+            end
+
             epic["status"] = "complete"
             epic["completed_at"] = Time.now.iso8601
             epic["updated_at"] = Time.now.iso8601
