@@ -295,11 +295,15 @@ module Brainiac
           end
 
           # Dispatch a Fizzy card to the appropriate agent.
+          # Uses the project-specific agent if configured, otherwise falls back to the epic's agent.
           def dispatch_card(epic, task)
             card_number = task.fizzy_card
-            agent = epic["agent"]
 
-            LOG.info "[Basecamp:Orchestrator] Dispatching Fizzy card ##{card_number} to #{agent}" if defined?(LOG)
+            # Resolve agent from project config — each project can have its own default agent
+            project_key = task.is_a?(Hash) ? task["project"] : task.project
+            agent = resolve_agent_for_project(project_key) || epic["agent"]
+
+            LOG.info "[Basecamp:Orchestrator] Dispatching Fizzy card ##{card_number} to #{agent} (project: #{project_key})" if defined?(LOG)
 
             # Mark as in-flight in our state
             epic_task = epic["tasks"].find { |t| t["fizzy_card"] == card_number }
@@ -462,6 +466,24 @@ module Brainiac
             end
 
             @fizzy_users[name.downcase]
+          end
+
+          # Resolve the default agent for a project from projects.json.
+          # Returns nil if no project-specific agent is configured.
+          #
+          # @param project_key [String, nil] Brainiac project key
+          # @return [String, nil] Agent name or nil
+          def resolve_agent_for_project(project_key)
+            return nil unless project_key
+
+            projects_file = File.join(BRAINIAC_DIR, "projects.json")
+            return nil unless File.exist?(projects_file)
+
+            projects = JSON.parse(File.read(projects_file))
+            projects.dig(project_key, "agent_name")
+          rescue StandardError => e
+            LOG.warn "[Basecamp:Orchestrator] Could not resolve agent for project #{project_key}: #{e.message}" if defined?(LOG)
+            nil
           end
 
           # Resolve the brainiac project key for a Fizzy card by querying its tags.
