@@ -222,7 +222,7 @@ module Brainiac
                   fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
                   if fizzy_user_id
                     LOG.info "[Basecamp:Hooks] Re-assigning card ##{card_number} to #{impl_agent} for fixes" if defined?(LOG)
-                    Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
+                    safe_assign_card(card_number, fizzy_user_id)
                   end
                 else
                   # Wait for remaining gates to respond
@@ -250,7 +250,7 @@ module Brainiac
                         save_epic_state(epic_reloaded)
                         # Re-assign card to trigger dispatch
                         fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, epic_reloaded["agent"])
-                        Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id) if fizzy_user_id
+                        safe_assign_card(card_number, fizzy_user_id) if fizzy_user_id
                       end
                     rescue StandardError => e
                       LOG.error "[Basecamp:Hooks] Debounce dispatch failed: #{e.message}" if defined?(LOG)
@@ -319,6 +319,43 @@ module Brainiac
 
             false
           rescue StandardError
+            false
+          end
+
+          # Safely assign a card to a user, checking if they're already assigned first.
+          # Fizzy's assign command TOGGLES assignment, so calling it when already assigned
+          # will unassign the user. This method prevents that.
+          #
+          # @param card_number [Integer, String] Fizzy card number
+          # @param fizzy_user_id [String] Fizzy user ID to assign
+          # @return [Boolean] true if assigned, false if already assigned or failed
+          def safe_assign_card(card_number, fizzy_user_id)
+            return false unless fizzy_user_id
+
+            # Check current assignees
+            stdout, _, status = Open3.capture3("fizzy", "card", "show", card_number.to_s, "--json")
+            if status.success?
+              card_data = JSON.parse(stdout).dig("data") rescue nil
+              if card_data
+                current_assignees = (card_data["assignees"] || []).map { |a| a["id"] }
+                if current_assignees.include?(fizzy_user_id)
+                  LOG.info "[Basecamp:Hooks] User #{fizzy_user_id} already assigned to ##{card_number}, skipping" if defined?(LOG)
+                  return false
+                end
+              end
+            end
+
+            # Not assigned — safe to assign
+            _, stderr, status = Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
+            if status.success?
+              LOG.info "[Basecamp:Hooks] Assigned ##{card_number} to #{fizzy_user_id}" if defined?(LOG)
+              true
+            else
+              LOG.error "[Basecamp:Hooks] Failed to assign ##{card_number}: #{stderr.strip}" if defined?(LOG)
+              false
+            end
+          rescue StandardError => e
+            LOG.error "[Basecamp:Hooks] Error in safe_assign_card: #{e.message}" if defined?(LOG)
             false
           end
 
