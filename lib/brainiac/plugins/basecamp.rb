@@ -47,7 +47,112 @@ module Brainiac
             end
           end
 
+          # Start background health check thread for active epics
+          start_epic_health_monitor
+
           LOG.info "[Basecamp] Plugin registered (webhook: /basecamp, review_gate: #{Config.review_gate})"
+        end
+
+        # Background thread that periodically checks for stuck epic states and auto-heals.
+        # Runs every 90 seconds to catch:
+        # - final_decision tasks where PR is already merged
+        # - in_flight tasks where impl agent isn't assigned
+        # - in_review tasks where all gates have actually approved (webhook missed)
+        def start_epic_health_monitor
+          @health_monitor_thread = Thread.new do
+            loop do
+              sleep 90  # Check every 90 seconds
+
+              begin
+                active_epics = Orchestrator.active_epics
+                next if active_epics.empty?
+
+                active_epics.each do |epic|
+                  health_check_epic(epic)
+                end
+              rescue StandardError => e
+                LOG.error "[Basecamp:HealthCheck] Error: #{e.message}" if defined?(LOG)
+              end
+            end
+          end
+          @health_monitor_thread.abort_on_exception = false
+        end
+
+        # Check an epic for stuck states and auto-heal
+        def health_check_epic(epic)
+          healed_any = false
+
+          epic["tasks"]&.each do |task|
+            card_number = task["fizzy_card"]
+            status = task["status"]
+            pr_number = task["pr_number"]
+            project_key = task["project"]
+
+            case status
+            when "final_decision"
+              # Check if PR is already merged
+              if pr_number && project_key
+                projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
+                projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+                github_repo = projects.dig(project_key, "github_repo")
+
+                if github_repo
+                  pr_state, = Open3.capture2("gh", "pr", "view", pr_number.to_s, "--repo", github_repo, "--json", "state", "-q", ".state")
+                  if pr_state.strip == "MERGED"
+                    LOG.info "[Basecamp:HealthCheck] PR ##{pr_number} merged but task ##{card_number} stuck in final_decision — healing" if defined?(LOG)
+                    Orchestrator.on_card_completed(card_number)
+                    healed_any = true
+                  end
+                end
+              end
+
+            when "in_flight"
+              # Check if impl agent is assigned when changes were requested
+              if task["changes_requested_by"]&.any?
+                impl_agent = epic["agent"]
+                card_json, = Open3.capture2("fizzy", "card", "show", card_number.to_s, "--json")
+                card_data = JSON.parse(card_json) rescue {}
+                assignees = card_data.dig("data", "assignees") || []
+                assignee_names = assignees.map { |a| a["name"]&.downcase }
+
+                unless assignee_names.include?(impl_agent.downcase)
+                  LOG.info "[Basecamp:HealthCheck] Task ##{card_number} in_flight with changes_requested but #{impl_agent} not assigned — healing" if defined?(LOG)
+                  fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
+                  if fizzy_user_id
+                    Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
+                    healed_any = true
+                  end
+                end
+              end
+
+            when "in_review"
+              # Check if all gates have actually approved (webhook might have missed)
+              if pr_number && project_key && ReviewGate.enabled?
+                projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
+                projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+                repo_path = projects.dig(project_key, "repo_path")
+
+                if repo_path
+                  # Sync from GitHub to catch any missed approvals
+                  sync_result = ReviewGate.sync_from_github(task, repo_path: repo_path)
+                  if sync_result[:synced] && ReviewGate.all_gates_passed?(task)
+                    LOG.info "[Basecamp:HealthCheck] All gates passed for ##{card_number} but still in_review — healing" if defined?(LOG)
+                    task["status"] = "final_decision"
+                    task["awaiting_final_decision"] = true
+                    Hooks.send(:save_epic_state, epic)
+                    Hooks.send(:dispatch_final_decision, epic, task, {})
+                    healed_any = true
+                  end
+                end
+              end
+            end
+          end
+
+          # If we healed anything, check if we can dispatch more tasks
+          if healed_any
+            Orchestrator.send(:dispatch_unblocked_tasks, epic)
+            Orchestrator.send(:save_epic, epic)
+          end
         end
 
         private
