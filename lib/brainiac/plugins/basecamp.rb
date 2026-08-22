@@ -135,12 +135,34 @@ module Brainiac
                 if repo_path
                   # Sync from GitHub to catch any missed approvals
                   sync_result = ReviewGate.sync_from_github(task, repo_path: repo_path)
-                  if sync_result[:synced] && ReviewGate.all_gates_passed?(task)
+
+                  if ReviewGate.all_gates_passed?(task)
+                    # All approved — advance to final_decision
                     LOG.info "[Basecamp:HealthCheck] All gates passed for ##{card_number} but still in_review — healing" if defined?(LOG)
                     task["status"] = "final_decision"
                     task["awaiting_final_decision"] = true
                     Hooks.send(:save_epic_state, epic)
                     Hooks.send(:dispatch_final_decision, epic, task, {})
+                    healed_any = true
+                  elsif Hooks.send(:all_gates_responded?, task) && task["changes_requested_by"]&.any?
+                    # All gates responded but some requested changes — need to dispatch impl agent
+                    impl_agent = epic["agent"]
+                    card_json, = Open3.capture2("fizzy", "card", "show", card_number.to_s, "--json")
+                    card_data = JSON.parse(card_json) rescue {}
+                    assignees = card_data.dig("data", "assignees") || []
+                    assignee_names = assignees.map { |a| a["name"]&.downcase }
+
+                    LOG.info "[Basecamp:HealthCheck] All gates responded for ##{card_number} with changes_requested — transitioning to in_flight" if defined?(LOG)
+                    task["status"] = "in_flight"
+                    Hooks.send(:save_epic_state, epic)
+
+                    unless assignee_names.include?(impl_agent.downcase)
+                      LOG.info "[Basecamp:HealthCheck] Re-assigning ##{card_number} to #{impl_agent}" if defined?(LOG)
+                      fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
+                      if fizzy_user_id
+                        Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
+                      end
+                    end
                     healed_any = true
                   end
                 end
