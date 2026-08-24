@@ -16,7 +16,7 @@ module Brainiac
       #   :resolve_base_branch — returns epic branch as worktree base
       #   :resolve_pr_target — returns epic branch as PR target
       module Hooks
-        class << self
+        class << self # rubocop:disable Metrics/ClassLength
           def register_all!
             register_agent_completed
             register_pr_merged
@@ -856,8 +856,8 @@ module Brainiac
                 task["pr_repo"] = project_config["github_repo"]
                 save_epic_state(epic)
                 LOG.info "[Basecamp:Hooks] Backfilled pr_number=#{pr_number} for card ##{card_number} during direct dispatch" if defined?(LOG)
-              else
-                LOG.warn "[Basecamp:Hooks] Could not find PR for card ##{card_number} — gates won't re-trigger after fixes" if defined?(LOG)
+              elsif defined?(LOG)
+                LOG.warn "[Basecamp:Hooks] Could not find PR for card ##{card_number} — gates won't re-trigger after fixes"
               end
             end
 
