@@ -49,6 +49,9 @@ module Brainiac
             LOG.info "[Basecamp:Orchestrator] Started epic '#{title}' (todolist #{todolist_id}) " \
                      "with agent #{agent}, review_gate: #{review_gate}" if defined?(LOG)
 
+            # Initialize epic memory for cross-task shared knowledge
+            EpicMemory.initialize_for(epic)
+
             # FIRST: Populate tasks with project info from Fizzy card tags
             # This must happen BEFORE creating epic branches so we know which repos are involved
             populate_tasks(epic)
@@ -642,6 +645,18 @@ module Brainiac
               "- ##{t['fizzy_card']}: #{t['title']}#{dep_str}"
             end.join("\n")
 
+            # Include existing epic memory if any
+            epic_memory_path = EpicMemory.path_for(epic["basecamp_todolist_id"])
+            epic_memory_section = if EpicMemory.exists?(epic["basecamp_todolist_id"])
+                                    <<~MEM
+
+                                      ### Epic Memory (shared knowledge so far)
+                                      Read the epic memory file at `#{epic_memory_path}` for decisions and patterns established in previous tasks.
+                                    MEM
+                                  else
+                                    ""
+                                  end
+
             prompt = <<~PROMPT
               ## Epic Review: #{epic['title']}
 
@@ -652,7 +667,7 @@ module Brainiac
 
               ### Remaining tasks (with current dependencies):
               #{remaining_summary}
-
+              #{epic_memory_section}
               ### Your job:
               1. Read the memory files for completed tasks to understand what was implemented
               2. Check if remaining tasks still make sense given the implementation decisions
@@ -665,10 +680,20 @@ module Brainiac
 
               Memory files are at: `~/.brainiac/brain/memory/#{agent_name&.downcase}/card-<number>.md`
 
-              After reviewing, post a brief summary comment on the Basecamp todolist:
+              ### Update Epic Memory (IMPORTANT)
+              After your review, update the epic memory file at `#{epic_memory_path}` with:
+              - **Architectural decisions** made during task ##{completed_card_number}
+              - **Patterns established** that should be followed in remaining tasks
+              - **Gotchas** discovered that future tasks should know about
+              - **Cross-task notes** about relationships or dependencies
+
+              This is shared knowledge — other agents will read it. Be concise but thorough.
+              Append a new section, don't replace the existing content.
+
+              Then post a brief summary comment on the Basecamp todolist:
               `basecamp comments create #{epic['basecamp_todolist_id']} "Epic review after ##{completed_card_number}: <your summary>" --in #{epic['basecamp_project_id']}`
 
-              Keep it concise — this is a checkpoint, not a full analysis.
+              Keep the basecamp comment concise — this is a checkpoint, not a full analysis.
             PROMPT
 
             # Get project config for the agent
@@ -758,6 +783,9 @@ module Brainiac
             log_event(epic, "completed", "All tasks complete — epic finished!")
 
             LOG.info "[Basecamp:Orchestrator] Epic '#{epic['title']}' completed!" if defined?(LOG)
+
+            # Archive epic memory (preserves it for future reference)
+            EpicMemory.cleanup(epic["basecamp_todolist_id"], archive: true)
 
             # If epic_branch mode, open final PRs to main
             if epic["review_gate"] == "epic_branch" && epic["epic_branches"]&.any?

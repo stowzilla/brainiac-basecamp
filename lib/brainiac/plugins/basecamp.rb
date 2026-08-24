@@ -7,6 +7,7 @@ require_relative "basecamp/config"
 require_relative "basecamp/client"
 require_relative "basecamp/epic"
 require_relative "basecamp/epic_branch"
+require_relative "basecamp/epic_memory"
 require_relative "basecamp/review_gate"
 require_relative "basecamp/orchestrator"
 require_relative "basecamp/webhook"
@@ -206,7 +207,8 @@ module Brainiac
                         task: task,
                         pr_number: effective_pr,
                         repo_name: github_repo,
-                        repo_path: repo_path
+                        repo_path: repo_path,
+                        is_rereview: true
                       )
                     rescue StandardError => e
                       LOG.error "[Basecamp:HealthCheck] Gate re-dispatch failed for ##{card_number}: #{e.message}" if defined?(LOG)
