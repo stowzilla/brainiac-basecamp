@@ -160,7 +160,19 @@ module Brainiac
 
             when "in_review"
               # Check if all gates have actually approved (webhook might have missed)
-              if pr_number && project_key && ReviewGate.enabled?
+              # Resolve pr_number if missing/zero (same pattern as final_decision)
+              effective_pr = pr_number
+              if (effective_pr.nil? || effective_pr.zero?) && project_key
+                resolved = resolve_pr_for_task(task)
+                if resolved
+                  task["pr_number"] = resolved[:number]
+                  task["pr_repo"] = resolved[:repo] if resolved[:repo]
+                  effective_pr = resolved[:number]
+                  LOG.info "[Basecamp:HealthCheck] Resolved PR ##{effective_pr} for in_review card ##{card_number}" if defined?(LOG)
+                end
+              end
+
+              if effective_pr&.positive? && project_key && ReviewGate.enabled?
                 projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
                 projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
                 repo_path = projects.dig(project_key, "repo_path")
@@ -177,6 +189,28 @@ module Brainiac
                     task["awaiting_final_decision"] = true
                     Hooks.send(:save_epic_state, epic)
                     Hooks.send(:dispatch_final_decision, epic, task, {})
+                    healed_any = true
+                  elsif task["changes_requested_by"]&.any? && pr_has_newer_commits_than_reviews?(task, repo_path: repo_path)
+                    # Changes were requested but the impl agent has already pushed fixes.
+                    # The pr_synchronized hook missed this (pr_number was 0, or status wasn't in_flight).
+                    # Reset approvals and re-dispatch gates to review the new code.
+                    LOG.info "[Basecamp:HealthCheck] PR has commits newer than last changes_requested review for ##{card_number} — re-dispatching gates" if defined?(LOG)
+                    ReviewGate.reset_approvals(task)
+                    task["changes_requested_by"] = []
+                    task["gates_dispatched_at"] = Time.now.iso8601
+                    Hooks.send(:save_epic_state, epic)
+
+                    Thread.new do
+                      ReviewGate.dispatch_gates(
+                        epic: epic,
+                        task: task,
+                        pr_number: effective_pr,
+                        repo_name: github_repo,
+                        repo_path: repo_path
+                      )
+                    rescue StandardError => e
+                      LOG.error "[Basecamp:HealthCheck] Gate re-dispatch failed for ##{card_number}: #{e.message}" if defined?(LOG)
+                    end
                     healed_any = true
                   elsif Hooks.send(:all_gates_responded?, task) && task["changes_requested_by"]&.any?
                     # All gates responded but some requested changes — need to dispatch impl agent
@@ -208,7 +242,7 @@ module Brainiac
                       ReviewGate.dispatch_gates(
                         epic: epic,
                         task: task,
-                        pr_number: pr_number,
+                        pr_number: effective_pr,
                         repo_name: github_repo,
                         repo_path: repo_path
                       )
@@ -226,7 +260,7 @@ module Brainiac
                         ReviewGate.dispatch_missing_gates(
                           epic: epic,
                           task: task,
-                          pr_number: pr_number,
+                          pr_number: effective_pr,
                           repo_name: github_repo,
                           repo_path: repo_path
                         )
@@ -236,6 +270,65 @@ module Brainiac
                     end
                   end
                 end
+              end
+
+            when "complete"
+              # Sanity check: verify the PR is actually merged before accepting "complete" status.
+              # Catches race conditions where rapid review cycles cause premature task completion.
+              next unless project_key
+
+              effective_pr = pr_number
+              if (effective_pr.nil? || effective_pr.zero?)
+                resolved = resolve_pr_for_task(task)
+                if resolved
+                  task["pr_number"] = resolved[:number]
+                  task["pr_repo"] = resolved[:repo] if resolved[:repo]
+                  effective_pr = resolved[:number]
+                end
+              end
+
+              # If we can't find a PR, we can't verify — skip (might be a no-code task)
+              next unless effective_pr&.positive?
+
+              projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
+              projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+              github_repo = projects.dig(project_key, "github_repo")
+              repo_path = projects.dig(project_key, "repo_path")
+              next unless github_repo
+
+              pr_state, = Open3.capture2("gh", "pr", "view", effective_pr.to_s, "--repo", github_repo, "--json", "state", "-q", ".state")
+              pr_state = pr_state.strip
+
+              if pr_state == "OPEN"
+                # PR is NOT merged — task was prematurely marked complete.
+                # Revert to in_review and re-dispatch gates to review current state.
+                LOG.info "[Basecamp:HealthCheck] Task ##{card_number} marked complete but PR ##{effective_pr} is still OPEN — reverting to in_review" if defined?(LOG)
+
+                task["status"] = "in_review"
+                task.delete("completed_at")
+                task["gate_approvals"] = []
+                task["changes_requested_by"] = []
+                task["gates_dispatched_at"] = Time.now.iso8601
+                Hooks.send(:save_epic_state, epic)
+
+                # Uncheck the Basecamp todo (it was incorrectly checked)
+                Orchestrator.send(:uncheck_todo, epic, card_number) if Orchestrator.respond_to?(:uncheck_todo, true)
+
+                # Re-dispatch review gates
+                if ReviewGate.enabled? && repo_path
+                  Thread.new do
+                    ReviewGate.dispatch_gates(
+                      epic: epic,
+                      task: task,
+                      pr_number: effective_pr,
+                      repo_name: github_repo,
+                      repo_path: repo_path
+                    )
+                  rescue StandardError => e
+                    LOG.error "[Basecamp:HealthCheck] Gate dispatch failed for ##{card_number}: #{e.message}" if defined?(LOG)
+                  end
+                end
+                healed_any = true
               end
             end
           end
@@ -248,6 +341,36 @@ module Brainiac
         end
 
         private
+
+        # Check if a PR has commits newer than the most recent changes_requested review.
+        # This detects when the impl agent pushed fixes but gates weren't re-triggered.
+        #
+        # @param task [Hash] Task state with pr_number
+        # @param repo_path [String] Local repo path for gh CLI
+        # @return [Boolean] true if PR has commits after the last changes_requested review
+        def pr_has_newer_commits_than_reviews?(task, repo_path:)
+          pr_number = task["pr_number"]
+          return false unless pr_number&.positive?
+
+          # Get the last changes_requested review timestamp and the latest commit timestamp
+          stdout, _, status = Open3.capture3(
+            "gh", "pr", "view", pr_number.to_s,
+            "--json", "reviews,commits",
+            "--jq", "[(.reviews | map(select(.state == \"CHANGES_REQUESTED\")) | sort_by(.submittedAt) | last | .submittedAt), (.commits | last | .committedDate)] | @tsv",
+            chdir: repo_path
+          )
+          return false unless status.success? && !stdout.strip.empty?
+
+          last_changes_at, last_commit_at = stdout.strip.split("\t")
+          return false if last_changes_at.nil? || last_changes_at.empty? || last_commit_at.nil? || last_commit_at.empty?
+
+          # Compare timestamps — if the latest commit is newer than the last changes_requested review,
+          # the impl agent has pushed fixes that haven't been reviewed yet.
+          Time.parse(last_commit_at) > Time.parse(last_changes_at)
+        rescue StandardError => e
+          LOG.warn "[Basecamp:HealthCheck] Error checking PR commits vs reviews: #{e.message}" if defined?(LOG)
+          false
+        end
 
         # Resume active epics on server startup.
         # For each epic, checks task states and takes appropriate action.
