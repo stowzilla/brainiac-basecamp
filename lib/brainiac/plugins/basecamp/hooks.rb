@@ -446,6 +446,23 @@ module Brainiac
                 ""
               ]
 
+              # Inject epic memory if it exists (shared knowledge across the epic)
+              epic_memory = EpicMemory.read(epic["basecamp_todolist_id"])
+              if epic_memory
+                context_lines << "### Epic Memory (Shared Knowledge)"
+                context_lines << ""
+                context_lines << "The following is shared knowledge accumulated from previous tasks in this epic."
+                context_lines << "Reference this when making implementation decisions."
+                context_lines << ""
+                context_lines << "```markdown"
+                context_lines << epic_memory.lines.first(50).join # Limit to first 50 lines to avoid context overflow
+                if epic_memory.lines.size > 50
+                  context_lines << "... (truncated — full file at ~/.brainiac/brain/memory/epics/epic-#{epic['basecamp_todolist_id']}.md)"
+                end
+                context_lines << "```"
+                context_lines << ""
+              end
+
               # List completed tasks with their memory files for reference
               completed_tasks = tasks.select { |t| t["status"] == "complete" }
               if completed_tasks.any?

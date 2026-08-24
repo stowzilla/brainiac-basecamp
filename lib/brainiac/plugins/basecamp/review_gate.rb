@@ -166,15 +166,23 @@ module Brainiac
           # @param pr_number [Integer, String] PR number
           # @param repo_name [String] e.g. "stowzilla/brainiac-basecamp"
           # @param repo_path [String] Local repo path
+          # @param is_rereview [Boolean] True if this is a re-review after changes
           # @return [Array<String>] Agent names dispatched
-          def dispatch_gates(epic:, task:, pr_number:, repo_name:, repo_path:)
+          def dispatch_gates(epic:, task:, pr_number:, repo_name:, repo_path:, is_rereview: false)
             dispatched = []
+
+            # Get current HEAD SHA for tracking incremental reviews
+            current_sha = get_pr_head_sha(pr_number: pr_number, repo_path: repo_path)
+
+            # Determine if this is a re-review and what SHA to diff from
+            last_reviewed_sha = task["last_reviewed_sha"]
+            diff_from_sha = is_rereview && last_reviewed_sha ? last_reviewed_sha : nil
 
             gates.each do |gate|
               agent_name = gate["agent"]
               role = gate["role"] || "review"
 
-              LOG.info "[Basecamp:ReviewGate] Dispatching #{agent_name} (#{role}) to review PR ##{pr_number}" if defined?(LOG)
+              LOG.info "[Basecamp:ReviewGate] Dispatching #{agent_name} (#{role}) to review PR ##{pr_number}#{diff_from_sha ? " (incremental from #{diff_from_sha[0..7]})" : ""}" if defined?(LOG)
 
               # Dispatch the gate agent via brainiac-github's PR review mechanism.
               # The agent gets the PR diff and reviews it using their bot identity.
@@ -186,7 +194,8 @@ module Brainiac
                   repo_name: repo_name,
                   repo_path: repo_path,
                   card_number: task["fizzy_card"],
-                  epic: epic
+                  epic: epic,
+                  diff_from_sha: diff_from_sha
                 )
               rescue StandardError => e
                 LOG.error "[Basecamp:ReviewGate] Failed to dispatch #{agent_name}: #{e.message}" if defined?(LOG)
@@ -199,6 +208,9 @@ module Brainiac
             task["status"] = "in_review"
             task["gates_dispatched_at"] = Time.now.iso8601
             task["gate_approvals"] ||= []
+            
+            # Track the SHA we're reviewing for incremental diff on next round
+            task["last_reviewed_sha"] = current_sha if current_sha
 
             dispatched
           end
@@ -218,8 +230,9 @@ module Brainiac
           # @param pr_number [Integer, String] PR number
           # @param repo_name [String] e.g. "stowzilla/brainiac-basecamp"
           # @param repo_path [String] Local repo path
+          # @param is_rereview [Boolean] True if this is a re-review after implementation fixes
           # @return [Array<String>] Agent names dispatched
-          def dispatch_missing_gates(epic:, task:, pr_number:, repo_name:, repo_path:)
+          def dispatch_missing_gates(epic:, task:, pr_number:, repo_name:, repo_path:, is_rereview: false)
             responded_agents = Set.new
             (task["gate_approvals"] || []).each { |a| responded_agents << a["agent"].downcase }
             (task["changes_requested_by"] || []).each { |a| responded_agents << a.downcase }
@@ -229,6 +242,10 @@ module Brainiac
 
             # Track per-gate re-dispatch counts to prevent infinite loops
             task["gate_redispatch_counts"] ||= {}
+
+            # For re-reviews, determine incremental diff range
+            diff_from_sha = is_rereview && task["last_reviewed_sha"] ? task["last_reviewed_sha"] : nil
+            current_sha = get_pr_head_sha(pr_number: pr_number, repo_path: repo_path)
 
             dispatched = []
 
@@ -243,7 +260,7 @@ module Brainiac
                 next
               end
 
-              LOG.info "[Basecamp:ReviewGate] Re-dispatching missing gate #{agent_name} (#{role}) to review PR ##{pr_number} (retry #{retries + 1}/#{MAX_GATE_REDISPATCH_RETRIES})" if defined?(LOG)
+              LOG.info "[Basecamp:ReviewGate] Re-dispatching missing gate #{agent_name} (#{role}) to review PR ##{pr_number} (retry #{retries + 1}/#{MAX_GATE_REDISPATCH_RETRIES})#{diff_from_sha ? " (incremental)" : ""}" if defined?(LOG)
 
               task["gate_redispatch_counts"][agent_name.downcase] = retries + 1
 
@@ -255,7 +272,8 @@ module Brainiac
                   repo_name: repo_name,
                   repo_path: repo_path,
                   card_number: task["fizzy_card"],
-                  epic: epic
+                  epic: epic,
+                  diff_from_sha: diff_from_sha
                 )
               rescue StandardError => e
                 LOG.error "[Basecamp:ReviewGate] Failed to dispatch #{agent_name}: #{e.message}" if defined?(LOG)
@@ -267,6 +285,9 @@ module Brainiac
             # Record when this partial re-dispatch happened (for diagnostics)
             # but do NOT overwrite gates_dispatched_at — that's the original timestamp
             task["last_redispatch_at"] = Time.now.iso8601
+            
+            # Update last_reviewed_sha for next round
+            task["last_reviewed_sha"] = current_sha if current_sha
 
             dispatched
           end
@@ -300,9 +321,33 @@ module Brainiac
 
           private
 
+          # Get the HEAD SHA of a PR (for tracking incremental reviews).
+          #
+          # @param pr_number [Integer, String] PR number
+          # @param repo_path [String] Local repo path
+          # @return [String, nil] Commit SHA or nil if failed
+          def get_pr_head_sha(pr_number:, repo_path:)
+            stdout, _, status = Open3.capture3(
+              "gh", "pr", "view", pr_number.to_s,
+              "--json", "headRefOid",
+              "--jq", ".headRefOid",
+              chdir: repo_path
+            )
+            return nil unless status.success?
+
+            sha = stdout.strip
+            sha.empty? ? nil : sha
+          rescue StandardError => e
+            LOG.warn "[Basecamp:ReviewGate] Failed to get PR head SHA: #{e.message}" if defined?(LOG)
+            nil
+          end
+
           # Dispatch a single gate agent to review a PR.
           # This creates a review prompt and runs the agent in the repo directory.
-          def dispatch_agent_for_review(agent_name:, role:, pr_number:, repo_name:, repo_path:, card_number:, epic:)
+          #
+          # @param diff_from_sha [String, nil] If present, this is a re-review and agent should
+          #   focus on changes since this SHA (incremental review)
+          def dispatch_agent_for_review(agent_name:, role:, pr_number:, repo_name:, repo_path:, card_number:, epic:, diff_from_sha: nil)
             # Build a review-specific prompt for the gate agent
             prompt = build_gate_review_prompt(
               agent_name: agent_name,
@@ -310,7 +355,8 @@ module Brainiac
               pr_number: pr_number,
               repo_name: repo_name,
               card_number: card_number,
-              epic_title: epic["title"]
+              epic_title: epic["title"],
+              diff_from_sha: diff_from_sha
             )
 
             # Resolve the agent's GitHub token for their bot identity
@@ -359,29 +405,67 @@ module Brainiac
           end
 
           # Build the prompt for a gate review agent.
-          def build_gate_review_prompt(agent_name:, role:, pr_number:, repo_name:, card_number:, epic_title:)
-            <<~PROMPT
-              You are reviewing PR ##{pr_number} on #{repo_name} as part of epic: "#{epic_title}".
-              Your role: **#{role}**
+          #
+          # @param diff_from_sha [String, nil] If present, this is an incremental re-review
+          def build_gate_review_prompt(agent_name:, role:, pr_number:, repo_name:, card_number:, epic_title:, diff_from_sha: nil)
+            if diff_from_sha
+              # Incremental re-review prompt — focus only on new changes
+              <<~PROMPT
+                You are RE-REVIEWING PR ##{pr_number} on #{repo_name} as part of epic: "#{epic_title}".
+                Your role: **#{role}**
 
-              This is a review gate — the epic cannot proceed until you approve.
+                This is an INCREMENTAL REVIEW — you already reviewed this PR and requested changes.
+                The implementation agent has pushed fixes. Focus on what changed.
 
-              Review the PR changes with `gh pr diff #{pr_number}` and `gh pr view #{pr_number}`.
+                **View only the NEW changes since your last review:**
+                ```
+                git fetch origin && git diff #{diff_from_sha}..HEAD
+                ```
 
-              Based on your role (#{role}):
-              #{role_instructions(role)}
+                Or compare in GitHub: `#{repo_name}/compare/#{diff_from_sha[0..7]}...HEAD`
 
-              After your review:
-              - If the code meets your standards: `gh pr review #{pr_number} --approve --body "your summary"`
-              - If changes are needed: `gh pr review #{pr_number} --request-changes --body "what needs fixing"`
+                If you need the full context, you can still use `gh pr diff #{pr_number}`, but prioritize
+                reviewing the incremental changes first.
 
-              Be thorough but pragmatic. This is Fizzy card ##{card_number}.
+                Based on your role (#{role}):
+                #{role_instructions(role)}
 
-              IMPORTANT RESTRICTIONS:
-              - Do NOT open new PRs or modify code — you are a reviewer only
-              - Do NOT comment on the Fizzy card — your review goes on GitHub only
-              - Do NOT use the fizzy CLI at all
-            PROMPT
+                After your review:
+                - If the fixes address your concerns: `gh pr review #{pr_number} --approve --body "your summary"`
+                - If more changes are needed: `gh pr review #{pr_number} --request-changes --body "what still needs fixing"`
+
+                Be thorough but pragmatic. This is Fizzy card ##{card_number}.
+
+                IMPORTANT RESTRICTIONS:
+                - Do NOT open new PRs or modify code — you are a reviewer only
+                - Do NOT comment on the Fizzy card — your review goes on GitHub only
+                - Do NOT use the fizzy CLI at all
+              PROMPT
+            else
+              # Initial full review prompt
+              <<~PROMPT
+                You are reviewing PR ##{pr_number} on #{repo_name} as part of epic: "#{epic_title}".
+                Your role: **#{role}**
+
+                This is a review gate — the epic cannot proceed until you approve.
+
+                Review the PR changes with `gh pr diff #{pr_number}` and `gh pr view #{pr_number}`.
+
+                Based on your role (#{role}):
+                #{role_instructions(role)}
+
+                After your review:
+                - If the code meets your standards: `gh pr review #{pr_number} --approve --body "your summary"`
+                - If changes are needed: `gh pr review #{pr_number} --request-changes --body "what needs fixing"`
+
+                Be thorough but pragmatic. This is Fizzy card ##{card_number}.
+
+                IMPORTANT RESTRICTIONS:
+                - Do NOT open new PRs or modify code — you are a reviewer only
+                - Do NOT comment on the Fizzy card — your review goes on GitHub only
+                - Do NOT use the fizzy CLI at all
+              PROMPT
+            end
           end
 
           # Role-specific review instructions.
