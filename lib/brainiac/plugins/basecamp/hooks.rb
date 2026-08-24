@@ -737,6 +737,21 @@ module Brainiac
             agent_name = epic["agent"]
             pr_number = task["pr_number"]
             project_key = task["project"]
+            card_key = "changes-requested-#{card_number}"
+
+            # Guard: don't spawn a duplicate if a session is already running for this task
+            session_alive = if defined?(session_active?)
+                             session_active?(card_key)
+                           elsif Object.respond_to?(:session_active?, true)
+                             Object.send(:session_active?, card_key)
+                           else
+                             false
+                           end
+
+            if session_alive
+              LOG.info "[Basecamp:Hooks] Session already active for #{card_key} — skipping dispatch" if defined?(LOG)
+              return
+            end
 
             LOG.info "[Basecamp:Hooks] Direct-dispatching #{agent_name} for changes_requested on card ##{card_number}" if defined?(LOG)
 
@@ -788,7 +803,6 @@ module Brainiac
             # Spawn the agent directly
             pid = nil
             log_file = nil
-            card_key = "changes-requested-#{card_number}"
 
             begin
               pid, log_file = method(:run_agent).call(
