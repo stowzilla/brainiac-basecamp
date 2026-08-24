@@ -189,6 +189,8 @@ module Brainiac
             load_epics.find { |e| e["id"] == epic_id }
           end
 
+          WEBHOOK_CHECK_COOLDOWN = 300 # 5 minutes
+
           private
 
           # Resolve current todolist state from Basecamp and dispatch unblocked cards.
@@ -449,7 +451,7 @@ module Brainiac
 
                   # Fizzy assign TOGGLES, so calling it removes the assignment
                   Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
-                  sleep 1  # Brief pause to ensure the unassign is processed
+                  sleep 1 # Brief pause to ensure the unassign is processed
 
                   # Now reassign — this should trigger the webhook
                   stdout2, stderr2, status2 = Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
@@ -484,8 +486,6 @@ module Brainiac
           # any disabled brainiac webhooks.
           #
           # Uses a cooldown to avoid hammering the API on every dispatch batch.
-          WEBHOOK_CHECK_COOLDOWN = 300 # 5 minutes
-
           def ensure_fizzy_webhooks_active
             now = Time.now
             @last_webhook_check ||= Time.at(0)
@@ -523,21 +523,22 @@ module Brainiac
                 next unless webhook["name"]&.start_with?("brainiac")
                 next if webhook["active"]
 
-                LOG.warn "[Basecamp:Orchestrator] Fizzy webhook '#{webhook["name"]}' on board '#{board_key}' is INACTIVE — reactivating" if defined?(LOG)
+                wh_name = webhook["name"]
+                LOG.warn "[Basecamp:Orchestrator] Fizzy webhook '#{wh_name}' on board '#{board_key}' is INACTIVE — reactivating" if defined?(LOG)
                 _, _, reactivate_status = Open3.capture3(env, "fizzy", "webhook", "reactivate", webhook["id"],
                                                          "--board", board_id, chdir: Dir.home)
                 if reactivate_status.success?
                   reactivated += 1
-                  LOG.info "[Basecamp:Orchestrator] Reactivated webhook '#{webhook["name"]}' on board '#{board_key}'" if defined?(LOG)
+                  LOG.info "[Basecamp:Orchestrator] Reactivated webhook '#{webhook['name']}' on board '#{board_key}'" if defined?(LOG)
                 else
-                  LOG.error "[Basecamp:Orchestrator] Failed to reactivate webhook '#{webhook["name"]}' on board '#{board_key}'" if defined?(LOG)
+                  LOG.error "[Basecamp:Orchestrator] Failed to reactivate webhook '#{webhook['name']}' on board '#{board_key}'" if defined?(LOG)
                 end
               end
             rescue StandardError => e
               LOG.warn "[Basecamp:Orchestrator] Webhook check failed for board '#{board_key}': #{e.message}" if defined?(LOG)
             end
 
-            LOG.info "[Basecamp:Orchestrator] Fizzy webhook health check: #{reactivated} reactivated" if reactivated > 0
+            LOG.info "[Basecamp:Orchestrator] Fizzy webhook health check: #{reactivated} reactivated" if reactivated.positive?
           rescue StandardError => e
             LOG.warn "[Basecamp:Orchestrator] Fizzy webhook health check failed: #{e.message}" if defined?(LOG)
           end
