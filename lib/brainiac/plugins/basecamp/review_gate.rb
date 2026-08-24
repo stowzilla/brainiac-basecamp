@@ -350,11 +350,16 @@ module Brainiac
               end
             end
 
-            # Register session for waybar visibility
-            if pid && defined?(register_session)
-              register_session(card_key, pid, log_file: log_file, agent_name: agent_name)
-            elsif pid && Object.respond_to?(:register_session, true)
-              Object.send(:register_session, card_key, pid, log_file: log_file, agent_name: agent_name)
+            # Register session in SessionRegistry for liveness tracking
+            if pid
+              SessionRegistry.register_session(
+                card_key, pid,
+                log_file: log_file,
+                agent_name: agent_name,
+                epic_id: epic["id"],
+                card_number: card_number
+              )
+              LOG.info "[Basecamp:ReviewGate] Spawned #{agent_name} (pid #{pid}) for gate review on card ##{card_number}" if defined?(LOG)
             end
           end
 

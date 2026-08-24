@@ -2,6 +2,30 @@
 
 All notable changes to brainiac-basecamp will be documented in this file.
 
+## [0.1.0] - 2026-08-24
+
+### Added
+
+- **SessionRegistry module** — first-class agent session liveness tracking via PID checks. Replaces the old pattern of inferring agent liveness from elapsed time or Fizzy assignment state.
+  - `SessionRegistry.register_session(task_id, pid)` — track active agent sessions
+  - `SessionRegistry.alive?(task_id)` — direct PID liveness check
+  - `SessionRegistry.mark_dead(task_id)` — explicit session termination
+  - `SessionRegistry.sessions_for_epic(epic_id)` — list sessions by epic
+  - `SessionRegistry.any_alive_for_card?(card_number)` — check if any agent is running for a card
+  - `SessionRegistry.reap_dead!` — periodic sweep for crashed agents
+  - `SessionRegistry.clear_all!` — called on server restart (all PIDs assumed stale)
+- Sessions persisted to `~/.brainiac/basecamp_sessions.json` for crash recovery diagnostics
+- Session status exposed via `/api/basecamp` endpoint
+- Health monitor now reaps dead sessions and sweeps old entries each cycle
+
+### Changed
+
+- Health monitor `in_flight` check uses `SessionRegistry.alive?` instead of elapsed-time heuristic
+- Gate agent dispatch (`ReviewGate.dispatch_agent_for_review`) registers sessions via `SessionRegistry`
+- Final decision dispatch (`Hooks.dispatch_final_decision`) registers sessions via `SessionRegistry`
+- Epic review dispatch (`Orchestrator.dispatch_epic_review`) registers sessions via `SessionRegistry`
+- All above replace the fragile `Object.send(:register_session, ...)` pattern with the new module
+
 ## [0.0.7] - 2026-08-24
 
 ### Fixed

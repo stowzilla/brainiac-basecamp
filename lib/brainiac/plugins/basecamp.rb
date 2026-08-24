@@ -6,6 +6,7 @@ require_relative "basecamp/config"
 require_relative "basecamp/client"
 require_relative "basecamp/epic"
 require_relative "basecamp/epic_branch"
+require_relative "basecamp/session_registry"
 require_relative "basecamp/review_gate"
 require_relative "basecamp/orchestrator"
 require_relative "basecamp/webhook"
@@ -31,6 +32,9 @@ module Brainiac
         # @param app [Sinatra::Application] The running Brainiac server
         def register(app)
           Config.load!
+
+          # Clear all sessions on startup — PIDs from prior runs are untrustworthy
+          SessionRegistry.clear_all!
 
           # Register lifecycle hooks
           Hooks.register_all!
@@ -67,12 +71,17 @@ module Brainiac
         # - final_decision tasks where PR is already merged
         # - in_flight tasks where impl agent isn't assigned
         # - in_review tasks where all gates have actually approved (webhook missed)
+        # - dead sessions that need reaping
         def start_epic_health_monitor
           @health_monitor_thread = Thread.new do
             loop do
               sleep 90  # Check every 90 seconds
 
               begin
+                # Reap dead sessions and sweep old entries
+                SessionRegistry.reap_dead!
+                SessionRegistry.sweep!
+
                 active_epics = Orchestrator.active_epics
                 next if active_epics.empty?
 
@@ -116,18 +125,23 @@ module Brainiac
               end
 
             when "in_flight"
-              # Check if impl agent session is likely dead after a restart.
-              # Instead of just checking Fizzy assignment (stale artifact), use
-              # dispatched_at as a liveness signal — if dispatched too long ago
-              # without completion, assume the session died and re-dispatch.
+              # Check if impl agent session is actually alive via SessionRegistry.
+              # This replaces the old elapsed-time heuristic with a direct PID check.
+              session_alive = SessionRegistry.any_alive_for_card?(card_number)
+
+              if session_alive
+                # Agent is running — nothing to heal
+                next
+              end
+
+              # No live session for this card — check if we should re-dispatch
               dispatched_at = task["dispatched_at"]
               if dispatched_at
                 elapsed = Time.now - Time.parse(dispatched_at)
-                # If task has been in_flight for longer than the stale timeout
-                # AND no agent is actively running (we can't check PID, so use elapsed time)
+                # Only re-dispatch if enough time has passed (agent may not have registered yet)
                 if elapsed > STALE_DISPATCH_TIMEOUT
                   impl_agent = epic["agent"]
-                  LOG.info "[Basecamp:HealthCheck] Task ##{card_number} in_flight for #{elapsed.round}s — re-dispatching #{impl_agent}" if defined?(LOG)
+                  LOG.info "[Basecamp:HealthCheck] Task ##{card_number} in_flight with no live session (elapsed #{elapsed.round}s) — re-dispatching #{impl_agent}" if defined?(LOG)
 
                   # Re-dispatch by re-assigning the card (triggers webhook)
                   task["dispatched_at"] = Time.now.iso8601
@@ -443,7 +457,8 @@ module Brainiac
               bot_accounts: config["bot_accounts"].keys,
               project_mappings: config["project_mappings"].keys,
               active_epics: Orchestrator.active_epics.size,
-              total_epics: Orchestrator.all_epics.size
+              total_epics: Orchestrator.all_epics.size,
+              sessions: SessionRegistry.status
             }.to_json
           end
 
