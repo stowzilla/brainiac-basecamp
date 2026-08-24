@@ -129,25 +129,21 @@ module Brainiac
                   impl_agent = epic["agent"]
                   LOG.info "[Basecamp:HealthCheck] Task ##{card_number} in_flight for #{elapsed.round}s — re-dispatching #{impl_agent}" if defined?(LOG)
 
-                  # Re-dispatch by re-assigning the card (triggers webhook)
+                  # Spawn the agent directly — safe_assign_card won't work if already assigned
                   task["dispatched_at"] = Time.now.iso8601
-                  fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
-                  if fizzy_user_id
-                    Hooks.send(:safe_assign_card, card_number, fizzy_user_id)
-                    healed_any = true
-                  end
+                  Hooks.send(:dispatch_impl_directly, epic, task)
+                  healed_any = true
                 end
               elsif task["changes_requested_by"]&.any?
                 # No dispatched_at recorded but changes were requested — legacy state.
                 # Always re-dispatch in this case.
                 impl_agent = epic["agent"]
                 LOG.info "[Basecamp:HealthCheck] Task ##{card_number} in_flight with changes_requested but no dispatched_at — re-dispatching #{impl_agent}" if defined?(LOG)
+
+                # Spawn the agent directly — safe_assign_card won't work if already assigned
                 task["dispatched_at"] = Time.now.iso8601
-                fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
-                if fizzy_user_id
-                  Hooks.send(:safe_assign_card, card_number, fizzy_user_id)
-                  healed_any = true
-                end
+                Hooks.send(:dispatch_impl_directly, epic, task)
+                healed_any = true
               end
 
             when "in_review"
@@ -329,13 +325,11 @@ module Brainiac
 
             # Transition to in_flight so the agent gets the right context
             task["status"] = "in_flight"
+            task["dispatched_at"] = Time.now.iso8601
             Hooks.send(:save_epic_state, epic)
 
-            # Re-assign card to trigger a fresh dispatch via the Fizzy webhook
-            fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
-            if fizzy_user_id
-              Hooks.send(:safe_assign_card, card_number, fizzy_user_id)
-            end
+            # Spawn the agent directly — safe_assign_card won't work if already assigned
+            Hooks.send(:dispatch_impl_directly, epic, task)
           else
             # No changes requested yet — check if gates need (re-)dispatching
             approvals = task["gate_approvals"]&.size || 0
