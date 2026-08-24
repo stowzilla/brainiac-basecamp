@@ -131,10 +131,11 @@ module Brainiac
                 projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
                 projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
                 repo_path = projects.dig(project_key, "repo_path")
+                github_repo = projects.dig(project_key, "github_repo")
 
                 if repo_path
                   # Sync from GitHub to catch any missed approvals
-                  sync_result = ReviewGate.sync_from_github(task, repo_path: repo_path)
+                  ReviewGate.sync_from_github(task, repo_path: repo_path)
 
                   if ReviewGate.all_gates_passed?(task)
                     # All approved — advance to final_decision
@@ -164,6 +165,23 @@ module Brainiac
                       end
                     end
                     healed_any = true
+                  elsif (task["gate_approvals"] || []).empty? && !task["changes_requested_by"]&.any?
+                    # No gate responses at all — gates may never have been dispatched or agents crashed
+                    gates_dispatched_at = task["gates_dispatched_at"]
+                    should_redispatch = gates_dispatched_at.nil? || (Time.now - Time.parse(gates_dispatched_at)) > 300
+
+                    if should_redispatch && github_repo
+                      LOG.info "[Basecamp:HealthCheck] No gate responses for ##{card_number} — re-dispatching review gates" if defined?(LOG)
+                      ReviewGate.dispatch_gates(
+                        epic: epic,
+                        task: task,
+                        pr_number: pr_number,
+                        repo_name: github_repo,
+                        repo_path: repo_path
+                      )
+                      Hooks.send(:save_epic_state, epic)
+                      healed_any = true
+                    end
                   end
                 end
               end
@@ -281,9 +299,41 @@ module Brainiac
               end
             end
           else
-            # No changes requested yet — just waiting for reviews
+            # No changes requested yet — check if gates need (re-)dispatching
             approvals = task["gate_approvals"]&.size || 0
-            LOG.info "[Basecamp] Resume: ##{card_number} has #{approvals} approvals, waiting for more reviews" if defined?(LOG)
+            gates_dispatched_at = task["gates_dispatched_at"]
+
+            # Re-dispatch gates if:
+            # 1. Gates were never dispatched (missed webhook), OR
+            # 2. Gates were dispatched but no responses received after a reasonable window
+            should_redispatch = if gates_dispatched_at.nil?
+                                  true
+                                elsif approvals.zero?
+                                  # If dispatched more than 5 minutes ago with no responses, re-dispatch
+                                  elapsed = Time.now - Time.parse(gates_dispatched_at)
+                                  elapsed > 300
+                                else
+                                  false
+                                end
+
+            if should_redispatch && ReviewGate.enabled?
+              github_repo = projects.dig(project_key, "github_repo")
+              if github_repo
+                LOG.info "[Basecamp] Resume: ##{card_number} has #{approvals} approvals — re-dispatching review gates" if defined?(LOG)
+                ReviewGate.dispatch_gates(
+                  epic: epic,
+                  task: task,
+                  pr_number: pr_number,
+                  repo_name: github_repo,
+                  repo_path: repo_path
+                )
+                Hooks.send(:save_epic_state, epic)
+              else
+                LOG.warn "[Basecamp] Resume: ##{card_number} — cannot re-dispatch gates, no github_repo for #{project_key}" if defined?(LOG)
+              end
+            else
+              LOG.info "[Basecamp] Resume: ##{card_number} has #{approvals} approvals, waiting for more reviews" if defined?(LOG)
+            end
           end
         end
 
