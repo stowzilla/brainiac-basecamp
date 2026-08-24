@@ -482,12 +482,17 @@ module Brainiac
           end
 
           # Return the epic branch as the worktree base for cards in an active epic.
+          # If the epic branch doesn't exist for this task's project yet, create it lazily.
           def register_resolve_base_branch
             Brainiac.on(:resolve_base_branch) do |ctx|
               card_number = ctx[:card_number]
               next unless card_number
 
               branch = EpicBranch.epic_branch_for_card(card_number)
+
+              # Lazy creation: if no branch exists for this task's project, create one now
+              branch ||= EpicBranch.ensure_epic_branch_for_card(card_number)
+
               next unless branch
 
               "origin/#{branch}"
@@ -495,12 +500,15 @@ module Brainiac
           end
 
           # Return the epic branch as the PR target for cards in an active epic.
+          # Same lazy-creation logic as resolve_base_branch.
           def register_resolve_pr_target
             Brainiac.on(:resolve_pr_target) do |ctx|
               card_number = ctx[:card_number]
               next unless card_number
 
-              EpicBranch.epic_branch_for_card(card_number)
+              branch = EpicBranch.epic_branch_for_card(card_number)
+              branch ||= EpicBranch.ensure_epic_branch_for_card(card_number)
+              branch
             end
           end
 
