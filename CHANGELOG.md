@@ -2,6 +2,12 @@
 
 All notable changes to brainiac-basecamp will be documented in this file.
 
+## [0.0.7] - 2026-08-24
+
+### Fixed
+
+- Review gates are now re-dispatched on restart when no gate responses have been received. Previously, if a GitHub webhook was missed (or gate agents crashed), tasks would stay in `in_review` indefinitely with "0 approvals, waiting for more reviews." Now both the startup resume and the 90-second health monitor will re-dispatch gates if `gates_dispatched_at` is nil or more than 5 minutes have passed with no responses.
+
 ## [0.0.5] - 2026-08-21
 
 ### Fixed
