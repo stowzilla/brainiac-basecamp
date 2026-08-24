@@ -16,7 +16,7 @@ module Brainiac
       #   :resolve_base_branch — returns epic branch as worktree base
       #   :resolve_pr_target — returns epic branch as PR target
       module Hooks
-        class << self
+        class << self # rubocop:disable Metrics/ClassLength
           def register_all!
             register_agent_completed
             register_pr_merged
@@ -380,14 +380,39 @@ module Brainiac
               next unless epic["review_gate"] == "epic_branch" && ReviewGate.enabled?
 
               task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
-              # Re-trigger gates if task is in_flight (agent working/pushed fixes)
-              # No need to check for prior reviews — if task is in_flight with a PR, gates should review
-              next unless task && task["status"] == "in_flight" && task["pr_number"]
+              next unless task && task["status"] == "in_flight"
+
+              # Ensure pr_number is set — it may be missing if initial gate dispatch
+              # failed to persist it or if state was lost during serialization.
+              unless task["pr_number"]
+                pr_number = ctx.dig(:pull_request, "number") || ctx[:pr_number]
+                if pr_number
+                  task["pr_number"] = pr_number.to_i
+                  LOG.info "[Basecamp:Hooks] Backfilled pr_number=#{pr_number} for card ##{card_number}" if defined?(LOG)
+                else
+                  # Try to find it from the branch
+                  project_key = task["project"] || Config.brainiac_project_for(epic["basecamp_project_id"])
+                  projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
+                  projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+                  repo_path = projects.dig(project_key, "repo_path")
+                  if repo_path
+                    branch = ctx[:branch] || "fizzy-#{card_number}-*"
+                    found_pr = find_pr_number(repo_path: repo_path, branch: branch)
+                    if found_pr
+                      task["pr_number"] = found_pr
+                      LOG.info "[Basecamp:Hooks] Resolved pr_number=#{found_pr} for card ##{card_number} via branch lookup" if defined?(LOG)
+                    end
+                  end
+                end
+              end
+
+              next unless task["pr_number"]
 
               LOG.info "[Basecamp:Hooks] PR updated for card ##{card_number} — re-triggering review gates" if defined?(LOG)
 
               # Reset approvals and re-dispatch gates
               ReviewGate.reset_approvals(task)
+              task["changes_requested_by"] = []
               task["status"] = "in_review"
               epic["updated_at"] = Time.now.iso8601
               save_epic_state(epic)
@@ -819,6 +844,21 @@ module Brainiac
             unless repo_path
               LOG.error "[Basecamp:Hooks] No repo_path for project '#{project_key}' — cannot direct-dispatch" if defined?(LOG)
               return
+            end
+
+            # Ensure pr_number is set — look it up if missing.
+            # This is critical for the pr_synchronized hook to re-trigger gates after fixes.
+            unless pr_number
+              found_pr = find_pr_number(repo_path: repo_path, branch: "fizzy-#{card_number}-*")
+              if found_pr
+                pr_number = found_pr
+                task["pr_number"] = pr_number
+                task["pr_repo"] = project_config["github_repo"]
+                save_epic_state(epic)
+                LOG.info "[Basecamp:Hooks] Backfilled pr_number=#{pr_number} for card ##{card_number} during direct dispatch" if defined?(LOG)
+              elsif defined?(LOG)
+                LOG.warn "[Basecamp:Hooks] Could not find PR for card ##{card_number} — gates won't re-trigger after fixes"
+              end
             end
 
             # Find the worktree for this card
