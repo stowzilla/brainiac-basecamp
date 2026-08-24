@@ -278,7 +278,7 @@ module Brainiac
               next unless project_key
 
               effective_pr = pr_number
-              if (effective_pr.nil? || effective_pr.zero?)
+              if effective_pr.nil? || effective_pr.zero?
                 resolved = resolve_pr_for_task(task)
                 if resolved
                   task["pr_number"] = resolved[:number]
