@@ -174,7 +174,8 @@ module Brainiac
 
               status_icon = epic["status"] == "active" ? "🚀" : "✅"
               puts "#{status_icon} #{epic['title']}"
-              puts "   Todolist: #{epic['basecamp_todolist_id']} | Agent: #{epic['agent']} | Tasks: #{complete}/#{total} complete, #{in_flight} in-flight"
+              puts "   Todolist: #{epic['basecamp_todolist_id']} | Agent: #{epic['agent']}"
+              puts "   Tasks: #{complete}/#{total} complete, #{in_flight} in-flight"
               puts "   Started: #{epic['started_at']}"
 
               # Show per-task detail if verbose or few tasks
@@ -478,9 +479,9 @@ module Brainiac
             puts "✓ Reset card ##{card_number} from '#{old_status}' → '#{target_status}'"
             puts "  Epic: #{epic['title']}"
 
-            if target_status == "pending"
-              puts "  The task will be picked up on next dispatch cycle (restart brainiac or wait for next event)"
-            end
+            return unless target_status == "pending"
+
+            puts "  The task will be picked up on next dispatch cycle (restart brainiac or wait for next event)"
           end
 
           def cmd_reset_gates(args)
@@ -578,7 +579,7 @@ module Brainiac
             tasks_to_reset = if target_status == "pending"
                                epic["tasks"]
                              else
-                               epic["tasks"].select { |t| t["status"] != "complete" }
+                               epic["tasks"].reject { |t| t["status"] == "complete" }
                              end
 
             tasks_to_reset.each { |t| reset_task_to(t, target_status) }
@@ -601,10 +602,8 @@ module Brainiac
 
           # --- Reset helpers ---
 
-          VALID_TASK_STATUSES = %w[pending in_flight in_review final_decision complete].freeze
-
           def valid_task_status?(status)
-            VALID_TASK_STATUSES.include?(status)
+            %w[pending in_flight in_review final_decision complete].include?(status)
           end
 
           def parse_to_flag(args)
@@ -675,9 +674,9 @@ module Brainiac
           def save_epics(epics)
             epics_file = File.join(BRAINIAC_DIR, "basecamp_epics.json")
             File.write(epics_file, JSON.pretty_generate({
-              "epics" => epics,
-              "updated_at" => Time.now.iso8601
-            }))
+                                                          "epics" => epics,
+                                                          "updated_at" => Time.now.iso8601
+                                                        }))
           end
 
           def load_config
