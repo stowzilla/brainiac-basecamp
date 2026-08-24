@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "open3"
 require_relative "basecamp/version"
 require_relative "basecamp/metadata"
 require_relative "basecamp/config"
@@ -99,16 +100,27 @@ module Brainiac
 
             case status
             when "final_decision"
-              # Check if PR is already merged
-              if pr_number && project_key
+              # Check if PR is already merged — resolve pr_number first if missing/zero
+              effective_pr = pr_number
+              if (effective_pr.nil? || effective_pr.zero?) && project_key
+                resolved = resolve_pr_for_task(task)
+                if resolved
+                  task["pr_number"] = resolved[:number]
+                  task["pr_repo"] = resolved[:repo] if resolved[:repo]
+                  effective_pr = resolved[:number]
+                  LOG.info "[Basecamp:HealthCheck] Resolved PR ##{effective_pr} for card ##{card_number}" if defined?(LOG)
+                end
+              end
+
+              if effective_pr && effective_pr.positive? && project_key
                 projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
                 projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
                 github_repo = projects.dig(project_key, "github_repo")
 
                 if github_repo
-                  pr_state, = Open3.capture2("gh", "pr", "view", pr_number.to_s, "--repo", github_repo, "--json", "state", "-q", ".state")
+                  pr_state, = Open3.capture2("gh", "pr", "view", effective_pr.to_s, "--repo", github_repo, "--json", "state", "-q", ".state")
                   if pr_state.strip == "MERGED"
-                    LOG.info "[Basecamp:HealthCheck] PR ##{pr_number} merged but task ##{card_number} stuck in final_decision — healing" if defined?(LOG)
+                    LOG.info "[Basecamp:HealthCheck] PR ##{effective_pr} merged but task ##{card_number} stuck in final_decision — healing" if defined?(LOG)
                     Orchestrator.on_card_completed(card_number)
                     healed_any = true
                   end
@@ -388,6 +400,35 @@ module Brainiac
           card_number = task["fizzy_card"]
           LOG.info "[Basecamp] Resume: checking final_decision task ##{card_number}, awaiting=#{task['awaiting_final_decision']}" if defined?(LOG)
 
+          # First, resolve PR number if missing or zero (branch creation may have failed)
+          pr_number = task["pr_number"]
+          if (pr_number.nil? || pr_number.zero?) && task["project"]
+            resolved_pr = resolve_pr_for_task(task)
+            if resolved_pr
+              task["pr_number"] = resolved_pr[:number]
+              task["pr_repo"] = resolved_pr[:repo] if resolved_pr[:repo]
+              pr_number = resolved_pr[:number]
+              LOG.info "[Basecamp] Resume: resolved PR ##{pr_number} for card ##{card_number}" if defined?(LOG)
+            end
+          end
+
+          # Check if PR is already merged (handles manual merges, webhook misses, agent merges to wrong branch)
+          if pr_number && pr_number.positive?
+            project_key = task["project"]
+            projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
+            projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+            github_repo = projects.dig(project_key, "github_repo")
+
+            if github_repo
+              pr_state, = Open3.capture2("gh", "pr", "view", pr_number.to_s, "--repo", github_repo, "--json", "state", "-q", ".state")
+              if pr_state.strip == "MERGED"
+                LOG.info "[Basecamp] Resume: PR ##{pr_number} already merged — marking card ##{card_number} complete" if defined?(LOG)
+                Orchestrator.on_card_completed(card_number)
+                return
+              end
+            end
+          end
+
           # If awaiting_final_decision is set, re-dispatch
           # Also handle the case where it's nil but gates are all approved (stale state)
           if task["awaiting_final_decision"] || ReviewGate.all_gates_passed?(task)
@@ -398,6 +439,38 @@ module Brainiac
           else
             LOG.info "[Basecamp] Resume: final_decision task ##{card_number} not ready (awaiting=#{task['awaiting_final_decision']}, gates_passed=#{ReviewGate.all_gates_passed?(task)})" if defined?(LOG)
           end
+        end
+
+        # Resolve a PR number for a task by searching GitHub for matching branch patterns.
+        # Used when pr_number is 0 or nil (e.g., branch creation failed so PR was never tracked).
+        def resolve_pr_for_task(task)
+          card_number = task["fizzy_card"]
+          project_key = task["project"]
+          return nil unless project_key
+
+          projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
+          projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+          repo_path = projects.dig(project_key, "repo_path")
+          github_repo = projects.dig(project_key, "github_repo")
+          return nil unless repo_path
+
+          # Search for PR by fizzy-NNNN branch pattern (any state)
+          stdout, _, status = Open3.capture3(
+            "gh", "pr", "list", "--state", "all",
+            "--json", "number,headRefName,state",
+            "--jq", ".[] | select(.headRefName | startswith(\"fizzy-#{card_number}\")) | [.number, .state] | @tsv",
+            chdir: repo_path
+          )
+          return nil unless status.success? && !stdout.strip.empty?
+
+          # Take the first match
+          number, _state = stdout.strip.split("\n").first.split("\t")
+          return nil unless number
+
+          { number: number.to_i, repo: github_repo }
+        rescue StandardError => e
+          LOG.warn "[Basecamp] Error resolving PR for card ##{card_number}: #{e.message}" if defined?(LOG)
+          nil
         end
 
         def setup_routes(app)

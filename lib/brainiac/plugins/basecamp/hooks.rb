@@ -123,6 +123,16 @@ module Brainiac
               if epic_branches.include?(base_branch)
                 LOG.info "[Basecamp:Hooks] PR merged to epic branch #{base_branch} for card ##{card_number} — advancing" if defined?(LOG)
                 Orchestrator.on_card_completed(card_number)
+              elsif epic_branches.empty?
+                # Fallback: epic_branches was never populated (branch creation failed).
+                # If the task is in final_decision or in_review, the merge still represents
+                # completion — advance the epic regardless of which branch was targeted.
+                task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
+                if task && %w[final_decision in_review in_flight].include?(task["status"])
+                  LOG.warn "[Basecamp:Hooks] epic_branches is empty but PR merged to '#{base_branch}' " \
+                           "for card ##{card_number} (status: #{task['status']}) — advancing anyway (branch creation likely failed)" if defined?(LOG)
+                  Orchestrator.on_card_completed(card_number)
+                end
               end
             end
           end
@@ -613,12 +623,30 @@ module Brainiac
             github_repo = project_config&.dig("github_repo")
 
             # Check if PR is already merged (handles manual merges, webhook misses, etc.)
-            if github_repo && pr_number
+            if github_repo && pr_number && pr_number.to_i.positive?
               pr_state, = Open3.capture2("gh", "pr", "view", pr_number.to_s, "--repo", github_repo, "--json", "state", "-q", ".state")
               if pr_state.strip == "MERGED"
                 LOG.info "[Basecamp:Hooks] PR ##{pr_number} already merged — marking card ##{card_number} complete" if defined?(LOG)
                 Orchestrator.on_card_completed(card_number)
                 return
+              end
+
+              # SAFEGUARD: Verify PR targets the epic branch (not main/master).
+              # If epic_branches is populated and the PR targets the wrong base, retarget it.
+              epic_branches = epic["epic_branches"] || {}
+              expected_base = epic_branches[project_key] || epic_branches.values.first
+              if expected_base
+                actual_base, = Open3.capture2("gh", "pr", "view", pr_number.to_s, "--repo", github_repo, "--json", "baseRefName", "-q", ".baseRefName")
+                actual_base = actual_base.strip
+                if !actual_base.empty? && actual_base != expected_base
+                  LOG.warn "[Basecamp:Hooks] PR ##{pr_number} targets '#{actual_base}' but expected '#{expected_base}' — retargeting" if defined?(LOG)
+                  _, stderr, status = Open3.capture3("gh", "pr", "edit", pr_number.to_s, "--repo", github_repo, "--base", expected_base)
+                  if status.success?
+                    LOG.info "[Basecamp:Hooks] Retargeted PR ##{pr_number} to '#{expected_base}'" if defined?(LOG)
+                  else
+                    LOG.error "[Basecamp:Hooks] Failed to retarget PR ##{pr_number}: #{stderr.strip}" if defined?(LOG)
+                  end
+                end
               end
             end
 
@@ -659,6 +687,17 @@ module Brainiac
             gate_approvals = task["gate_approvals"] || []
             gate_agents = gate_approvals.map { |a| a["agent"] }.join(", ")
 
+            # Determine expected target branch for the prompt
+            epic_branches = epic["epic_branches"] || {}
+            expected_base = epic_branches[project_key] || epic_branches.values.first
+            target_note = if expected_base
+                           "\n**IMPORTANT:** This PR should target `#{expected_base}` (the epic branch). " \
+                           "If `gh pr view #{pr_number} --json baseRefName` shows a different base, " \
+                           "do NOT merge — report the mismatch instead.\n"
+                         else
+                           ""
+                         end
+
             prompt = <<~PROMPT
               ## Final Decision Required — Fizzy Card ##{card_number}
 
@@ -670,7 +709,7 @@ module Brainiac
                  ```
                  gh pr merge #{pr_number} --squash --delete-branch
                  ```
-
+              #{target_note}
               Note: You cannot self-approve PRs you authored. Merge directly since gates have approved.
 
               After merging, update the Fizzy card with a brief status comment.
