@@ -30,6 +30,8 @@ module Brainiac
               cmd_projects(args)
             when "set"
               cmd_set(args)
+            when "reset"
+              cmd_reset(args)
             else
               print_help
             end
@@ -172,8 +174,23 @@ module Brainiac
 
               status_icon = epic["status"] == "active" ? "🚀" : "✅"
               puts "#{status_icon} #{epic['title']}"
-              puts "   Agent: #{epic['agent']} | Tasks: #{complete}/#{total} complete, #{in_flight} in-flight"
+              puts "   Todolist: #{epic['basecamp_todolist_id']} | Agent: #{epic['agent']}"
+              puts "   Tasks: #{complete}/#{total} complete, #{in_flight} in-flight"
               puts "   Started: #{epic['started_at']}"
+
+              # Show per-task detail if verbose or few tasks
+              if args.include?("--verbose") || args.include?("-v")
+                tasks.each do |t|
+                  icon = case t["status"]
+                         when "complete" then "✅"
+                         when "in_flight" then "🚀"
+                         when "in_review" then "👀"
+                         when "final_decision" then "⚡"
+                         else "⬜"
+                         end
+                  puts "     #{icon} ##{t['fizzy_card']} — #{t['title']} [#{t['status']}]"
+                end
+              end
               puts ""
             end
           end
@@ -317,9 +334,12 @@ module Brainiac
                 projects map <key> <basecamp-id>        Map a Brainiac project to Basecamp
                 projects list                           List project mappings
                 projects unmap <key>                    Remove a project mapping
-                set fizzy-account-id <id>                Set Fizzy account ID (for card URLs)
+                set fizzy-account-id <id>               Set Fizzy account ID (for card URLs)
                 set review-gate <mode>                  Set review gate (on_complete or on_pr_merge)
                 set epic-prefix <prefix>                Set epic todolist prefix (default: "Epic:")
+                reset task <card-number> [--to <status>] Reset a task to a given status (default: pending)
+                reset epic <todolist-id> [--to <status>] Reset entire epic or all tasks within it
+                reset gates <card-number>               Clear gate approvals and re-dispatch gates
 
               Config file: ~/.brainiac/basecamp.json
               Epics state: ~/.brainiac/basecamp_epics.json
@@ -327,6 +347,13 @@ module Brainiac
               Review gate modes:
                 on_complete   — Advance to next task as soon as agent finishes (default)
                 on_pr_merge   — Wait for PR to be merged before advancing (review gate)
+
+              Task statuses (for reset --to):
+                pending         — Not yet started, waiting for dependencies
+                in_flight       — Agent is actively working on it
+                in_review       — PR open, gates reviewing
+                final_decision  — Gates passed, awaiting implementation agent merge decision
+                complete        — Done
             HELP
           end
 
@@ -385,6 +412,273 @@ module Brainiac
             end
           end
 
+          def cmd_reset(args)
+            subcommand = args.shift
+
+            case subcommand
+            when "task"
+              cmd_reset_task(args)
+            when "epic"
+              cmd_reset_epic(args)
+            when "gates"
+              cmd_reset_gates(args)
+            else
+              puts <<~HELP
+                Usage: brainiac basecamp reset <subcommand>
+
+                Subcommands:
+                  task <card-number> [--to <status>]    Reset a task's status (default: pending)
+                  epic <todolist-id> [--to <status>]    Reset entire epic or all its tasks
+                  gates <card-number>                   Clear gate approvals and re-dispatch
+
+                Task statuses:
+                  pending, in_flight, in_review, final_decision, complete
+
+                Examples:
+                  brainiac basecamp reset task 1234                  # Reset card #1234 to pending
+                  brainiac basecamp reset task 1234 --to in_flight   # Reset to in_flight
+                  brainiac basecamp reset gates 1234                 # Clear gates, re-dispatch reviewers
+                  brainiac basecamp reset epic 10233212224            # Reset all tasks to pending
+                  brainiac basecamp reset epic 10233212224 --to pending  # Same as above
+              HELP
+            end
+          end
+
+          def cmd_reset_task(args)
+            card_number = args.shift&.gsub(/^#/, "")
+            unless card_number
+              puts "Usage: brainiac basecamp reset task <card-number> [--to <status>]"
+              return
+            end
+
+            target_status = parse_to_flag(args) || "pending"
+            unless valid_task_status?(target_status)
+              puts "Error: Invalid status '#{target_status}'"
+              puts "Valid statuses: pending, in_flight, in_review, final_decision, complete"
+              return
+            end
+
+            epics = load_epics
+            epic = epics.find do |e|
+              e["status"] == "active" &&
+                e["tasks"]&.any? { |t| t["fizzy_card"] == card_number.to_i }
+            end
+
+            unless epic
+              puts "Error: Card ##{card_number} not found in any active epic"
+              return
+            end
+
+            task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
+            old_status = task["status"]
+
+            # Reset the task
+            reset_task_to(task, target_status)
+
+            save_epics(epics)
+            puts "✓ Reset card ##{card_number} from '#{old_status}' → '#{target_status}'"
+            puts "  Epic: #{epic['title']}"
+
+            return unless target_status == "pending"
+
+            puts "  The task will be picked up on next dispatch cycle (restart brainiac or wait for next event)"
+          end
+
+          def cmd_reset_gates(args)
+            card_number = args.shift&.gsub(/^#/, "")
+            unless card_number
+              puts "Usage: brainiac basecamp reset gates <card-number>"
+              return
+            end
+
+            epics = load_epics
+            epic = epics.find do |e|
+              e["status"] == "active" &&
+                e["tasks"]&.any? { |t| t["fizzy_card"] == card_number.to_i }
+            end
+
+            unless epic
+              puts "Error: Card ##{card_number} not found in any active epic"
+              return
+            end
+
+            task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
+
+            # Clear all gate-related state
+            old_approvals = task["gate_approvals"]&.size || 0
+            old_changes = task["changes_requested_by"]&.size || 0
+
+            task["gate_approvals"] = []
+            task["changes_requested_by"] = []
+            task["gates_dispatched_at"] = nil
+            task["awaiting_final_decision"] = nil
+            task["changes_debounce_started"] = nil
+            task["gate_redispatch_counts"] = {}
+            task["last_redispatch_at"] = nil
+            task["status"] = "in_review"
+            epic["updated_at"] = Time.now.iso8601
+
+            save_epics(epics)
+            puts "✓ Cleared gates for card ##{card_number}"
+            puts "  Removed #{old_approvals} approval(s), #{old_changes} changes_requested"
+            puts "  Status set to 'in_review' — gates will be re-dispatched on next health check"
+            puts ""
+            puts "  To force immediate re-dispatch, restart brainiac:"
+            puts "    brainiac restart"
+          end
+
+          def cmd_reset_epic(args)
+            todolist_id = args.shift
+            unless todolist_id
+              puts "Usage: brainiac basecamp reset epic <todolist-id> [--to <status>]"
+              puts ""
+              puts "Options:"
+              puts "  --to <status>    Reset all tasks to this status (default: pending)"
+              puts "  --reactivate     Reset a completed epic back to active"
+              puts ""
+              puts "Find your todolist ID with: brainiac basecamp epics --all"
+              return
+            end
+
+            target_status = parse_to_flag(args) || "pending"
+            reactivate = args.include?("--reactivate")
+
+            unless valid_task_status?(target_status)
+              puts "Error: Invalid status '#{target_status}'"
+              puts "Valid statuses: pending, in_flight, in_review, final_decision, complete"
+              return
+            end
+
+            epics = load_epics
+            epic = epics.find { |e| e["basecamp_todolist_id"] == todolist_id.to_s }
+
+            unless epic
+              puts "Error: No epic found with todolist ID #{todolist_id}"
+              puts ""
+              puts "Active epics:"
+              epics.select { |e| e["status"] == "active" }.each do |e|
+                puts "  #{e['basecamp_todolist_id']} — #{e['title']}"
+              end
+              return
+            end
+
+            if epic["status"] != "active" && !reactivate
+              puts "Error: Epic '#{epic['title']}' is #{epic['status']} (not active)"
+              puts "  Use --reactivate to set it back to active"
+              return
+            end
+
+            # Reactivate if needed
+            if epic["status"] != "active" && reactivate
+              epic["status"] = "active"
+              epic["completed_at"] = nil
+              puts "✓ Reactivated epic '#{epic['title']}'"
+            end
+
+            # Reset all non-complete tasks (unless resetting to pending, in which case reset all)
+            tasks_to_reset = if target_status == "pending"
+                               epic["tasks"]
+                             else
+                               epic["tasks"].reject { |t| t["status"] == "complete" }
+                             end
+
+            tasks_to_reset.each { |t| reset_task_to(t, target_status) }
+            epic["updated_at"] = Time.now.iso8601
+
+            save_epics(epics)
+            puts "✓ Reset #{tasks_to_reset.size} task(s) → '#{target_status}' in epic '#{epic['title']}'"
+            puts ""
+            epic["tasks"].each do |t|
+              icon = case t["status"]
+                     when "complete" then "✅"
+                     when "in_flight" then "🚀"
+                     when "in_review" then "👀"
+                     when "final_decision" then "⚡"
+                     else "⬜"
+                     end
+              puts "  #{icon} ##{t['fizzy_card']} — #{t['title']} [#{t['status']}]"
+            end
+          end
+
+          # --- Reset helpers ---
+
+          def valid_task_status?(status)
+            %w[pending in_flight in_review final_decision complete].include?(status)
+          end
+
+          def parse_to_flag(args)
+            idx = args.index("--to")
+            return nil unless idx
+
+            args.delete_at(idx) # remove --to
+            args.delete_at(idx) # remove the value (now at same index)
+          end
+
+          def reset_task_to(task, status)
+            task["status"] = status
+
+            case status
+            when "pending"
+              # Clear all progress state
+              task["dispatched_at"] = nil
+              task["completed_at"] = nil
+              task["pr_number"] = nil
+              task["pr_repo"] = nil
+              task["gate_approvals"] = []
+              task["changes_requested_by"] = []
+              task["gates_dispatched_at"] = nil
+              task["awaiting_final_decision"] = nil
+              task["changes_debounce_started"] = nil
+              task["gate_redispatch_counts"] = {}
+              task["last_redispatch_at"] = nil
+              task["last_reviewed_sha"] = nil
+            when "in_flight"
+              # Keep PR info but clear gate state
+              task["completed_at"] = nil
+              task["gate_approvals"] = []
+              task["changes_requested_by"] = []
+              task["gates_dispatched_at"] = nil
+              task["awaiting_final_decision"] = nil
+              task["changes_debounce_started"] = nil
+              task["gate_redispatch_counts"] = {}
+              task["last_redispatch_at"] = nil
+              task["dispatched_at"] ||= Time.now.iso8601
+            when "in_review"
+              # Clear gate approvals but keep PR info
+              task["completed_at"] = nil
+              task["gate_approvals"] = []
+              task["changes_requested_by"] = []
+              task["gates_dispatched_at"] = nil
+              task["awaiting_final_decision"] = nil
+              task["changes_debounce_started"] = nil
+              task["gate_redispatch_counts"] = {}
+              task["last_redispatch_at"] = nil
+            when "final_decision"
+              task["completed_at"] = nil
+              task["awaiting_final_decision"] = true
+            when "complete"
+              task["completed_at"] ||= Time.now.iso8601
+            end
+          end
+
+          def load_epics
+            epics_file = File.join(BRAINIAC_DIR, "basecamp_epics.json")
+            return [] unless File.exist?(epics_file)
+
+            data = JSON.parse(File.read(epics_file))
+            data["epics"] || []
+          rescue JSON::ParserError
+            []
+          end
+
+          def save_epics(epics)
+            epics_file = File.join(BRAINIAC_DIR, "basecamp_epics.json")
+            File.write(epics_file, JSON.pretty_generate({
+                                                          "epics" => epics,
+                                                          "updated_at" => Time.now.iso8601
+                                                        }))
+          end
+
           def load_config
             if File.exist?(CONFIG_FILE)
               JSON.parse(File.read(CONFIG_FILE))
@@ -404,7 +698,7 @@ module Brainiac
       end
 
       def self.completions
-        %w[setup config status epics link bot projects set]
+        %w[setup config status epics link bot projects set reset]
       end
     end
   end
