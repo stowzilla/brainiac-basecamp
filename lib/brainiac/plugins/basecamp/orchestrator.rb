@@ -631,6 +631,15 @@ module Brainiac
                            profile: epic["agent"]&.downcase)
           end
 
+          # Mark a Basecamp todo as incomplete (undo premature completion).
+          def uncheck_todo(epic, card_number)
+            task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
+            return unless task && task["todo_id"]
+
+            Client.run_safe("todos", "uncomplete", task["todo_id"].to_s, "--json",
+                           profile: epic["agent"]&.downcase)
+          end
+
           # Post a completion comment on the Basecamp todo.
           def post_completion_comment(epic, card_number)
             task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
