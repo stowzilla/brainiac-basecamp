@@ -20,7 +20,7 @@ module Brainiac
       module Epic
         # Represents a single task within an epic (one todo → one Fizzy card).
         Task = Struct.new(:todo_id, :title, :fizzy_card, :depends_on, :status, :completed,
-                          :description, :assignees, :due_on, keyword_init: true)
+                          :description, :assignees, :due_on, :project, keyword_init: true)
 
         class << self
           # Parse todos from a todolist into structured tasks with dependency graph.
