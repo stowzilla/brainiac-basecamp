@@ -455,16 +455,41 @@ module Brainiac
           elsif task["changes_requested_by"]&.any?
             # Gates requested changes — after a restart, no agent session is running even if assigned.
             # Always re-dispatch the impl agent to address the feedback.
+            # Gates requested changes — check if the agent already pushed fixes.
+            # If new commits exist after the latest changes_requested review, re-trigger
+            # gates instead of redundantly re-dispatching the implementation agent.
             impl_agent = epic["agent"]
-            LOG.info "[Basecamp] Resume: ##{card_number} has changes requested — re-dispatching #{impl_agent}" if defined?(LOG)
 
-            # Transition to in_flight so the agent gets the right context
-            task["status"] = "in_flight"
-            task["dispatched_at"] = Time.now.iso8601
-            Hooks.send(:save_epic_state, epic)
+            if pr_has_newer_commits_than_reviews?(task, repo_path: repo_path)
+              LOG.info "[Basecamp] Resume: ##{card_number} has changes requested but agent already pushed fixes — re-triggering gates" if defined?(LOG)
+              ReviewGate.reset_approvals(task)
+              task["changes_requested_by"] = []
+              task["status"] = "in_review"
+              task["gates_dispatched_at"] = Time.now.iso8601
+              Hooks.send(:save_epic_state, epic)
 
-            # Spawn the agent directly — safe_assign_card won't work if already assigned
-            Hooks.send(:dispatch_impl_directly, epic, task)
+              github_repo = projects.dig(project_key, "github_repo")
+              if github_repo
+                ReviewGate.dispatch_gates(
+                  epic: epic,
+                  task: task,
+                  pr_number: pr_number,
+                  repo_name: github_repo,
+                  repo_path: repo_path
+                )
+                Hooks.send(:save_epic_state, epic)
+              end
+            else
+              LOG.info "[Basecamp] Resume: ##{card_number} has changes requested — re-dispatching #{impl_agent}" if defined?(LOG)
+
+              # Transition to in_flight so the agent gets the right context
+              task["status"] = "in_flight"
+              task["dispatched_at"] = Time.now.iso8601
+              Hooks.send(:save_epic_state, epic)
+
+              # Spawn the agent directly — safe_assign_card won't work if already assigned
+              Hooks.send(:dispatch_impl_directly, epic, task)
+            end
           else
             # No changes requested yet — check if gates need (re-)dispatching
             approvals = task["gate_approvals"]&.size || 0
