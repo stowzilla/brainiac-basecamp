@@ -417,7 +417,16 @@ module Brainiac
                 This is an INCREMENTAL REVIEW — you already reviewed this PR and requested changes.
                 The implementation agent has pushed fixes. Focus on what changed.
 
-                **View only the NEW changes since your last review:**
+                **Step 1: Read the commit messages to understand WHY changes were made:**
+                ```
+                gh pr view #{pr_number} --comments
+                git log #{diff_from_sha}..HEAD --oneline
+                ```
+
+                The implementation agent's commit messages and PR comments explain their reasoning.
+                Read these BEFORE looking at the code changes.
+
+                **Step 2: View the NEW changes since your last review:**
                 ```
                 git fetch origin && git diff #{diff_from_sha}..HEAD
                 ```

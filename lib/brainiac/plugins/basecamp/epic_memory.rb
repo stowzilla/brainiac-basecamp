@@ -5,17 +5,23 @@ module Brainiac
     module Basecamp
       # Epic-level shared memory.
       #
-      # Unlike per-card memory (agent-specific), epic memory is shared across all
-      # agents working the epic. It accumulates architectural decisions, patterns
-      # established, gotchas discovered, and cross-task learnings.
+      # Unlike per-card memory (agent-specific, gitignored), epic memory is shared
+      # across all agents working the epic AND persisted to git. It accumulates
+      # architectural decisions, patterns established, gotchas discovered, and
+      # cross-task learnings.
       #
       # The epic review agent writes to this file after each task completes.
       # All task agents and gate agents read it as part of their context.
       #
-      # Location: ~/.brainiac/brain/memory/epics/epic-<todolist-id>.md
+      # Location: ~/.brainiac/brain/knowledge/epics/epic-<todolist-id>.md
+      #
+      # This is under knowledge/ (not memory/) because:
+      # - memory/ is gitignored — per-card, per-agent, ephemeral
+      # - knowledge/ is synced to git — shared, permanent, valuable
+      # - Epic learnings should persist and be searchable via qmd
       module EpicMemory
         BRAINIAC_DIR = ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac"))
-        EPIC_MEMORY_DIR = File.join(BRAINIAC_DIR, "brain", "memory", "epics")
+        EPIC_MEMORY_DIR = File.join(BRAINIAC_DIR, "brain", "knowledge", "epics")
 
         class << self
           # Path to the epic memory file for a given epic.
