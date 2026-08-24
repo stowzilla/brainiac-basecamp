@@ -203,6 +203,54 @@ module Brainiac
             dispatched
           end
 
+          # Dispatch only gate agents that have NOT yet responded (no approval, no changes_requested).
+          # Used during resume/health-check when some gates responded but others didn't.
+          #
+          # @param epic [Hash] Epic state
+          # @param task [Hash] Task state
+          # @param pr_number [Integer, String] PR number
+          # @param repo_name [String] e.g. "stowzilla/brainiac-basecamp"
+          # @param repo_path [String] Local repo path
+          # @return [Array<String>] Agent names dispatched
+          def dispatch_missing_gates(epic:, task:, pr_number:, repo_name:, repo_path:)
+            responded_agents = Set.new
+            (task["gate_approvals"] || []).each { |a| responded_agents << a["agent"].downcase }
+            (task["changes_requested_by"] || []).each { |a| responded_agents << a.downcase }
+
+            missing_gates = gates.reject { |g| responded_agents.include?(g["agent"].downcase) }
+            return [] if missing_gates.empty?
+
+            dispatched = []
+
+            missing_gates.each do |gate|
+              agent_name = gate["agent"]
+              role = gate["role"] || "review"
+
+              LOG.info "[Basecamp:ReviewGate] Re-dispatching missing gate #{agent_name} (#{role}) to review PR ##{pr_number}" if defined?(LOG)
+
+              Thread.new do
+                dispatch_agent_for_review(
+                  agent_name: agent_name,
+                  role: role,
+                  pr_number: pr_number,
+                  repo_name: repo_name,
+                  repo_path: repo_path,
+                  card_number: task["fizzy_card"],
+                  epic: epic
+                )
+              rescue StandardError => e
+                LOG.error "[Basecamp:ReviewGate] Failed to dispatch #{agent_name}: #{e.message}" if defined?(LOG)
+              end
+
+              dispatched << agent_name
+            end
+
+            # Update dispatch timestamp but preserve existing approvals
+            task["gates_dispatched_at"] = Time.now.iso8601
+
+            dispatched
+          end
+
           # Build the summary comment for Fizzy after all gates pass and merge completes.
           #
           # @param task [Hash] Task state
