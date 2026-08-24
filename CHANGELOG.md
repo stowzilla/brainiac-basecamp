@@ -2,6 +2,16 @@
 
 All notable changes to brainiac-basecamp will be documented in this file.
 
+## [0.0.17] - 2026-08-24
+
+### Added
+
+- `brainiac basecamp reset task <card> [--to <status>]` — manually reset a task's status
+- `brainiac basecamp reset gates <card>` — clear gate approvals and re-dispatch on next cycle
+- `brainiac basecamp reset epic <todolist-id> [--to <status>] [--reactivate]` — reset all tasks or reactivate a completed epic
+- `brainiac basecamp epics` now shows todolist IDs in output
+- `brainiac basecamp epics --verbose` shows per-task status breakdown
+
 ## [0.0.7] - 2026-08-24
 
 ### Fixed
