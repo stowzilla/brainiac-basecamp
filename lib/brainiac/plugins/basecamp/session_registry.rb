@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "fileutils"
 require "json"
 require "time"
 
@@ -179,7 +180,11 @@ module Brainiac
               next false unless session["status"] == "dead"
 
               ended_at = session["ended_at"]
-              next true unless ended_at # No end time? Remove it
+              # Orphaned entries (dead with no ended_at) are corrupt/abnormal — remove immediately
+              if ended_at.nil?
+                swept += 1
+                next true
+              end
 
               age = now - Time.parse(ended_at)
               if age > max_age
