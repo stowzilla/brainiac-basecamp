@@ -604,9 +604,15 @@ module Brainiac
                                               card_number: completed_card_number)
                                 end
 
-                # Register session for waybar
-                if pid && Object.respond_to?(:register_session, true)
-                  Object.send(:register_session, card_key, pid, log_file: log_file, agent_name: agent_name)
+                # Register session in SessionRegistry for liveness tracking
+                if pid
+                  SessionRegistry.register_session(
+                    card_key, pid,
+                    log_file: log_file,
+                    agent_name: agent_name,
+                    epic_id: epic["id"],
+                    card_number: completed_card_number
+                  )
                 end
 
                 # Wait for the review to complete

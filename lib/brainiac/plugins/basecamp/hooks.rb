@@ -717,13 +717,15 @@ module Brainiac
               end
             end
 
-            # Register session for waybar visibility
+            # Register session in SessionRegistry for liveness tracking
             if pid
-              if defined?(register_session)
-                register_session(card_key, pid, log_file: log_file, agent_name: agent_name)
-              elsif Object.respond_to?(:register_session, true)
-                Object.send(:register_session, card_key, pid, log_file: log_file, agent_name: agent_name)
-              end
+              SessionRegistry.register_session(
+                card_key, pid,
+                log_file: log_file,
+                agent_name: agent_name,
+                epic_id: epic["id"],
+                card_number: card_number
+              )
               LOG.info "[Basecamp:Hooks] Spawned #{agent_name} (pid #{pid}) for final decision on card ##{card_number}" if defined?(LOG)
             end
           end
