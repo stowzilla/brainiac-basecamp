@@ -156,10 +156,75 @@ module Brainiac
             # If project is set, look up directly
             return epic_branches[project_key] if project_key && epic_branches[project_key]
 
-            # Fallback: if there's only one epic branch, use it (single-project epic)
-            return epic_branches.values.first if epic_branches.size == 1
+            # Fallback: if there's only one epic branch AND the task has no specific project set,
+            # use it (assumed single-project epic).
+            # Do NOT fallback if the task has a specific project that isn't in epic_branches —
+            # that means the branch wasn't created for this repo and we should return nil
+            # (letting the default branch be used) rather than returning a branch from a different repo.
+            return epic_branches.values.first if epic_branches.size == 1 && !project_key
 
-            # Multi-project epic but no project on task — can't determine which branch
+            # Multi-project epic but no matching branch for this task's project — return nil
+            nil
+          end
+
+          # Lazily ensure an epic branch exists for a card's project.
+          # Called when epic_branch_for_card returns nil but the card IS in an active epic.
+          # Creates the branch in the task's repo and registers it in epic state.
+          #
+          # @param card_number [Integer, String] Fizzy card number
+          # @return [String, nil] Epic branch name or nil
+          def ensure_epic_branch_for_card(card_number)
+            epic = Orchestrator.find_epic_for_card(card_number.to_i)
+            return nil unless epic
+            return nil unless epic["review_gate"] == "epic_branch"
+
+            task = epic["tasks"]&.find { |t| t["fizzy_card"] == card_number.to_i }
+            return nil unless task
+
+            project_key = task["project"]
+            return nil unless project_key
+
+            # Already have a branch for this project
+            epic_branches = epic["epic_branches"] || {}
+            return epic_branches[project_key] if epic_branches[project_key]
+
+            # Resolve repo path for this project
+            projects_file = File.join(BRAINIAC_DIR, "projects.json")
+            return nil unless File.exist?(projects_file)
+
+            all_projects = JSON.parse(File.read(projects_file))
+            repo_path = all_projects.dig(project_key, "repo_path")
+            return nil unless repo_path
+
+            # Create the branch
+            slug = branch_slug(epic["title"])
+            branch_name = "epic/#{slug}"
+            default_branch = detect_default_branch(repo_path)
+
+            run_git("fetch", "origin", chdir: repo_path)
+
+            # Check if branch already exists remotely
+            remote_exists = system("git", "ls-remote", "--exit-code", "--heads", "origin", branch_name,
+                                   chdir: repo_path, out: File::NULL, err: File::NULL)
+
+            if remote_exists
+              run_git("fetch", "origin", "#{branch_name}:#{branch_name}", chdir: repo_path)
+              LOG.info "[Basecamp:EpicBranch] Lazy-created: reusing existing '#{branch_name}' in #{project_key}" if defined?(LOG)
+            else
+              run_git("branch", branch_name, "origin/#{default_branch}", chdir: repo_path)
+              run_git("push", "-u", "origin", branch_name, chdir: repo_path)
+              LOG.info "[Basecamp:EpicBranch] Lazy-created: new '#{branch_name}' in #{project_key}" if defined?(LOG)
+            end
+
+            # Register in epic state
+            epic["epic_branches"] ||= {}
+            epic["epic_branches"][project_key] = branch_name
+            epic["updated_at"] = Time.now.iso8601
+            Orchestrator.send(:save_epic, epic)
+
+            branch_name
+          rescue StandardError => e
+            LOG.error "[Basecamp:EpicBranch] Lazy branch creation failed for #{project_key}: #{e.message}" if defined?(LOG)
             nil
           end
 
