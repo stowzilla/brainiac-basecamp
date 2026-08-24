@@ -112,7 +112,7 @@ module Brainiac
                 end
               end
 
-              if effective_pr && effective_pr.positive? && project_key
+              if effective_pr&.positive? && project_key
                 projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
                 projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
                 github_repo = projects.dig(project_key, "github_repo")
@@ -413,7 +413,7 @@ module Brainiac
           end
 
           # Check if PR is already merged (handles manual merges, webhook misses, agent merges to wrong branch)
-          if pr_number && pr_number.positive?
+          if pr_number&.positive?
             project_key = task["project"]
             projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
             projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}

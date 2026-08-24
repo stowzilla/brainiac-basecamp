@@ -129,8 +129,10 @@ module Brainiac
                 # completion — advance the epic regardless of which branch was targeted.
                 task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
                 if task && %w[final_decision in_review in_flight].include?(task["status"])
-                  LOG.warn "[Basecamp:Hooks] epic_branches is empty but PR merged to '#{base_branch}' " \
-                           "for card ##{card_number} (status: #{task['status']}) — advancing anyway (branch creation likely failed)" if defined?(LOG)
+                  if defined?(LOG)
+                    LOG.warn "[Basecamp:Hooks] epic_branches is empty but PR merged to '#{base_branch}' " \
+                             "for card ##{card_number} (status: #{task['status']}) — advancing anyway (branch creation likely failed)"
+                  end
                   Orchestrator.on_card_completed(card_number)
                 end
               end
@@ -623,7 +625,7 @@ module Brainiac
             github_repo = project_config&.dig("github_repo")
 
             # Check if PR is already merged (handles manual merges, webhook misses, etc.)
-            if github_repo && pr_number && pr_number.to_i.positive?
+            if github_repo && pr_number&.to_i&.positive?
               pr_state, = Open3.capture2("gh", "pr", "view", pr_number.to_s, "--repo", github_repo, "--json", "state", "-q", ".state")
               if pr_state.strip == "MERGED"
                 LOG.info "[Basecamp:Hooks] PR ##{pr_number} already merged — marking card ##{card_number} complete" if defined?(LOG)
@@ -636,15 +638,16 @@ module Brainiac
               epic_branches = epic["epic_branches"] || {}
               expected_base = epic_branches[project_key] || epic_branches.values.first
               if expected_base
-                actual_base, = Open3.capture2("gh", "pr", "view", pr_number.to_s, "--repo", github_repo, "--json", "baseRefName", "-q", ".baseRefName")
+                actual_base, = Open3.capture2("gh", "pr", "view", pr_number.to_s, "--repo", github_repo, "--json", "baseRefName", "-q",
+".baseRefName")
                 actual_base = actual_base.strip
                 if !actual_base.empty? && actual_base != expected_base
                   LOG.warn "[Basecamp:Hooks] PR ##{pr_number} targets '#{actual_base}' but expected '#{expected_base}' — retargeting" if defined?(LOG)
                   _, stderr, status = Open3.capture3("gh", "pr", "edit", pr_number.to_s, "--repo", github_repo, "--base", expected_base)
                   if status.success?
                     LOG.info "[Basecamp:Hooks] Retargeted PR ##{pr_number} to '#{expected_base}'" if defined?(LOG)
-                  else
-                    LOG.error "[Basecamp:Hooks] Failed to retarget PR ##{pr_number}: #{stderr.strip}" if defined?(LOG)
+                  elsif defined?(LOG)
+                    LOG.error "[Basecamp:Hooks] Failed to retarget PR ##{pr_number}: #{stderr.strip}"
                   end
                 end
               end
@@ -691,12 +694,12 @@ module Brainiac
             epic_branches = epic["epic_branches"] || {}
             expected_base = epic_branches[project_key] || epic_branches.values.first
             target_note = if expected_base
-                           "\n**IMPORTANT:** This PR should target `#{expected_base}` (the epic branch). " \
-                           "If `gh pr view #{pr_number} --json baseRefName` shows a different base, " \
-                           "do NOT merge — report the mismatch instead.\n"
-                         else
-                           ""
-                         end
+                            "\n**IMPORTANT:** This PR should target `#{expected_base}` (the epic branch). " \
+                              "If `gh pr view #{pr_number} --json baseRefName` shows a different base, " \
+                              "do NOT merge — report the mismatch instead.\n"
+                          else
+                            ""
+                          end
 
             prompt = <<~PROMPT
               ## Final Decision Required — Fizzy Card ##{card_number}
@@ -780,12 +783,12 @@ module Brainiac
 
             # Guard: don't spawn a duplicate if a session is already running for this task
             session_alive = if defined?(session_active?)
-                             session_active?(card_key)
-                           elsif Object.respond_to?(:session_active?, true)
-                             Object.send(:session_active?, card_key)
-                           else
-                             false
-                           end
+                              session_active?(card_key)
+                            elsif Object.respond_to?(:session_active?, true)
+                              Object.send(:session_active?, card_key)
+                            else
+                              false
+                            end
 
             if session_alive
               LOG.info "[Basecamp:Hooks] Session already active for #{card_key} — skipping dispatch" if defined?(LOG)
@@ -824,11 +827,11 @@ module Brainiac
             prompt = <<~PROMPT
               ## Changes Requested — Fizzy Card ##{card_number}
 
-              Review gates have requested changes on your PR#{pr_number ? " ##{pr_number}" : ""}.
+              Review gates have requested changes on your PR#{" ##{pr_number}" if pr_number}.
               Reviewers who requested changes: #{changers}
 
               Your job:
-              1. Read the review feedback: #{pr_number ? "`gh pr view #{pr_number} --comments`" : "check the Fizzy card comments"}
+              1. Read the review feedback: #{pr_number ? "`gh pr view #{pr_number} --comments`" : 'check the Fizzy card comments'}
               2. Address all requested changes
               3. Commit and push your fixes
 

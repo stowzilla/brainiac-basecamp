@@ -798,7 +798,8 @@ module Brainiac
               log_event(epic, "branches_created", "Epic branches: #{epic['epic_branches'].values.uniq.join(', ')}")
             end
           rescue StandardError => e
-            LOG.error "[Basecamp:Orchestrator] Failed to create epic branches: #{e.class}: #{e.message}\n#{e.backtrace.first(3).join("\n")}" if defined?(LOG)
+            LOG.error "[Basecamp:Orchestrator] Failed to create epic branches: #{e.class}: #{e.message}" \
+                      "\n#{e.backtrace.first(3).join("\n")}" if defined?(LOG)
             log_event(epic, "branches_failed", "Exception: #{e.message}")
           end
 
