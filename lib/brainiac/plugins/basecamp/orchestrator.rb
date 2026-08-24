@@ -648,14 +648,14 @@ module Brainiac
             # Include existing epic memory if any
             epic_memory_path = EpicMemory.path_for(epic["basecamp_todolist_id"])
             epic_memory_section = if EpicMemory.exists?(epic["basecamp_todolist_id"])
-              <<~MEM
+                                    <<~MEM
 
-              ### Epic Memory (shared knowledge so far)
-              Read the epic memory file at `#{epic_memory_path}` for decisions and patterns established in previous tasks.
-              MEM
-            else
-              ""
-            end
+                                      ### Epic Memory (shared knowledge so far)
+                                      Read the epic memory file at `#{epic_memory_path}` for decisions and patterns established in previous tasks.
+                                    MEM
+                                  else
+                                    ""
+                                  end
 
             prompt = <<~PROMPT
               ## Epic Review: #{epic['title']}
@@ -686,7 +686,7 @@ module Brainiac
               - **Patterns established** that should be followed in remaining tasks
               - **Gotchas** discovered that future tasks should know about
               - **Cross-task notes** about relationships or dependencies
-              
+
               This is shared knowledge — other agents will read it. Be concise but thorough.
               Append a new section, don't replace the existing content.
 

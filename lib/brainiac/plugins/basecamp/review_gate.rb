@@ -182,7 +182,7 @@ module Brainiac
               agent_name = gate["agent"]
               role = gate["role"] || "review"
 
-              LOG.info "[Basecamp:ReviewGate] Dispatching #{agent_name} (#{role}) to review PR ##{pr_number}#{diff_from_sha ? " (incremental from #{diff_from_sha[0..7]})" : ""}" if defined?(LOG)
+              LOG.info "[Basecamp:ReviewGate] Dispatching #{agent_name} (#{role}) to review PR ##{pr_number}#{" (incremental from #{diff_from_sha[0..7]})" if diff_from_sha}" if defined?(LOG)
 
               # Dispatch the gate agent via brainiac-github's PR review mechanism.
               # The agent gets the PR diff and reviews it using their bot identity.
@@ -208,7 +208,7 @@ module Brainiac
             task["status"] = "in_review"
             task["gates_dispatched_at"] = Time.now.iso8601
             task["gate_approvals"] ||= []
-            
+
             # Track the SHA we're reviewing for incremental diff on next round
             task["last_reviewed_sha"] = current_sha if current_sha
 
@@ -260,7 +260,7 @@ module Brainiac
                 next
               end
 
-              LOG.info "[Basecamp:ReviewGate] Re-dispatching missing gate #{agent_name} (#{role}) to review PR ##{pr_number} (retry #{retries + 1}/#{MAX_GATE_REDISPATCH_RETRIES})#{diff_from_sha ? " (incremental)" : ""}" if defined?(LOG)
+              LOG.info "[Basecamp:ReviewGate] Re-dispatching missing gate #{agent_name} (#{role}) to review PR ##{pr_number} (retry #{retries + 1}/#{MAX_GATE_REDISPATCH_RETRIES})#{' (incremental)' if diff_from_sha}" if defined?(LOG)
 
               task["gate_redispatch_counts"][agent_name.downcase] = retries + 1
 
@@ -285,7 +285,7 @@ module Brainiac
             # Record when this partial re-dispatch happened (for diagnostics)
             # but do NOT overwrite gates_dispatched_at — that's the original timestamp
             task["last_redispatch_at"] = Time.now.iso8601
-            
+
             # Update last_reviewed_sha for next round
             task["last_reviewed_sha"] = current_sha if current_sha
 
