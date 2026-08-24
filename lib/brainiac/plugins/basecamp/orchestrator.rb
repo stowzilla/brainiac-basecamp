@@ -272,7 +272,8 @@ module Brainiac
                 title: t["title"],
                 depends_on: t["depends_on"] || [],
                 status: t["status"].to_sym,
-                completed: t["status"] == "complete"
+                completed: t["status"] == "complete",
+                project: t["project"]
               )
             end
 
