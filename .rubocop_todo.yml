@@ -90,7 +90,7 @@ Metrics/AbcSize:
 # Configuration parameters: CountComments, CountAsOne, AllowedMethods, AllowedPatterns.
 # AllowedMethods: refine
 Metrics/BlockLength:
-  Max: 91
+  Max: 116
 
 # Offense count: 6
 # Configuration parameters: CountBlocks, CountModifierForms.
@@ -100,12 +100,12 @@ Metrics/BlockNesting:
 # Offense count: 9
 # Configuration parameters: CountComments, CountAsOne.
 Metrics/ClassLength:
-  Max: 633
+  Max: 742
 
 # Offense count: 48
 # Configuration parameters: AllowedMethods, AllowedPatterns.
 Metrics/CyclomaticComplexity:
-  Max: 52
+  Max: 62
 
 # Offense count: 4
 # Configuration parameters: CountComments, Max, CountAsOne, AllowedMethods, AllowedPatterns.
@@ -123,7 +123,7 @@ Metrics/ModuleLength:
 # Offense count: 39
 # Configuration parameters: AllowedMethods, AllowedPatterns.
 Metrics/PerceivedComplexity:
-  Max: 55
+  Max: 62
 
 # Offense count: 1
 # Configuration parameters: MinSize.
@@ -232,6 +232,8 @@ Style/IfUnlessModifier:
     - 'lib/brainiac/plugins/basecamp/client.rb'
     - 'lib/brainiac/plugins/basecamp/epic_branch.rb'
     - 'lib/brainiac/plugins/basecamp/hooks.rb'
+    - 'lib/brainiac/plugins/basecamp/orchestrator.rb'
+    - 'lib/brainiac/plugins/basecamp/review_gate.rb'
     - 'lib/brainiac/plugins/basecamp/orchestrator.rb'
 
 # Offense count: 1

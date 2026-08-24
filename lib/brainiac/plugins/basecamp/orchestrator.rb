@@ -764,14 +764,43 @@ module Brainiac
           end
 
           # Create epic branches for all projects involved in this epic.
+          # CRITICAL: If this fails, epic_branches will be empty and agents will
+          # open PRs against the default branch instead of the epic branch.
+          # We log loudly and retry resolution of project repos if initial attempt fails.
           def create_epic_branches_for(epic)
             project_repos = resolve_project_repos(epic)
-            return if project_repos.empty?
+
+            if project_repos.empty?
+              # Fallback: try to resolve from the basecamp project mapping directly
+              mapped_project = Config.brainiac_project_for(epic["basecamp_project_id"])
+              if mapped_project
+                projects_file = File.join(BRAINIAC_DIR, "projects.json")
+                all_projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+                repo = all_projects.dig(mapped_project, "repo_path")
+                project_repos = { mapped_project => repo } if repo
+              end
+            end
+
+            if project_repos.empty?
+              LOG.error "[Basecamp:Orchestrator] Cannot create epic branches — no project repos resolved. " \
+                        "Tasks have projects: #{(epic['tasks'] || []).map { |t| t['project'] }.compact.uniq.inspect}. " \
+                        "Epic will proceed WITHOUT epic branches — PRs will target the default branch!" if defined?(LOG)
+              log_event(epic, "branches_failed", "No project repos resolved — epic branches not created")
+              return
+            end
 
             epic["epic_branches"] = EpicBranch.create_epic_branches(epic, project_repos)
-            log_event(epic, "branches_created", "Epic branches: #{epic['epic_branches'].values.uniq.join(', ')}")
+
+            if epic["epic_branches"].empty?
+              LOG.error "[Basecamp:Orchestrator] create_epic_branches returned empty — branch creation failed" if defined?(LOG)
+              log_event(epic, "branches_failed", "Branch creation returned empty for repos: #{project_repos.keys.join(', ')}")
+            else
+              log_event(epic, "branches_created", "Epic branches: #{epic['epic_branches'].values.uniq.join(', ')}")
+            end
           rescue StandardError => e
-            LOG.error "[Basecamp:Orchestrator] Failed to create epic branches: #{e.message}" if defined?(LOG)
+            LOG.error "[Basecamp:Orchestrator] Failed to create epic branches: #{e.class}: #{e.message}" \
+                      "\n#{e.backtrace.first(3).join("\n")}" if defined?(LOG)
+            log_event(epic, "branches_failed", "Exception: #{e.message}")
           end
 
           # Open final PRs from epic branches to main.
