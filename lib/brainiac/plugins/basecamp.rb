@@ -165,7 +165,7 @@ module Brainiac
                       end
                     end
                     healed_any = true
-                  elsif (task["gate_approvals"] || []).empty? && !(task["changes_requested_by"]&.any?)
+                  elsif (task["gate_approvals"] || []).empty? && !task["changes_requested_by"]&.any?
                     # No gate responses at all — gates may never have been dispatched or agents crashed
                     gates_dispatched_at = task["gates_dispatched_at"]
                     should_redispatch = gates_dispatched_at.nil? || (Time.now - Time.parse(gates_dispatched_at)) > 300
