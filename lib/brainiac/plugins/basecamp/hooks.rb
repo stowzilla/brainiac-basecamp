@@ -214,16 +214,12 @@ module Brainiac
                   # All gates have reviewed — dispatch implementation agent to address ALL feedback
                   LOG.info "[Basecamp:Hooks] All gates responded for card ##{card_number} — dispatching fixes" if defined?(LOG)
                   task["status"] = "in_flight"
+                  task["dispatched_at"] = Time.now.iso8601
                   task.delete("changes_debounce_started")
                   save_epic_state(epic)
 
-                  # Re-assign card to implementation agent to trigger dispatch
-                  impl_agent = epic["agent"]
-                  fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
-                  if fizzy_user_id
-                    LOG.info "[Basecamp:Hooks] Re-assigning card ##{card_number} to #{impl_agent} for fixes" if defined?(LOG)
-                    safe_assign_card(card_number, fizzy_user_id)
-                  end
+                  # Spawn agent directly — safe_assign_card won't work if already assigned
+                  dispatch_impl_directly(epic, task)
                 else
                   # Wait for remaining gates to respond
                   responded = (task["gate_approvals"]&.size || 0) + (task["changes_requested_by"]&.size || 0)
@@ -246,11 +242,11 @@ module Brainiac
                       if task_reloaded && task_reloaded["status"] == "in_review" && task_reloaded["changes_requested_by"]&.any?
                         LOG.info "[Basecamp:Hooks] Debounce timeout for card ##{card_number} — forcing dispatch" if defined?(LOG)
                         task_reloaded["status"] = "in_flight"
+                        task_reloaded["dispatched_at"] = Time.now.iso8601
                         task_reloaded.delete("changes_debounce_started")
                         save_epic_state(epic_reloaded)
-                        # Re-assign card to trigger dispatch
-                        fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, epic_reloaded["agent"])
-                        safe_assign_card(card_number, fizzy_user_id) if fizzy_user_id
+                        # Spawn agent directly — safe_assign_card won't work if already assigned
+                        dispatch_impl_directly(epic_reloaded, task_reloaded)
                       end
                     rescue StandardError => e
                       LOG.error "[Basecamp:Hooks] Debounce dispatch failed: #{e.message}" if defined?(LOG)
@@ -728,14 +724,109 @@ module Brainiac
             end
           end
 
-          def mark_in_review(epic, card_number)
-            task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
-            return unless task
+          # Dispatch the implementation agent directly (spawns via run_agent) to address
+          # changes_requested feedback. Used by resume and health-check when the agent is
+          # no longer running but the Fizzy card is still assigned (so safe_assign_card
+          # would bail out with "already assigned, skipping").
+          #
+          # @param epic [Hash] Epic state
+          # @param task [Hash] Task within the epic
+          # @return [void]
+          def dispatch_impl_directly(epic, task)
+            card_number = task["fizzy_card"]
+            agent_name = epic["agent"]
+            pr_number = task["pr_number"]
+            project_key = task["project"]
 
-            task["status"] = "in_review"
-            task["review_started_at"] = Time.now.iso8601
-            epic["updated_at"] = Time.now.iso8601
-            save_epic_state(epic)
+            LOG.info "[Basecamp:Hooks] Direct-dispatching #{agent_name} for changes_requested on card ##{card_number}" if defined?(LOG)
+
+            # Get project config
+            projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
+            projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+            project_config = projects[project_key]
+
+            unless project_config
+              LOG.error "[Basecamp:Hooks] No project config for '#{project_key}' — cannot direct-dispatch" if defined?(LOG)
+              return
+            end
+
+            repo_path = project_config["repo_path"]
+            unless repo_path
+              LOG.error "[Basecamp:Hooks] No repo_path for project '#{project_key}' — cannot direct-dispatch" if defined?(LOG)
+              return
+            end
+
+            # Find the worktree for this card
+            work_items_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "work_items.json")
+            worktree_path = repo_path  # Default to main repo
+            if File.exist?(work_items_file)
+              work_items = JSON.parse(File.read(work_items_file))
+              work_item = work_items.values.find { |wi| wi.dig("sources", "fizzy", "card_number") == card_number }
+              worktree_path = work_item["worktree"] if work_item&.dig("worktree")
+            end
+
+            # Build prompt
+            changers = (task["changes_requested_by"] || []).join(", ")
+            prompt = <<~PROMPT
+              ## Changes Requested — Fizzy Card ##{card_number}
+
+              Review gates have requested changes on your PR#{pr_number ? " ##{pr_number}" : ""}.
+              Reviewers who requested changes: #{changers}
+
+              Your job:
+              1. Read the review feedback: #{pr_number ? "`gh pr view #{pr_number} --comments`" : "check the Fizzy card comments"}
+              2. Address all requested changes
+              3. Commit and push your fixes
+
+              After pushing, update the Fizzy card with a brief status comment noting what you fixed.
+            PROMPT
+
+            # Resolve GitHub App token so agent's `gh` commands run as their bot identity
+            github_repo = project_config&.dig("github_repo")
+            agent_env = github_repo ? ReviewGate.send(:resolve_agent_github_env, agent_name, github_repo) : {}
+
+            # Spawn the agent directly
+            pid = nil
+            log_file = nil
+            card_key = "changes-requested-#{card_number}"
+
+            begin
+              pid, log_file = method(:run_agent).call(
+                prompt,
+                project_config: project_config,
+                chdir: worktree_path,
+                log_name: "changes-requested-#{card_number}",
+                agent_name: agent_name,
+                source: :basecamp,
+                card_number: card_number,
+                env: agent_env
+              )
+            rescue NameError
+              if Object.respond_to?(:run_agent, true)
+                pid, log_file = Object.send(:run_agent,
+                  prompt,
+                  project_config: project_config,
+                  chdir: worktree_path,
+                  log_name: "changes-requested-#{card_number}",
+                  agent_name: agent_name,
+                  source: :basecamp,
+                  card_number: card_number,
+                  env: agent_env)
+              else
+                LOG.warn "[Basecamp:Hooks] run_agent not available — direct impl dispatch skipped" if defined?(LOG)
+                return
+              end
+            end
+
+            # Register session for waybar visibility
+            if pid
+              if defined?(register_session)
+                register_session(card_key, pid, log_file: log_file, agent_name: agent_name)
+              elsif Object.respond_to?(:register_session, true)
+                Object.send(:register_session, card_key, pid, log_file: log_file, agent_name: agent_name)
+              end
+              LOG.info "[Basecamp:Hooks] Spawned #{agent_name} (pid #{pid}) for changes_requested on card ##{card_number}" if defined?(LOG)
+            end
           end
 
           def auto_merge_and_advance(epic, card_number, ctx)
