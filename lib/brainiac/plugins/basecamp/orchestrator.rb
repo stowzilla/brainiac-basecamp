@@ -189,6 +189,8 @@ module Brainiac
             load_epics.find { |e| e["id"] == epic_id }
           end
 
+          WEBHOOK_CHECK_COOLDOWN = 300 # 5 minutes
+
           private
 
           # Resolve current todolist state from Basecamp and dispatch unblocked cards.
@@ -264,7 +266,9 @@ module Brainiac
           end
 
           # Dispatch unblocked tasks that aren't already in-flight or complete.
+          # Ensures Fizzy webhooks are active before dispatching (prevents silent failures).
           def dispatch_unblocked_tasks(epic)
+            ensure_fizzy_webhooks_active
             tasks = epic["tasks"].map do |t|
               Epic::Task.new(
                 todo_id: t["todo_id"],
@@ -316,7 +320,9 @@ module Brainiac
 
             log_event(epic, "dispatched", "Card ##{card_number} dispatched to #{agent}")
 
-            # Assign the card in Fizzy via CLI — this triggers the normal Fizzy webhook flow
+            # Assign the card in Fizzy via CLI — this triggers the normal Fizzy webhook flow.
+            # If the agent is already assigned (stale state from a disabled webhook),
+            # the method will cycle the assignment to re-trigger the webhook.
             assign_fizzy_card(card_number, agent)
 
             # Post a comment on the Basecamp todo
@@ -416,7 +422,10 @@ module Brainiac
           end
 
           # Assign a Fizzy card to an agent via Fizzy CLI.
-          # If the agent is already assigned, skip — the webhook should have already fired.
+          # If the agent is already assigned, unassigns and reassigns to re-trigger the webhook
+          # (Fizzy webhooks can silently become disabled, causing the original assignment to be lost).
+          #
+          # @return [Symbol] :assigned, :reassigned, or :failed
           def assign_fizzy_card(card_number, agent)
             agent_config = load_agent_registry[agent.downcase]
             fizzy_name = agent_config&.dig("fizzy_name") || agent
@@ -425,18 +434,34 @@ module Brainiac
             fizzy_user_id = resolve_fizzy_user_id(fizzy_name)
             unless fizzy_user_id
               LOG.error "[Basecamp:Orchestrator] Could not resolve Fizzy user ID for '#{fizzy_name}'" if defined?(LOG)
-              return
+              return :failed
             end
 
-            # Check if agent is already assigned — if so, skip (webhook should have fired)
+            # Check if agent is already assigned
             stdout, _, status = Open3.capture3("fizzy", "card", "show", card_number.to_s, "--json")
             if status.success?
               card_data = JSON.parse(stdout).dig("data") rescue nil
               if card_data
                 current_assignees = (card_data["assignees"] || []).map { |a| a["id"] }
                 if current_assignees.include?(fizzy_user_id)
-                  LOG.info "[Basecamp:Orchestrator] Agent already assigned to ##{card_number}, skipping (webhook should have fired)" if defined?(LOG)
-                  return
+                  # Agent is already assigned — webhook may not have fired (disabled webhook).
+                  # Unassign then reassign to trigger a fresh webhook delivery.
+                  LOG.warn "[Basecamp:Orchestrator] Agent already assigned to ##{card_number} — " \
+                           "cycling assignment to re-trigger webhook" if defined?(LOG)
+
+                  # Fizzy assign TOGGLES, so calling it removes the assignment
+                  Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
+                  sleep 1 # Brief pause to ensure the unassign is processed
+
+                  # Now reassign — this should trigger the webhook
+                  stdout2, stderr2, status2 = Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
+                  if status2.success?
+                    LOG.info "[Basecamp:Orchestrator] Reassigned Fizzy ##{card_number} to #{fizzy_name} (webhook re-triggered)" if defined?(LOG)
+                    return :reassigned
+                  else
+                    LOG.error "[Basecamp:Orchestrator] Failed to reassign Fizzy ##{card_number}: #{stderr2.strip}" if defined?(LOG)
+                    return :failed
+                  end
                 end
               end
             end
@@ -445,11 +470,77 @@ module Brainiac
 
             if status.success?
               LOG.info "[Basecamp:Orchestrator] Assigned Fizzy ##{card_number} to #{fizzy_name} (#{fizzy_user_id})" if defined?(LOG)
+              :assigned
             else
               LOG.error "[Basecamp:Orchestrator] Failed to assign Fizzy ##{card_number}: #{stderr.strip}" if defined?(LOG)
+              :failed
             end
           rescue Errno::ENOENT => e
             LOG.error "[Basecamp:Orchestrator] fizzy CLI not found: #{e.message}" if defined?(LOG)
+            :failed
+          end
+
+          # Ensure Fizzy webhooks are active before dispatching cards.
+          # Fizzy webhooks can silently become disabled (e.g., after repeated delivery failures),
+          # causing assigned cards to never trigger agent work. This pre-flight check reactivates
+          # any disabled brainiac webhooks.
+          #
+          # Uses a cooldown to avoid hammering the API on every dispatch batch.
+          def ensure_fizzy_webhooks_active
+            now = Time.now
+            @last_webhook_check ||= Time.at(0)
+            return if (now - @last_webhook_check) < WEBHOOK_CHECK_COOLDOWN
+
+            @last_webhook_check = now
+
+            # Read fizzy config to get admin_token and board list
+            fizzy_config_file = File.join(BRAINIAC_DIR, "fizzy.json")
+            return unless File.exist?(fizzy_config_file)
+
+            fizzy_config = JSON.parse(File.read(fizzy_config_file))
+            admin_token = fizzy_config["admin_token"]
+            boards = fizzy_config["boards"] || {}
+
+            unless admin_token
+              LOG.debug "[Basecamp:Orchestrator] Fizzy webhook check skipped (no admin_token in fizzy.json)" if defined?(LOG)
+              return
+            end
+
+            env = { "FIZZY_TOKEN" => admin_token }
+            reactivated = 0
+
+            boards.each do |board_key, board_config|
+              board_id = board_config["board_id"]
+              next unless board_id
+
+              stdout, _, status = Open3.capture3(env, "fizzy", "webhook", "list",
+                                                 "--board", board_id, "--all", "--json",
+                                                 chdir: Dir.home)
+              next unless status.success?
+
+              webhooks = JSON.parse(stdout)["data"] || []
+              webhooks.each do |webhook|
+                next unless webhook["name"]&.start_with?("brainiac")
+                next if webhook["active"]
+
+                wh_name = webhook["name"]
+                LOG.warn "[Basecamp:Orchestrator] Fizzy webhook '#{wh_name}' on board '#{board_key}' is INACTIVE — reactivating" if defined?(LOG)
+                _, _, reactivate_status = Open3.capture3(env, "fizzy", "webhook", "reactivate", webhook["id"],
+                                                         "--board", board_id, chdir: Dir.home)
+                if reactivate_status.success?
+                  reactivated += 1
+                  LOG.info "[Basecamp:Orchestrator] Reactivated webhook '#{webhook['name']}' on board '#{board_key}'" if defined?(LOG)
+                else
+                  LOG.error "[Basecamp:Orchestrator] Failed to reactivate webhook '#{webhook['name']}' on board '#{board_key}'" if defined?(LOG)
+                end
+              end
+            rescue StandardError => e
+              LOG.warn "[Basecamp:Orchestrator] Webhook check failed for board '#{board_key}': #{e.message}" if defined?(LOG)
+            end
+
+            LOG.info "[Basecamp:Orchestrator] Fizzy webhook health check: #{reactivated} reactivated" if reactivated.positive?
+          rescue StandardError => e
+            LOG.warn "[Basecamp:Orchestrator] Fizzy webhook health check failed: #{e.message}" if defined?(LOG)
           end
 
           # Resolve a Fizzy user ID from their display name.

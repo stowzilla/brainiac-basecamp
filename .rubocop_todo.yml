@@ -119,6 +119,7 @@ Metrics/MethodLength:
 Metrics/ModuleLength:
   Exclude:
     - 'lib/brainiac/plugins/basecamp/hooks.rb'
+    - 'lib/brainiac/plugins/basecamp/orchestrator.rb'
 
 # Offense count: 39
 # Configuration parameters: AllowedMethods, AllowedPatterns.
