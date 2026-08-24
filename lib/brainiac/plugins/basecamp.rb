@@ -16,6 +16,15 @@ require_relative "basecamp/cli"
 module Brainiac
   module Plugins
     module Basecamp
+      # Maximum seconds to wait for a dispatched agent/gate to respond before
+      # considering it stale and re-dispatching. Used across resume, health-check,
+      # and dispatch_missing_gates.
+      STALE_DISPATCH_TIMEOUT = 300 # 5 minutes
+
+      # Maximum number of times a gate will be re-dispatched for the same review
+      # cycle before giving up (prevents infinite re-dispatch loops).
+      MAX_GATE_REDISPATCH_RETRIES = 3
+
       class << self
         # Called by Brainiac plugin system during server startup.
         #
@@ -107,21 +116,37 @@ module Brainiac
               end
 
             when "in_flight"
-              # Check if impl agent is assigned when changes were requested
-              if task["changes_requested_by"]&.any?
-                impl_agent = epic["agent"]
-                card_json, = Open3.capture2("fizzy", "card", "show", card_number.to_s, "--json")
-                card_data = JSON.parse(card_json) rescue {}
-                assignees = card_data.dig("data", "assignees") || []
-                assignee_names = assignees.map { |a| a["name"]&.downcase }
+              # Check if impl agent session is likely dead after a restart.
+              # Instead of just checking Fizzy assignment (stale artifact), use
+              # dispatched_at as a liveness signal — if dispatched too long ago
+              # without completion, assume the session died and re-dispatch.
+              dispatched_at = task["dispatched_at"]
+              if dispatched_at
+                elapsed = Time.now - Time.parse(dispatched_at)
+                # If task has been in_flight for longer than the stale timeout
+                # AND no agent is actively running (we can't check PID, so use elapsed time)
+                if elapsed > STALE_DISPATCH_TIMEOUT
+                  impl_agent = epic["agent"]
+                  LOG.info "[Basecamp:HealthCheck] Task ##{card_number} in_flight for #{elapsed.round}s — re-dispatching #{impl_agent}" if defined?(LOG)
 
-                unless assignee_names.include?(impl_agent.downcase)
-                  LOG.info "[Basecamp:HealthCheck] Task ##{card_number} in_flight with changes_requested but #{impl_agent} not assigned — healing" if defined?(LOG)
+                  # Re-dispatch by re-assigning the card (triggers webhook)
+                  task["dispatched_at"] = Time.now.iso8601
                   fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
                   if fizzy_user_id
-                    Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
+                    Hooks.send(:safe_assign_card, card_number, fizzy_user_id)
                     healed_any = true
                   end
+                end
+              elsif task["changes_requested_by"]&.any?
+                # No dispatched_at recorded but changes were requested — legacy state.
+                # Always re-dispatch in this case.
+                impl_agent = epic["agent"]
+                LOG.info "[Basecamp:HealthCheck] Task ##{card_number} in_flight with changes_requested but no dispatched_at — re-dispatching #{impl_agent}" if defined?(LOG)
+                task["dispatched_at"] = Time.now.iso8601
+                fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
+                if fizzy_user_id
+                  Hooks.send(:safe_assign_card, card_number, fizzy_user_id)
+                  healed_any = true
                 end
               end
 
@@ -168,7 +193,7 @@ module Brainiac
                   elsif (task["gate_approvals"] || []).empty? && !task["changes_requested_by"]&.any?
                     # No gate responses at all — gates may never have been dispatched or agents crashed
                     gates_dispatched_at = task["gates_dispatched_at"]
-                    should_redispatch = gates_dispatched_at.nil? || (Time.now - Time.parse(gates_dispatched_at)) > 300
+                    should_redispatch = gates_dispatched_at.nil? || (Time.now - Time.parse(gates_dispatched_at)) > STALE_DISPATCH_TIMEOUT
 
                     if should_redispatch && github_repo
                       LOG.info "[Basecamp:HealthCheck] No gate responses for ##{card_number} — re-dispatching review gates" if defined?(LOG)
@@ -185,7 +210,7 @@ module Brainiac
                   else
                     # Partial responses — some gates responded but others haven't
                     gates_dispatched_at = task["gates_dispatched_at"]
-                    if gates_dispatched_at && (Time.now - Time.parse(gates_dispatched_at)) > 300
+                    if gates_dispatched_at && (Time.now - Time.parse(gates_dispatched_at)) > STALE_DISPATCH_TIMEOUT
                       responded_count = (task["gate_approvals"]&.size || 0) + (task["changes_requested_by"]&.size || 0)
                       total_gates = ReviewGate.gates.size
                       if responded_count.positive? && responded_count < total_gates && github_repo
@@ -328,7 +353,7 @@ module Brainiac
                                   true
                                 else
                                   elapsed = Time.now - Time.parse(gates_dispatched_at)
-                                  elapsed > 300 && responded_count < total_gates
+                                  elapsed > STALE_DISPATCH_TIMEOUT && responded_count < total_gates
                                 end
 
             if should_redispatch && ReviewGate.enabled?

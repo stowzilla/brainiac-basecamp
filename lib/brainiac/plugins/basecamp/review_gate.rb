@@ -206,6 +206,13 @@ module Brainiac
           # Dispatch only gate agents that have NOT yet responded (no approval, no changes_requested).
           # Used during resume/health-check when some gates responded but others didn't.
           #
+          # Tracks per-gate re-dispatch count to prevent infinite loops when a gate agent
+          # keeps crashing. After MAX_GATE_REDISPATCH_RETRIES, stops retrying that gate.
+          #
+          # IMPORTANT: Does NOT overwrite gates_dispatched_at — that timestamp represents
+          # the original dispatch and is used for stale detection. Overwriting it would
+          # reset the timeout window on every partial re-dispatch, causing infinite loops.
+          #
           # @param epic [Hash] Epic state
           # @param task [Hash] Task state
           # @param pr_number [Integer, String] PR number
@@ -220,13 +227,25 @@ module Brainiac
             missing_gates = gates.reject { |g| responded_agents.include?(g["agent"].downcase) }
             return [] if missing_gates.empty?
 
+            # Track per-gate re-dispatch counts to prevent infinite loops
+            task["gate_redispatch_counts"] ||= {}
+
             dispatched = []
 
             missing_gates.each do |gate|
               agent_name = gate["agent"]
               role = gate["role"] || "review"
 
-              LOG.info "[Basecamp:ReviewGate] Re-dispatching missing gate #{agent_name} (#{role}) to review PR ##{pr_number}" if defined?(LOG)
+              # Check retry count — stop if we've exceeded the max
+              retries = task["gate_redispatch_counts"][agent_name.downcase] || 0
+              if retries >= MAX_GATE_REDISPATCH_RETRIES
+                LOG.warn "[Basecamp:ReviewGate] Gate #{agent_name} exceeded max re-dispatch retries (#{retries}/#{MAX_GATE_REDISPATCH_RETRIES}) — skipping" if defined?(LOG)
+                next
+              end
+
+              LOG.info "[Basecamp:ReviewGate] Re-dispatching missing gate #{agent_name} (#{role}) to review PR ##{pr_number} (retry #{retries + 1}/#{MAX_GATE_REDISPATCH_RETRIES})" if defined?(LOG)
+
+              task["gate_redispatch_counts"][agent_name.downcase] = retries + 1
 
               Thread.new do
                 dispatch_agent_for_review(
@@ -245,8 +264,9 @@ module Brainiac
               dispatched << agent_name
             end
 
-            # Update dispatch timestamp but preserve existing approvals
-            task["gates_dispatched_at"] = Time.now.iso8601
+            # Record when this partial re-dispatch happened (for diagnostics)
+            # but do NOT overwrite gates_dispatched_at — that's the original timestamp
+            task["last_redispatch_at"] = Time.now.iso8601
 
             dispatched
           end
