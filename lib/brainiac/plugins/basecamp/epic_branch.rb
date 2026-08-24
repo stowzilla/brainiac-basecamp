@@ -156,10 +156,16 @@ module Brainiac
             # If project is set, look up directly
             return epic_branches[project_key] if project_key && epic_branches[project_key]
 
-            # Fallback: if there's only one epic branch, use it (single-project epic)
-            return epic_branches.values.first if epic_branches.size == 1
+            # Fallback: if there's only one epic branch AND only one project in the epic, use it.
+            # Do NOT fallback if the task has a specific project that isn't in epic_branches —
+            # that means the branch wasn't created for this repo and we should return nil
+            # (letting the default branch be used) rather than returning a branch from a different repo.
+            if (epic_branches.size == 1) && !project_key
+              # Only use the fallback if the task has no project set, or all tasks share the same project
+              return epic_branches.values.first
+            end
 
-            # Multi-project epic but no project on task — can't determine which branch
+            # Multi-project epic but no matching branch for this project — return nil
             nil
           end
 
