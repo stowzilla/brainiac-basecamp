@@ -3,7 +3,7 @@
 module Brainiac
   module Plugins
     module Basecamp
-      VERSION = "0.1.0"
+      VERSION = "0.0.18"
     end
   end
 end
