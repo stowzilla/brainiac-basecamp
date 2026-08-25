@@ -793,21 +793,30 @@ module Brainiac
             prompt = <<~PROMPT
               ## Changes Requested — Fizzy Card ##{card_number}
 
-              Review feedback needs attention on PR ##{task["pr_number"]}. Read the review,
+              Review feedback needs attention on PR ##{task['pr_number']}. Read the review,
               make the requested fixes, commit and push them, then update the Fizzy card.
             PROMPT
             github_repo = project_config["github_repo"]
             agent_env = github_repo ? ReviewGate.send(:resolve_agent_github_env, agent_name, github_repo) : {}
             pid, log_file = method(:run_agent).call(
-              prompt, project_config: project_config, chdir: project_config["repo_path"],
-              log_name: session_id, agent_name: agent_name, source: :basecamp,
-              card_number: card_number, env: agent_env
+              prompt,
+              project_config: project_config,
+              chdir: project_config["repo_path"],
+              log_name: session_id,
+              agent_name: agent_name,
+              source: :basecamp,
+              card_number: card_number,
+              env: agent_env
             )
             return unless pid
 
             SessionRegistry.register_session(
-              session_id, pid, log_file: log_file, agent_name: agent_name,
-              epic_id: epic["id"], card_number: card_number
+              session_id,
+              pid,
+              log_file: log_file,
+              agent_name: agent_name,
+              epic_id: epic["id"],
+              card_number: card_number
             )
           rescue NameError
             LOG.warn "[Basecamp:Hooks] run_agent unavailable — implementation recovery skipped" if defined?(LOG)

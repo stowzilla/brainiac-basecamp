@@ -43,9 +43,7 @@ module Brainiac
 
             to_state = transitions[from_state]
 
-            unless to_state
-              raise InvalidTransition, "cannot #{event} task from #{from_state}"
-            end
+            raise InvalidTransition, "cannot #{event} task from #{from_state}" unless to_state
             raise InvalidTransition, "guard failed for #{event} from #{from_state}" unless guard
 
             migrate!(task, at: at)

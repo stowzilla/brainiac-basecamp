@@ -16,12 +16,15 @@ class TestTaskState < Minitest::Test
     TaskState.transition!(task, :complete, triggered_by: "pr_merged", at: at + 3)
 
     assert_equal "complete", task["status"]
-    assert_equal({
-      "from_state" => "final_decision",
-      "to_state" => "complete",
-      "triggered_by" => "pr_merged",
-      "timestamp" => "2026-08-24T12:00:03Z"
-    }, task["transitions"].last)
+    assert_equal(
+      {
+        "from_state" => "final_decision",
+        "to_state" => "complete",
+        "triggered_by" => "pr_merged",
+        "timestamp" => "2026-08-24T12:00:03Z"
+      },
+      task["transitions"].last
+    )
   end
 
   def test_invalid_transition_does_not_mutate_task

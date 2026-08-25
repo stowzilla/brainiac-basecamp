@@ -16,7 +16,7 @@ rescue LoadError
       singleton.define_method(method_name) do |*args, **kwargs, &method_block|
         value.respond_to?(:call) ? value.call(*args, **kwargs, &method_block) : value
       end
-      block.call
+      yield
     ensure
       singleton.alias_method(method_name, original)
       singleton.remove_method(original)
