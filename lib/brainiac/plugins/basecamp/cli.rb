@@ -185,7 +185,7 @@ module Brainiac
               status_icon = epic["status"] == "active" ? "🚀" : "✅"
 
               # Show deploy env if configured
-              deploy_env = Epic.extract_deploy_env(epic["title"], epic["description"])
+              deploy_env = Basecamp::Epic.extract_deploy_env(epic["title"], epic["description"])
               deploy_display = deploy_env ? " [deploy:#{deploy_env}]" : ""
 
               puts "#{status_icon} #{epic['title']}#{deploy_display}"
@@ -1006,7 +1006,7 @@ module Brainiac
             return override if override && !override.empty?
 
             # 2. [deploy:env] in title or deploy:env in description
-            env = Epic.extract_deploy_env(epic["title"], epic["description"])
+            env = Basecamp::Epic.extract_deploy_env(epic["title"], epic["description"])
             return env if env
 
             # 3. Config default
