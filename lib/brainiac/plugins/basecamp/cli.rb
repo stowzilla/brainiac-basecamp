@@ -1014,7 +1014,10 @@ module Brainiac
             return env if env
 
             # 3. Per-project default from config
-            project_key = Config.brainiac_project_for(epic["basecamp_project_id"])
+            # Prefer the project from tasks (set from Fizzy card tags) over basecamp mapping
+            # since multiple brainiac projects can share the same basecamp project.
+            project_key = (epic["tasks"] || []).map { |t| t["project"] }.compact.first
+            project_key ||= Config.brainiac_project_for(epic["basecamp_project_id"])
             project_env = Config.deploy.dig("project_envs", project_key) if project_key
             return project_env if project_env
 
