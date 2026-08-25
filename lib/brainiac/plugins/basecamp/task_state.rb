@@ -39,7 +39,6 @@ module Brainiac
             event = event.to_sym
             from_state = state(task)
             transitions = TRANSITIONS.fetch(event, {})
-
             # Idempotent no-op: if the task is already in the target state for this
             # event, silently return. This is intentional for recovery paths where a
             # task may be re-processed after a restart — the audit trail already

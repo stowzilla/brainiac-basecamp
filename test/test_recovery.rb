@@ -67,6 +67,16 @@ class TestRecovery < Minitest::Test
     assert dispatched
   end
 
+  def test_changes_requested_recovery_rechecks_gate_state
+    review_task = task(status: "in_review")
+
+    ReviewGate.stub(:changes_requested?, false) do
+      refute Basecamp.send(:recover_changes_requested_task, { "agent" => "Kaylee" }, review_task, triggered_by: "test_recovery")
+    end
+
+    assert_equal "in_review", review_task["status"]
+  end
+
   def test_final_decision_reconciliation_completes_a_merged_pr
     decision_task = task(status: "final_decision").merge("pr_number" => 21)
     completed_card = nil

@@ -18,6 +18,8 @@ rescue LoadError
       end
       yield
     ensure
+      # Restoring the original unbound method retains its exact argument
+      # signature, including keyword arguments, on Ruby 3+.
       singleton.define_method(method_name, singleton.instance_method(original))
       singleton.remove_method(original)
     end
