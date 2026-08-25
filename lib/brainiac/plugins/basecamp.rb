@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "open3"
 require_relative "basecamp/version"
 require_relative "basecamp/metadata"
 require_relative "basecamp/config"
@@ -10,6 +11,7 @@ require_relative "basecamp/epic_branch"
 require_relative "basecamp/epic_memory"
 require_relative "basecamp/session_registry"
 require_relative "basecamp/review_gate"
+require_relative "basecamp/comment_responder"
 require_relative "basecamp/orchestrator"
 require_relative "basecamp/webhook"
 require_relative "basecamp/hooks"

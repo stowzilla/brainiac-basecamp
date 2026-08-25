@@ -84,6 +84,7 @@ Lint/UselessAssignment:
 Metrics/AbcSize:
   Exclude:
     - 'lib/brainiac/plugins/basecamp.rb'
+    - 'lib/brainiac/plugins/basecamp/cli.rb'
     - 'lib/brainiac/plugins/basecamp/hooks.rb'
 
 # Offense count: 7
@@ -101,6 +102,8 @@ Metrics/BlockNesting:
 # Configuration parameters: CountComments, CountAsOne.
 Metrics/ClassLength:
   Max: 750
+  Exclude:
+    - 'lib/brainiac/plugins/basecamp/cli.rb'
 
 # Offense count: 48
 # Configuration parameters: AllowedMethods, AllowedPatterns.
@@ -112,12 +115,14 @@ Metrics/CyclomaticComplexity:
 Metrics/MethodLength:
   Exclude:
     - 'lib/brainiac/plugins/basecamp.rb'
+    - 'lib/brainiac/plugins/basecamp/cli.rb'
     - 'lib/brainiac/plugins/basecamp/hooks.rb'
 
 # Offense count: 1
 # Configuration parameters: CountComments, Max, CountAsOne.
 Metrics/ModuleLength:
   Exclude:
+    - 'lib/brainiac/plugins/basecamp/cli.rb'
     - 'lib/brainiac/plugins/basecamp/hooks.rb'
     - 'lib/brainiac/plugins/basecamp/orchestrator.rb'
 

@@ -568,6 +568,9 @@ module Brainiac
 
             LOG.info "[Basecamp:Orchestrator] Dispatching epic review after card ##{completed_card_number}" if defined?(LOG)
 
+            # Ensure epic memory exists (in case this epic started before the feature)
+            EpicMemory.ensure_exists_for(epic)
+
             # Build the review prompt
             completed_tasks = epic["tasks"].select { |t| t["status"] == "complete" }
             completed_summary = completed_tasks.map { |t| "- ##{t['fizzy_card']}: #{t['title']}" }.join("\n")

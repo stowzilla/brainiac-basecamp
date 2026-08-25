@@ -60,6 +60,16 @@ module Brainiac
             File.exist?(path_for(todolist_id))
           end
 
+          # Ensure epic memory exists for an epic (creates if missing).
+          # Called on resume for epics that started before the feature existed.
+          #
+          # @param epic [Hash] Epic state
+          def ensure_exists_for(epic)
+            return if exists?(epic["basecamp_todolist_id"])
+
+            initialize_for(epic)
+          end
+
           # Initialize epic memory with the epic title and initial context.
           # Called when an epic starts.
           #

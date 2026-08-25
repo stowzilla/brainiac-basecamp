@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "json"
+require "open3"
 
 module Brainiac
   module Plugins
@@ -32,10 +33,16 @@ module Brainiac
               cmd_set(args)
             when "reset"
               cmd_reset(args)
+            when "webhook", "webhooks"
+              cmd_webhook(args)
             else
               print_help
             end
           end
+
+          # The canonical set of webhook event types this plugin needs.
+          # Add new types here as features are added — webhook sync will pick them up.
+          REQUIRED_WEBHOOK_TYPES = %w[Todo Todolist Comment].freeze
 
           private
 
@@ -88,7 +95,8 @@ module Brainiac
             puts "  2. Add bot accounts:     brainiac basecamp bot add <name> <person-id> <agent>"
             puts "  3. Map projects:         brainiac basecamp projects map <brainiac-key> <basecamp-id>"
             puts "  4. Set review gate:      brainiac basecamp set review-gate <on_complete|on_pr_merge>"
-            puts "  5. Set up webhooks:      basecamp webhooks create \"https://your-ngrok/basecamp\" --types \"Todo,Todolist\" --in <project>"
+            puts "  5. Set up webhooks:      basecamp webhooks create \"https://your-ngrok/basecamp\" " \
+                 "--types \"Todo,Todolist,Comment\" --in <project>"
             puts "  6. Restart brainiac:     brainiac restart"
           end
 
@@ -217,11 +225,37 @@ module Brainiac
               person_id = args.shift
               agent = args.shift
 
-              unless name && person_id && agent
-                puts "Usage: brainiac basecamp bot add <name> <basecamp-person-id> <default-agent>"
+              # If person_id is omitted but agent is given, or only agent name given,
+              # try to auto-resolve from Basecamp
+              if name && !person_id
+                # Single arg: treat as agent name, auto-resolve
+                agent = name
+                person_id = auto_resolve_person_id(agent)
+                unless person_id
+                  puts "❌ Could not find '#{agent}' in Basecamp people list."
+                  puts "   Try: basecamp people list --jq '.data[] | {id, name}'"
+                  return
+                end
+                name = agent.downcase
+              elsif name && person_id && !agent
+                # Two args: name + agent, auto-resolve person_id
+                agent = person_id
+                person_id = auto_resolve_person_id(agent)
+                unless person_id
+                  puts "❌ Could not find '#{agent}' in Basecamp people list."
+                  puts "   Provide the person_id manually:"
+                  puts "   brainiac basecamp bot add <name> <person-id> <agent>"
+                  return
+                end
+              elsif !(name && person_id && agent)
+                puts "Usage: brainiac basecamp bot add <agent-name>"
+                puts "       brainiac basecamp bot add <name> <agent-name>"
+                puts "       brainiac basecamp bot add <name> <basecamp-person-id> <agent-name>"
                 puts ""
-                puts "Example:"
-                puts "  brainiac basecamp bot add andy-server 12345 Galen"
+                puts "Examples:"
+                puts "  brainiac basecamp bot add Galen                    # auto-resolves person_id"
+                puts "  brainiac basecamp bot add andy-server Galen        # auto-resolves person_id"
+                puts "  brainiac basecamp bot add andy-server 52992796 Galen"
                 return
               end
 
@@ -234,7 +268,68 @@ module Brainiac
               save_config(config)
               puts "✓ Added bot account '#{name}' (person_id: #{person_id}, agent: #{agent})"
 
-            when "list"
+            when "sync"
+              # Auto-discover agents from ~/.brainiac/agents.json and resolve their
+              # Basecamp person IDs. Creates bot_account entries for any that match.
+              config = load_config
+              config["bot_accounts"] ||= {}
+
+              agents = load_agents_registry
+              if agents.empty?
+                puts "No agents found in ~/.brainiac/agents.json"
+                return
+              end
+
+              puts "Syncing bot accounts from agents registry..."
+              puts "Found #{agents.size} agent(s): #{agents.map { |k, v| v['display_name'] || k }.join(', ')}"
+              puts ""
+
+              added = 0
+              updated = 0
+              not_found = 0
+
+              agents.each do |key, agent_config|
+                display_name = agent_config["display_name"] || key.capitalize
+                # Skip the meta "brainiac" agent
+                next if key == "brainiac"
+
+                resolved_id = auto_resolve_person_id(display_name)
+
+                if resolved_id
+                  existing = config["bot_accounts"].find { |_k, v| v["default_agent"] == display_name }
+
+                  if existing
+                    _existing_key, existing_account = existing
+                    if existing_account["person_id"].to_s == resolved_id.to_s
+                      puts "  \u00b7 #{display_name}: #{resolved_id} (unchanged)"
+                    else
+                      existing_account["person_id"] = resolved_id
+                      updated += 1
+                      puts "  \u2191 #{display_name}: updated person_id \u2192 #{resolved_id}"
+                    end
+                  else
+                    # Create new bot_account entry using agent key as the account name
+                    config["bot_accounts"][key] = {
+                      "person_id" => resolved_id,
+                      "default_agent" => display_name
+                    }
+                    added += 1
+                    puts "  + #{display_name}: #{resolved_id} (new)"
+                  end
+                else
+                  puts "  \u2717 #{display_name}: not found in Basecamp"
+                  not_found += 1
+                end
+              end
+
+              if (added + updated).positive?
+                save_config(config)
+                puts ""
+                puts "\u2713 Added #{added}, updated #{updated} bot account(s)" if added.positive? || updated.positive?
+              else
+                puts "\nAll bot accounts already up to date."
+              end
+              puts "  (#{not_found} agent(s) not found in Basecamp)" if not_found.positive?
               config = load_config
               bots = config["bot_accounts"] || {}
               if bots.empty?
@@ -318,6 +413,102 @@ module Brainiac
             end
           end
 
+          def cmd_webhook(args)
+            action = args.shift
+
+            case action
+            when "sync"
+              cmd_webhook_sync
+            else
+              puts "Usage: brainiac basecamp webhook <command>"
+              puts ""
+              puts "Commands:"
+              puts "  sync    Ensure all project webhooks have the required event types"
+            end
+          end
+
+          def cmd_webhook_sync
+            config = load_config
+            mappings = config["project_mappings"] || {}
+
+            if mappings.empty?
+              puts "No project mappings configured. Add one first:"
+              puts "  brainiac basecamp projects map <key> <basecamp-project-id>"
+              return
+            end
+
+            updated = 0
+            skipped = 0
+            not_found = 0
+
+            mappings.each do |key, mapping|
+              project_id = mapping["basecamp_project_id"]
+              puts "Checking project '#{key}' (Basecamp #{project_id})..."
+
+              # List webhooks for this project
+              output, status = Open3.capture2("basecamp", "webhooks", "list", "--in", project_id.to_s, "--json")
+              unless status.success?
+                puts "  ✗ Failed to list webhooks"
+                not_found += 1
+                next
+              end
+
+              data = JSON.parse(output)
+              webhooks = data["data"] || []
+
+              if webhooks.empty?
+                puts "  ⚠ No webhooks found"
+                not_found += 1
+                next
+              end
+
+              # Find webhooks that point to a /basecamp endpoint (ours)
+              our_webhooks = webhooks.select { |wh| wh["payload_url"]&.include?("/basecamp") }
+
+              if our_webhooks.empty?
+                puts "  ⚠ No webhooks with /basecamp endpoint found"
+                not_found += 1
+                next
+              end
+
+              our_webhooks.each do |wh|
+                current_types = wh["types"] || []
+                missing_types = REQUIRED_WEBHOOK_TYPES - current_types
+
+                if missing_types.empty?
+                  puts "  · Webhook #{wh['id']} (#{wh['payload_url']}): up to date"
+                  skipped += 1
+                  next
+                end
+
+                new_types = (current_types + missing_types).uniq
+                puts "  ↑ Webhook #{wh['id']}: adding #{missing_types.join(', ')}"
+
+                _, stderr, update_status = Open3.capture3(
+                  "basecamp", "webhooks", "update", wh["id"].to_s,
+                  "--types", new_types.join(","),
+                  "--in", project_id.to_s
+                )
+
+                if update_status.success?
+                  puts "    ✓ Updated: #{new_types.join(', ')}"
+                  updated += 1
+                else
+                  puts "    ✗ Failed: #{stderr.strip}"
+                end
+              end
+            end
+
+            puts ""
+            if updated.positive?
+              puts "✓ Updated #{updated} webhook(s)"
+            elsif skipped.positive? && updated.zero?
+              puts "All webhooks already have required types: #{REQUIRED_WEBHOOK_TYPES.join(', ')}"
+            else
+              puts "No webhooks updated."
+            end
+          end
+
           def print_help
             puts <<~HELP
               Usage: brainiac basecamp <command>
@@ -328,7 +519,9 @@ module Brainiac
                 status                                  Check plugin status
                 epics [--all]                           List active epics (--all for completed too)
                 link <card> <url>                       Link a Fizzy card to a Basecamp todo
-                bot add <name> <person-id> <agent>      Add a bot account mapping
+                bot add <agent-name>                    Add bot (auto-resolves person_id from Basecamp)
+                bot add <name> <person-id> <agent>      Add bot with explicit person_id
+                bot sync                                Re-resolve all bot person IDs from Basecamp
                 bot list                                List bot accounts
                 bot remove <name>                       Remove a bot account
                 projects map <key> <basecamp-id>        Map a Brainiac project to Basecamp
@@ -340,6 +533,7 @@ module Brainiac
                 reset task <card-number> [--to <status>] Reset a task to a given status (default: pending)
                 reset epic <todolist-id> [--to <status>] Reset entire epic or all tasks within it
                 reset gates <card-number>               Clear gate approvals and re-dispatch gates
+                webhook sync                            Ensure webhooks have all required event types
 
               Config file: ~/.brainiac/basecamp.json
               Epics state: ~/.brainiac/basecamp_epics.json
@@ -679,6 +873,42 @@ module Brainiac
                                                         }))
           end
 
+          def auto_resolve_person_id(agent_name)
+            output, status = Open3.capture2(
+              "basecamp", "people", "list", "--jq",
+              ".data[] | select(.name | ascii_downcase | contains(\"#{agent_name.downcase}\")) | {id, name}"
+            )
+            return nil unless status.success? && !output.strip.empty?
+
+            # Parse each JSON line — prefer exact match
+            candidates = []
+            output.each_line do |line|
+              person = JSON.parse(line.strip)
+              candidates << person
+            rescue JSON::ParserError
+              next
+            end
+
+            # Exact name match first
+            exact = candidates.find { |p| p["name"]&.downcase == agent_name.downcase }
+            return exact["id"].to_s if exact
+
+            # Otherwise first contains-match
+            candidates.first&.dig("id")&.to_s
+          end
+
+          # Load the agents registry from ~/.brainiac/agents.json
+          #
+          # @return [Hash] Agent key => config hash
+          def load_agents_registry
+            agents_file = File.join(BRAINIAC_DIR, "agents.json")
+            return {} unless File.exist?(agents_file)
+
+            JSON.parse(File.read(agents_file))
+          rescue JSON::ParserError
+            {}
+          end
+
           def load_config
             if File.exist?(CONFIG_FILE)
               JSON.parse(File.read(CONFIG_FILE))
@@ -698,7 +928,7 @@ module Brainiac
       end
 
       def self.completions
-        %w[setup config status epics link bot projects set reset]
+        %w[setup config status epics link bot projects set reset webhook]
       end
     end
   end
