@@ -246,7 +246,8 @@ module Brainiac
               # Preserve PR and gate state from existing task
               if existing
                 %w[dispatched_at pr_number pr_repo gates_dispatched_at gate_approvals
-                   changes_requested_by awaiting_final_decision changes_debounce_started
+                   changes_requested_by gate_redispatch_counts gate_states
+                   awaiting_final_decision changes_debounce_started
                    fizzy_internal_id transitions].each do |key|
                   new_task[key] = existing[key] if existing.key?(key)
                 end
@@ -384,9 +385,6 @@ module Brainiac
               card_number = task["fizzy_card"]
               pr_number = task["pr_number"]
               project_key = task["project"]
-
-              # Skip if gates already dispatched
-              next if task["gates_dispatched_at"]
 
               # Get repo info
               projects_file = File.join(BRAINIAC_DIR, "projects.json")

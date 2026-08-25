@@ -19,8 +19,7 @@ module Brainiac
   module Plugins
     module Basecamp
       # Maximum seconds to wait for a dispatched agent/gate to respond before
-      # considering it stale and re-dispatching. Used across resume, health-check,
-      # and dispatch_missing_gates.
+      # considering it stale and re-dispatching. Used across resume and health-check.
       STALE_DISPATCH_TIMEOUT = 300 # 5 minutes
 
       # Maximum number of times a gate will be re-dispatched for the same review
@@ -106,7 +105,6 @@ module Brainiac
             status = task["status"]
             pr_number = task["pr_number"]
             project_key = task["project"]
-
             case status
             when "final_decision"
               # Check if PR is already merged
@@ -124,18 +122,14 @@ module Brainiac
                   end
                 end
               end
-
             when "in_flight"
-              # Check if impl agent session is actually alive via SessionRegistry.
-              # This replaces the old elapsed-time heuristic with a direct PID check.
+              # Check implementation-agent liveness via SessionRegistry.
               session_alive = SessionRegistry.any_alive_for_card?(card_number)
-
               if session_alive
                 # Agent is running — nothing to heal
                 next
               end
 
-              # No live session for this card — check if we should re-dispatch
               dispatched_at = task["dispatched_at"]
               if dispatched_at
                 elapsed = Time.now - Time.parse(dispatched_at)
@@ -152,9 +146,8 @@ module Brainiac
                     healed_any = true
                   end
                 end
-              elsif task["changes_requested_by"]&.any?
-                # No dispatched_at recorded but changes were requested — legacy state.
-                # Always re-dispatch in this case.
+              elsif ReviewGate.changes_requested?(task)
+                # Recover a changes-requested task with no dispatch timestamp.
                 impl_agent = epic["agent"]
                 LOG.info "[Basecamp:HealthCheck] Task ##{card_number} in_flight with changes_requested but no dispatched_at — re-dispatching #{impl_agent}" if defined?(LOG)
                 task["dispatched_at"] = Time.now.iso8601
@@ -166,84 +159,7 @@ module Brainiac
               end
 
             when "in_review"
-              # Check if all gates have actually approved (webhook might have missed)
-              if pr_number && project_key && ReviewGate.enabled?
-                projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
-                projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
-                repo_path = projects.dig(project_key, "repo_path")
-                github_repo = projects.dig(project_key, "github_repo")
-
-                if repo_path
-                  # Sync from GitHub to catch any missed approvals
-                  ReviewGate.sync_from_github(task, repo_path: repo_path)
-
-                  if ReviewGate.all_gates_passed?(task)
-                    # All approved — advance to final_decision
-                    LOG.info "[Basecamp:HealthCheck] All gates passed for ##{card_number} but still in_review — healing" if defined?(LOG)
-                    TaskState.transition!(task, :approve, triggered_by: "health_check", guard: ReviewGate.all_gates_passed?(task))
-                    task["awaiting_final_decision"] = true
-                    Hooks.send(:save_epic_state, epic)
-                    Hooks.send(:dispatch_final_decision, epic, task, {})
-                    healed_any = true
-                  elsif Hooks.send(:all_gates_responded?, task) && task["changes_requested_by"]&.any?
-                    # All gates responded but some requested changes — need to dispatch impl agent
-                    impl_agent = epic["agent"]
-                    card_json, = Open3.capture2("fizzy", "card", "show", card_number.to_s, "--json")
-                    card_data = JSON.parse(card_json) rescue {}
-                    assignees = card_data.dig("data", "assignees") || []
-                    assignee_names = assignees.map { |a| a["name"]&.downcase }
-
-                    LOG.info "[Basecamp:HealthCheck] All gates responded for ##{card_number} with changes_requested — transitioning to in_flight" if defined?(LOG)
-                    TaskState.transition!(task, :request_changes, triggered_by: "health_check")
-                    Hooks.send(:save_epic_state, epic)
-
-                    unless assignee_names.include?(impl_agent.downcase)
-                      LOG.info "[Basecamp:HealthCheck] Re-assigning ##{card_number} to #{impl_agent}" if defined?(LOG)
-                      fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
-                      if fizzy_user_id
-                        Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
-                      end
-                    end
-                    healed_any = true
-                  elsif (task["gate_approvals"] || []).empty? && !task["changes_requested_by"]&.any?
-                    # No gate responses at all — gates may never have been dispatched or agents crashed
-                    gates_dispatched_at = task["gates_dispatched_at"]
-                    should_redispatch = gates_dispatched_at.nil? || (Time.now - Time.parse(gates_dispatched_at)) > STALE_DISPATCH_TIMEOUT
-
-                    if should_redispatch && github_repo
-                      LOG.info "[Basecamp:HealthCheck] No gate responses for ##{card_number} — re-dispatching review gates" if defined?(LOG)
-                      ReviewGate.dispatch_gates(
-                        epic: epic,
-                        task: task,
-                        pr_number: pr_number,
-                        repo_name: github_repo,
-                        repo_path: repo_path
-                      )
-                      Hooks.send(:save_epic_state, epic)
-                      healed_any = true
-                    end
-                  else
-                    # Partial responses — some gates responded but others haven't
-                    gates_dispatched_at = task["gates_dispatched_at"]
-                    if gates_dispatched_at && (Time.now - Time.parse(gates_dispatched_at)) > STALE_DISPATCH_TIMEOUT
-                      responded_count = (task["gate_approvals"]&.size || 0) + (task["changes_requested_by"]&.size || 0)
-                      total_gates = ReviewGate.gates.size
-                      if responded_count.positive? && responded_count < total_gates && github_repo
-                        LOG.info "[Basecamp:HealthCheck] Partial gate response for ##{card_number} (#{responded_count}/#{total_gates}) — re-dispatching missing gates" if defined?(LOG)
-                        ReviewGate.dispatch_missing_gates(
-                          epic: epic,
-                          task: task,
-                          pr_number: pr_number,
-                          repo_name: github_repo,
-                          repo_path: repo_path
-                        )
-                        Hooks.send(:save_epic_state, epic)
-                        healed_any = true
-                      end
-                    end
-                  end
-                end
-              end
+              healed_any = heal_in_review_task(epic, task, card_number, pr_number, project_key) || healed_any
             end
           end
 
@@ -255,6 +171,54 @@ module Brainiac
         end
 
         private
+
+        def heal_in_review_task(epic, task, card_number, pr_number, project_key)
+          return false unless pr_number && project_key && ReviewGate.enabled?
+
+          projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
+          projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+          repo_path = projects.dig(project_key, "repo_path")
+          github_repo = projects.dig(project_key, "github_repo")
+          return false unless repo_path
+
+          ReviewGate.sync_from_github(task, repo_path: repo_path)
+          if ReviewGate.all_gates_passed?(task)
+            LOG.info "[Basecamp:HealthCheck] All gates passed for ##{card_number} but still in_review — healing" if defined?(LOG)
+            task["status"] = "final_decision"
+            task["awaiting_final_decision"] = true
+            Hooks.send(:save_epic_state, epic)
+            Hooks.send(:dispatch_final_decision, epic, task, {})
+            return true
+          end
+
+          if ReviewGate.all_gates_responded?(task) && ReviewGate.changes_requested?(task)
+            recover_changes_requested_task(epic, task, card_number)
+            return true
+          end
+          return false unless github_repo
+
+          dispatched = ReviewGate.redispatch_stale_gates(
+            epic: epic, task: task, pr_number: pr_number,
+            repo_name: github_repo, repo_path: repo_path
+          )
+          Hooks.send(:save_epic_state, epic) if dispatched.any?
+          dispatched.any?
+        end
+
+        def recover_changes_requested_task(epic, task, card_number)
+          impl_agent = epic["agent"]
+          card_json, = Open3.capture2("fizzy", "card", "show", card_number.to_s, "--json")
+          card_data = JSON.parse(card_json) rescue {}
+          assignee_names = (card_data.dig("data", "assignees") || []).map { |assignee| assignee["name"]&.downcase }
+
+          LOG.info "[Basecamp:HealthCheck] All gates responded for ##{card_number} with changes_requested — transitioning to in_flight" if defined?(LOG)
+          task["status"] = "in_flight"
+          Hooks.send(:save_epic_state, epic)
+          return if assignee_names.include?(impl_agent.downcase)
+
+          fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
+          Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id) if fizzy_user_id
+        end
 
         # Resume active epics on server startup.
         # For each epic, checks task states and takes appropriate action.
@@ -336,7 +300,7 @@ module Brainiac
             task["awaiting_final_decision"] = true
             Hooks.send(:save_epic_state, epic)
             Hooks.send(:dispatch_final_decision, epic, task, {})
-          elsif task["changes_requested_by"]&.any?
+          elsif ReviewGate.changes_requested?(task)
             # Gates requested changes — after a restart, no agent session is running even if assigned.
             # Always re-dispatch the impl agent to address the feedback.
             impl_agent = epic["agent"]
@@ -352,56 +316,17 @@ module Brainiac
               Hooks.send(:safe_assign_card, card_number, fizzy_user_id)
             end
           else
-            # No changes requested yet — check if gates need (re-)dispatching
-            approvals = task["gate_approvals"]&.size || 0
-            gates_dispatched_at = task["gates_dispatched_at"]
-
-            # Calculate how many gates have responded (approved or requested changes)
-            responded_count = approvals + (task["changes_requested_by"]&.size || 0)
-            total_gates = ReviewGate.gates.size
-
-            # Re-dispatch gates if:
-            # 1. Gates were never dispatched (missed webhook), OR
-            # 2. Gates were dispatched but no responses received after 5 minutes, OR
-            # 3. Some gates responded but others didn't after 5 minutes (partial response)
-            should_redispatch = if gates_dispatched_at.nil?
-                                  true
-                                else
-                                  elapsed = Time.now - Time.parse(gates_dispatched_at)
-                                  elapsed > STALE_DISPATCH_TIMEOUT && responded_count < total_gates
-                                end
-
-            if should_redispatch && ReviewGate.enabled?
-              github_repo = projects.dig(project_key, "github_repo")
-              if github_repo
-                if responded_count.zero?
-                  # No responses at all — dispatch all gates
-                  LOG.info "[Basecamp] Resume: ##{card_number} has 0/#{total_gates} gate responses — re-dispatching all review gates" if defined?(LOG)
-                  ReviewGate.dispatch_gates(
-                    epic: epic,
-                    task: task,
-                    pr_number: pr_number,
-                    repo_name: github_repo,
-                    repo_path: repo_path
-                  )
-                else
-                  # Partial responses — dispatch only the missing gates
-                  LOG.info "[Basecamp] Resume: ##{card_number} has #{responded_count}/#{total_gates} gate responses — re-dispatching missing gates" if defined?(LOG)
-                  ReviewGate.dispatch_missing_gates(
-                    epic: epic,
-                    task: task,
-                    pr_number: pr_number,
-                    repo_name: github_repo,
-                    repo_path: repo_path
-                  )
-                end
-                Hooks.send(:save_epic_state, epic)
-              else
-                LOG.warn "[Basecamp] Resume: ##{card_number} — cannot re-dispatch gates, no github_repo for #{project_key}" if defined?(LOG)
-              end
-            else
-              LOG.info "[Basecamp] Resume: ##{card_number} has #{responded_count}/#{total_gates} gate responses, waiting for more reviews" if defined?(LOG)
+            github_repo = projects.dig(project_key, "github_repo")
+            unless github_repo
+              LOG.warn "[Basecamp] Resume: ##{card_number} — cannot dispatch gates, no github_repo for #{project_key}" if defined?(LOG)
+              return
             end
+
+            dispatched = ReviewGate.redispatch_stale_gates(
+              epic: epic, task: task, pr_number: pr_number,
+              repo_name: github_repo, repo_path: repo_path
+            )
+            Hooks.send(:save_epic_state, epic) if dispatched.any?
           end
         end
 
