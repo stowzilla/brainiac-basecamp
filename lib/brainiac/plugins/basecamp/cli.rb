@@ -284,6 +284,21 @@ module Brainiac
             puts "   Worktree: #{worktree_path}"
             puts ""
 
+            # Pull latest changes before deploying
+            puts "Pulling latest changes..."
+            pull_output, pull_status = Open3.capture2e("git", "pull", "--ff-only", chdir: worktree_path)
+            if pull_status.success?
+              if pull_output.include?("Already up to date")
+                puts "Already up to date."
+              else
+                puts pull_output.lines.first(5).join
+              end
+            else
+              puts "⚠️  Git pull failed (continuing anyway):"
+              puts pull_output.lines.first(3).join
+            end
+            puts ""
+
             # Run deploy
             success = run_deploy(worktree_path, deploy_env)
 
@@ -309,6 +324,12 @@ module Brainiac
             end
 
             save_epics(epics)
+
+            # Change into the worktree directory
+            puts ""
+            puts "Entering worktree..."
+            Dir.chdir(worktree_path)
+            exec ENV.fetch("SHELL", "/bin/bash")
           end
 
           def cmd_link(args)
