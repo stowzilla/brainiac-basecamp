@@ -205,6 +205,10 @@ brainiac restart
     "enabled": true,
     "trigger": "on_final_pr",
     "default_env": "dev",
+    "project_envs": {
+      "stowzilla": "dev",
+      "posh-nosh": "dev02"
+    },
     "command": "belt deploy {env} --auto"
   },
   "notifications": {
@@ -248,7 +252,8 @@ Environment resolution (in order):
 1. Explicit env argument
 2. `[deploy:env]` in epic title
 3. `deploy:env` in epic description
-4. `deploy.default_env` in config
+4. `deploy.project_envs.<project>` in config (per-project default)
+5. `deploy.default_env` in config (global default)
 
 ### Automated Deploy
 
@@ -260,6 +265,10 @@ Configure automated deployment in `~/.brainiac/basecamp.json`:
     "enabled": true,
     "trigger": "on_final_pr",
     "default_env": "dev",
+    "project_envs": {
+      "stowzilla": "dev",
+      "posh-nosh": "dev02"
+    },
     "command": "belt deploy {env} --auto"
   }
 }
@@ -269,7 +278,8 @@ Configure automated deployment in `~/.brainiac/basecamp.json`:
 |--------|-------------|
 | `enabled` | Enable/disable automated deploys |
 | `trigger` | When to deploy: `manual`, `on_final_pr` |
-| `default_env` | Fallback environment if not specified in epic |
+| `default_env` | Global fallback environment |
+| `project_envs` | Per-project default environments (e.g., `{"stowzilla": "dev"}`) |
 | `command` | Deploy command template (`{env}` is replaced) |
 
 ## CLI Commands

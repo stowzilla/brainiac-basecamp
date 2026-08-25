@@ -1002,7 +1002,12 @@ module Brainiac
             env = Epic.extract_deploy_env(epic["title"], epic["description"])
             return env if env
 
-            # 2. Config default
+            # 2. Per-project default from config
+            project_key = Config.brainiac_project_for(epic["basecamp_project_id"])
+            project_env = Config.deploy.dig("project_envs", project_key) if project_key
+            return project_env if project_env
+
+            # 3. Global default
             Config.deploy["default_env"]
           end
 

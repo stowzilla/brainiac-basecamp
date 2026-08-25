@@ -24,6 +24,7 @@ module Brainiac
             "enabled" => false,
             "trigger" => "manual",
             "default_env" => nil,
+            "project_envs" => {},
             "command" => "belt deploy {env} --auto"
           },
           "notifications" => {

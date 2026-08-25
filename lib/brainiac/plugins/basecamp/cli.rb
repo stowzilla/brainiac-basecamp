@@ -265,7 +265,8 @@ module Brainiac
               puts "  1. Pass env as argument: brainiac basecamp deploy #{epic_id} dev02"
               puts "  2. Add [deploy:env] to epic title: \"Epic: My Feature [deploy:dev02]\""
               puts "  3. Add deploy:env to epic description"
-              puts "  4. Set deploy.default_env in ~/.brainiac/basecamp.json"
+              puts "  4. Set deploy.project_envs.<project> in ~/.brainiac/basecamp.json"
+              puts "  5. Set deploy.default_env in ~/.brainiac/basecamp.json"
               return
             end
 
@@ -654,7 +655,8 @@ module Brainiac
                 1. Explicit env argument: brainiac basecamp deploy 12345 dev02
                 2. [deploy:env] in epic title: "Epic: My Feature [deploy:dev02]"
                 3. deploy:env in epic description
-                4. deploy.default_env in config
+                4. deploy.project_envs.<project> in config (per-project default)
+                5. deploy.default_env in config (global default)
 
               Task statuses (for reset --to):
                 pending         — Not yet started, waiting for dependencies
@@ -1011,7 +1013,12 @@ module Brainiac
             env = Basecamp::Epic.extract_deploy_env(epic["title"], epic["description"])
             return env if env
 
-            # 3. Config default
+            # 3. Per-project default from config
+            project_key = Config.brainiac_project_for(epic["basecamp_project_id"])
+            project_env = Config.deploy.dig("project_envs", project_key) if project_key
+            return project_env if project_env
+
+            # 4. Global default
             Config.deploy["default_env"]
           end
 
