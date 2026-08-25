@@ -885,26 +885,7 @@ module Brainiac
           end
 
           def save_epic_state(epic)
-            epics_file = File.join(
-              ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")),
-              "basecamp_epics.json"
-            )
-
-            all = if File.exist?(epics_file)
-                    data = JSON.parse(File.read(epics_file))
-                    data["epics"] || []
-                  else
-                    []
-                  end
-
-            idx = all.index { |e| e["id"] == epic["id"] }
-            if idx
-              all[idx] = epic
-            else
-              all << epic
-            end
-
-            File.write(epics_file, JSON.pretty_generate({ "epics" => all, "updated_at" => Time.now.iso8601 }))
+            RemoteState.save_epic(epic)
           rescue StandardError => e
             LOG.error "[Basecamp:Hooks] Failed to save epic state: #{e.message}" if defined?(LOG)
           end
