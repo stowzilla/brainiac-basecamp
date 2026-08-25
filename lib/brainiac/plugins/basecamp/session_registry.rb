@@ -59,8 +59,11 @@ module Brainiac
 
             LOG.info "[Basecamp:SessionRegistry] Registered session: #{task_id} (pid=#{pid}, agent=#{agent_name})" if defined?(LOG)
 
-            # Also forward to the global register_session if it exists (for waybar/UI)
-            if Object.respond_to?(:register_session, true) && !@suppress_global_forward
+            # Also forward to the global register_session if it exists (for waybar/UI).
+            # Skip implementation-* sessions — fizzy already registers those as card-NNNN
+            # and we don't want duplicate entries in the tray.
+            if Object.respond_to?(:register_session, true) && !@suppress_global_forward &&
+               !task_id.to_s.start_with?("implementation-")
               begin
                 Object.send(:register_session, task_id, pid, log_file: log_file, agent_name: agent_name)
               rescue StandardError
