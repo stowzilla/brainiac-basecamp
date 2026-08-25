@@ -179,9 +179,11 @@ module Brainiac
           def extract_dependencies(text)
             return [] if text.nil? || text.empty?
 
-            # Try [depends:N,N] format
-            if (match = text.match(/\[depends:([\d,]+)\]/))
-              return match[1].split(",").map(&:strip).map(&:to_i)
+            # Try [depends:N,N] format — collect from ALL occurrences
+            # Handles both "[depends:1234,1235]" and "[depends:1234] [depends:1235]"
+            matches = text.scan(/\[depends:([\d,]+)\]/)
+            unless matches.empty?
+              return matches.flatten.flat_map { |m| m.split(",").map(&:strip).map(&:to_i) }.uniq
             end
 
             # Try "Depends on:" format (handles HTML tags around it)
