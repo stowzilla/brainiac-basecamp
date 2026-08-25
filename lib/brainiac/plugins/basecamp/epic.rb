@@ -123,6 +123,28 @@ module Brainiac
             lines.join("\n")
           end
 
+          # Extract deploy environment from epic title or description.
+          # Supports:
+          #   [deploy:dev02]  — in title (preferred)
+          #   deploy:dev02    — in description (fallback)
+          #
+          # @param title [String] Epic/todolist title
+          # @param description [String, nil] Optional description to check as fallback
+          # @return [String, nil] Environment name or nil
+          def extract_deploy_env(title, description = nil)
+            # Try [deploy:env] format in title (preferred)
+            if (match = title&.match(/\[deploy:([^\]]+)\]/))
+              return match[1].strip
+            end
+
+            # Fallback: try deploy:env in description
+            if description && (match = description.match(/deploy:(\S+)/i))
+              return match[1].strip
+            end
+
+            nil
+          end
+
           private
 
           # Extract Fizzy card number from title.

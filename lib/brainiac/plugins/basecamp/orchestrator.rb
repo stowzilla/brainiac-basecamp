@@ -737,6 +737,9 @@ module Brainiac
             # If epic_branch mode, open final PRs to main
             if epic["review_gate"] == "epic_branch" && epic["epic_branches"]&.any?
               open_final_prs(epic)
+
+              # Trigger automated deploy if configured
+              trigger_deploy_if_configured(epic, "on_final_pr")
             end
 
             # Post a summary message in Basecamp
@@ -924,6 +927,122 @@ module Brainiac
                           target: target,
                           message: message,
                           agent: agent)
+          end
+
+          # Trigger automated deploy if configured for the given trigger point.
+          #
+          # @param epic [Hash] Epic state
+          # @param trigger [String] Trigger point ("on_final_pr", "on_task_merge", etc.)
+          def trigger_deploy_if_configured(epic, trigger)
+            deploy_config = Config.deploy
+            return unless deploy_config["enabled"]
+            return unless deploy_config["trigger"] == trigger
+
+            # Resolve deploy environment
+            deploy_env = resolve_epic_deploy_env(epic)
+            unless deploy_env
+              LOG.warn "[Basecamp:Orchestrator] Deploy triggered but no environment configured for epic '#{epic['title']}'" if defined?(LOG)
+              return
+            end
+
+            # Find worktree
+            worktree_path = find_epic_worktree(epic)
+            unless worktree_path
+              LOG.warn "[Basecamp:Orchestrator] Deploy triggered but no worktree found for epic '#{epic['title']}'" if defined?(LOG)
+              return
+            end
+
+            LOG.info "[Basecamp:Orchestrator] Auto-deploying epic '#{epic['title']}' to #{deploy_env}" if defined?(LOG)
+
+            # Run deploy
+            command_template = deploy_config["command"] || "belt deploy {env} --auto"
+            command = command_template.gsub("{env}", deploy_env)
+
+            success = system(command, chdir: worktree_path)
+
+            # Record deploy result
+            epic["last_deploy"] = {
+              "env" => deploy_env,
+              "at" => Time.now.iso8601,
+              "status" => success ? "success" : "failed",
+              "trigger" => trigger
+            }
+
+            # Send notification
+            if success
+              send_notification(
+                event: :epic_deployed,
+                message: "🚀 Epic **#{epic['title']}** deployed to **#{deploy_env}**",
+                agent: epic["agent"]
+              )
+            else
+              send_notification(
+                event: :epic_deploy_failed,
+                message: "❌ Epic **#{epic['title']}** deploy to **#{deploy_env}** failed",
+                agent: epic["agent"]
+              )
+            end
+          rescue StandardError => e
+            LOG.error "[Basecamp:Orchestrator] Deploy failed: #{e.message}" if defined?(LOG)
+            epic["last_deploy"] = {
+              "env" => deploy_env,
+              "at" => Time.now.iso8601,
+              "status" => "error",
+              "error" => e.message,
+              "trigger" => trigger
+            }
+          end
+
+          # Resolve deploy environment for an epic.
+          #
+          # @param epic [Hash] Epic state
+          # @return [String, nil] Environment name or nil
+          def resolve_epic_deploy_env(epic)
+            # 1. [deploy:env] in title or deploy:env in description
+            env = Epic.extract_deploy_env(epic["title"], epic["description"])
+            return env if env
+
+            # 2. Config default
+            Config.deploy["default_env"]
+          end
+
+          # Find the worktree path for an epic's branch.
+          #
+          # @param epic [Hash] Epic state
+          # @return [String, nil] Worktree path or nil
+          def find_epic_worktree(epic)
+            epic_branches = epic["epic_branches"] || {}
+            return nil if epic_branches.empty?
+
+            projects_file = File.join(BRAINIAC_DIR, "projects.json")
+            return nil unless File.exist?(projects_file)
+
+            projects = JSON.parse(File.read(projects_file))
+
+            epic_branches.each do |project_key, branch_name|
+              repo_path = projects.dig(project_key, "repo_path")
+              next unless repo_path && File.directory?(repo_path)
+
+              # List worktrees and find one with this branch
+              output, status = Open3.capture2("git", "worktree", "list", "--porcelain", chdir: repo_path)
+              next unless status.success?
+
+              current_worktree = nil
+              output.each_line do |line|
+                if line.start_with?("worktree ")
+                  current_worktree = line.sub("worktree ", "").strip
+                elsif line.start_with?("branch refs/heads/")
+                  wt_branch = line.sub("branch refs/heads/", "").strip
+                  if wt_branch == branch_name && current_worktree && current_worktree != repo_path
+                    return current_worktree
+                  end
+                end
+              end
+            end
+
+            nil
+          rescue JSON::ParserError
+            nil
           end
         end
       end

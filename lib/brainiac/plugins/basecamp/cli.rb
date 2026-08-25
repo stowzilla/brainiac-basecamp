@@ -23,6 +23,8 @@ module Brainiac
               cmd_status
             when "epics"
               cmd_epics(args)
+            when "deploy"
+              cmd_deploy(args)
             when "link"
               cmd_link(args)
             when "bot"
@@ -163,14 +165,14 @@ module Brainiac
             data = JSON.parse(File.read(epics_file))
             epics = data["epics"] || []
 
-            if args.first == "--all"
+            if args.include?("--all")
               display_epics = epics
             else
               display_epics = epics.select { |e| e["status"] == "active" }
             end
 
             if display_epics.empty?
-              puts "No #{args.first == '--all' ? '' : 'active '}epics."
+              puts "No #{args.include?('--all') ? '' : 'active '}epics."
               return
             end
 
@@ -181,10 +183,22 @@ module Brainiac
               total = tasks.size
 
               status_icon = epic["status"] == "active" ? "🚀" : "✅"
-              puts "#{status_icon} #{epic['title']}"
+
+              # Show deploy env if configured
+              deploy_env = Epic.extract_deploy_env(epic["title"], epic["description"])
+              deploy_display = deploy_env ? " [deploy:#{deploy_env}]" : ""
+
+              puts "#{status_icon} #{epic['title']}#{deploy_display}"
               puts "   Todolist: #{epic['basecamp_todolist_id']} | Agent: #{epic['agent']}"
               puts "   Tasks: #{complete}/#{total} complete, #{in_flight} in-flight"
               puts "   Started: #{epic['started_at']}"
+
+              # Show last deploy if present
+              if epic["last_deploy"]
+                ld = epic["last_deploy"]
+                deploy_status = ld["status"] == "success" ? "✅" : "❌"
+                puts "   Last deploy: #{deploy_status} #{ld['env']} @ #{ld['at']}"
+              end
 
               # Show per-task detail if verbose or few tasks
               if args.include?("--verbose") || args.include?("-v")
@@ -200,6 +214,97 @@ module Brainiac
                 end
               end
               puts ""
+            end
+          end
+
+          def cmd_deploy(args)
+            epic_id = args.shift
+            env_override = args.shift
+
+            unless epic_id
+              puts "Usage: brainiac basecamp deploy <epic-id> [env]"
+              puts ""
+              puts "Deploy an epic's worktree to the specified environment."
+              puts ""
+              puts "Arguments:"
+              puts "  <epic-id>    Basecamp todolist ID for the epic"
+              puts "  [env]        Environment to deploy to (overrides epic's [deploy:env])"
+              puts ""
+              puts "Environment resolution (in order):"
+              puts "  1. Explicit env argument"
+              puts "  2. [deploy:env] in epic title"
+              puts "  3. deploy:env in epic description"
+              puts "  4. deploy.default_env in config"
+              puts ""
+              puts "Active epics:"
+              list_epics_for_deploy
+              return
+            end
+
+            # Load epic
+            epics = load_epics
+            epic = epics.find { |e| e["basecamp_todolist_id"] == epic_id.to_s }
+
+            unless epic
+              puts "❌ No epic found with todolist ID #{epic_id}"
+              puts ""
+              puts "Active epics:"
+              list_epics_for_deploy
+              return
+            end
+
+            # Resolve deploy environment
+            deploy_env = resolve_deploy_env(epic, env_override)
+
+            unless deploy_env
+              puts "❌ No deploy environment specified."
+              puts ""
+              puts "Either:"
+              puts "  1. Pass env as argument: brainiac basecamp deploy #{epic_id} dev02"
+              puts "  2. Add [deploy:env] to epic title: \"Epic: My Feature [deploy:dev02]\""
+              puts "  3. Add deploy:env to epic description"
+              puts "  4. Set deploy.default_env in ~/.brainiac/basecamp.json"
+              return
+            end
+
+            # Find worktree
+            worktree_path = find_epic_worktree(epic)
+
+            unless worktree_path
+              puts "❌ No worktree found for epic '#{epic['title']}'"
+              puts "   Epic branch mode may not be enabled, or no tasks have been dispatched."
+              return
+            end
+
+            puts "🚀 Deploying epic '#{epic['title']}'"
+            puts "   Environment: #{deploy_env}"
+            puts "   Worktree: #{worktree_path}"
+            puts ""
+
+            # Run deploy
+            success = run_deploy(worktree_path, deploy_env)
+
+            if success
+              puts ""
+              puts "✅ Deploy completed successfully"
+
+              # Update epic state
+              epic["last_deploy"] = {
+                "env" => deploy_env,
+                "at" => Time.now.iso8601,
+                "status" => "success"
+              }
+              save_epics(epics)
+            else
+              puts ""
+              puts "❌ Deploy failed"
+
+              epic["last_deploy"] = {
+                "env" => deploy_env,
+                "at" => Time.now.iso8601,
+                "status" => "failed"
+              }
+              save_epics(epics)
             end
           end
 
@@ -517,7 +622,8 @@ module Brainiac
                 setup                                   Interactive setup guide
                 config                                  Show current config
                 status                                  Check plugin status
-                epics [--all]                           List active epics (--all for completed too)
+                epics [--all] [-v]                      List active epics (--all for completed too)
+                deploy <epic-id> [env]                  Deploy epic worktree to environment
                 link <card> <url>                       Link a Fizzy card to a Basecamp todo
                 bot add <agent-name>                    Add bot (auto-resolves person_id from Basecamp)
                 bot add <name> <person-id> <agent>      Add bot with explicit person_id
@@ -541,6 +647,12 @@ module Brainiac
               Review gate modes:
                 on_complete   — Advance to next task as soon as agent finishes (default)
                 on_pr_merge   — Wait for PR to be merged before advancing (review gate)
+
+              Deploy environment resolution (in order):
+                1. Explicit env argument: brainiac basecamp deploy 12345 dev02
+                2. [deploy:env] in epic title: "Epic: My Feature [deploy:dev02]"
+                3. deploy:env in epic description
+                4. deploy.default_env in config
 
               Task statuses (for reset --to):
                 pending         — Not yet started, waiting for dependencies
@@ -873,6 +985,85 @@ module Brainiac
                                                         }))
           end
 
+          # --- Deploy helpers ---
+
+          def list_epics_for_deploy
+            epics = load_epics.select { |e| e["status"] == "active" }
+            if epics.empty?
+              puts "  (no active epics)"
+              return
+            end
+
+            epics.each do |epic|
+              deploy_env = resolve_deploy_env(epic, nil)
+              env_display = deploy_env ? "[deploy:#{deploy_env}]" : "(no env)"
+              puts "  #{epic['basecamp_todolist_id']} — #{epic['title']} #{env_display}"
+            end
+          end
+
+          def resolve_deploy_env(epic, override)
+            # 1. Explicit override
+            return override if override && !override.empty?
+
+            # 2. [deploy:env] in title or deploy:env in description
+            env = Epic.extract_deploy_env(epic["title"], epic["description"])
+            return env if env
+
+            # 3. Config default
+            Config.deploy["default_env"]
+          end
+
+          def find_epic_worktree(epic)
+            # Epic branches are stored per-project in epic["epic_branches"]
+            # Find any worktree that has the epic branch checked out
+            epic_branches = epic["epic_branches"] || {}
+            return nil if epic_branches.empty?
+
+            # Load projects to find repo paths
+            projects_file = File.join(BRAINIAC_DIR, "projects.json")
+            return nil unless File.exist?(projects_file)
+
+            projects = JSON.parse(File.read(projects_file))
+
+            epic_branches.each do |project_key, branch_name|
+              repo_path = projects.dig(project_key, "repo_path")
+              next unless repo_path && File.directory?(repo_path)
+
+              # List worktrees and find one with this branch
+              output, status = Open3.capture2("git", "worktree", "list", "--porcelain", chdir: repo_path)
+              next unless status.success?
+
+              # Parse porcelain output
+              current_worktree = nil
+              output.each_line do |line|
+                if line.start_with?("worktree ")
+                  current_worktree = line.sub("worktree ", "").strip
+                elsif line.start_with?("branch refs/heads/")
+                  wt_branch = line.sub("branch refs/heads/", "").strip
+                  if wt_branch == branch_name && current_worktree && current_worktree != repo_path
+                    return current_worktree
+                  end
+                end
+              end
+            end
+
+            nil
+          rescue JSON::ParserError
+            nil
+          end
+
+          def run_deploy(worktree_path, env)
+            deploy_config = Config.deploy
+            command_template = deploy_config["command"] || "belt deploy {env} --auto"
+            command = command_template.gsub("{env}", env)
+
+            puts "Running: #{command}"
+            puts "-" * 40
+
+            # Run the deploy command in the worktree directory
+            system(command, chdir: worktree_path)
+          end
+
           def auto_resolve_person_id(agent_name)
             output, status = Open3.capture2(
               "basecamp", "people", "list", "--jq",
@@ -928,7 +1119,7 @@ module Brainiac
       end
 
       def self.completions
-        %w[setup config status epics link bot projects set reset webhook]
+        %w[setup config status epics deploy link bot projects set reset webhook]
       end
     end
   end

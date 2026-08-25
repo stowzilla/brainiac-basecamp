@@ -20,6 +20,12 @@ module Brainiac
           "fizzy_account_id" => nil,
           "review_gate" => "on_complete",
           "review_gates" => [],
+          "deploy" => {
+            "enabled" => false,
+            "trigger" => "manual",
+            "default_env" => nil,
+            "command" => "belt deploy {env} --auto"
+          },
           "notifications" => {
             "epic_started" => true,
             "task_dispatched" => true,
@@ -101,6 +107,13 @@ module Brainiac
           # @return [String]
           def review_gate
             current["review_gate"] || "on_complete"
+          end
+
+          # Deploy configuration.
+          #
+          # @return [Hash]
+          def deploy
+            current["deploy"] || DEFAULT_CONFIG["deploy"]
           end
 
           private

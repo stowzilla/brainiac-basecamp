@@ -199,4 +199,66 @@ class TestEpicParser < Minitest::Test
 
     assert_nil tasks.first.fizzy_card
   end
+
+  # --- Deploy environment extraction ---
+
+  def test_extract_deploy_env_from_title_bracket_format
+    env = Brainiac::Plugins::Basecamp::Epic.extract_deploy_env(
+      "Epic: Build Auth System [deploy:dev02]"
+    )
+
+    assert_equal "dev02", env
+  end
+
+  def test_extract_deploy_env_from_title_with_other_brackets
+    env = Brainiac::Plugins::Basecamp::Epic.extract_deploy_env(
+      "Epic: Build Auth [depends:1234] [deploy:dev03]"
+    )
+
+    assert_equal "dev03", env
+  end
+
+  def test_extract_deploy_env_from_description_fallback
+    env = Brainiac::Plugins::Basecamp::Epic.extract_deploy_env(
+      "Epic: Build Auth System",
+      "This epic should deploy:staging after completion"
+    )
+
+    assert_equal "staging", env
+  end
+
+  def test_extract_deploy_env_title_takes_precedence
+    env = Brainiac::Plugins::Basecamp::Epic.extract_deploy_env(
+      "Epic: Build Auth System [deploy:dev02]",
+      "deploy:staging"
+    )
+
+    assert_equal "dev02", env
+  end
+
+  def test_extract_deploy_env_returns_nil_when_not_present
+    env = Brainiac::Plugins::Basecamp::Epic.extract_deploy_env(
+      "Epic: Build Auth System",
+      "Just a regular description"
+    )
+
+    assert_nil env
+  end
+
+  def test_extract_deploy_env_handles_nil_description
+    env = Brainiac::Plugins::Basecamp::Epic.extract_deploy_env(
+      "Epic: Build Auth System",
+      nil
+    )
+
+    assert_nil env
+  end
+
+  def test_extract_deploy_env_strips_whitespace
+    env = Brainiac::Plugins::Basecamp::Epic.extract_deploy_env(
+      "Epic: Build Auth System [deploy: dev02 ]"
+    )
+
+    assert_equal "dev02", env
+  end
 end
