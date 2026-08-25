@@ -293,6 +293,7 @@ module Brainiac
           def stale_gate_states(task)
             gate_states(task).values.select do |state|
               next false unless state["status"] == "dispatched" && state["dispatched_at"]
+              next false if SessionRegistry.alive?("gate-#{state['agent'].to_s.downcase}-#{task['fizzy_card']}")
 
               Time.now - Time.parse(state["dispatched_at"]) > STALE_DISPATCH_TIMEOUT
             end
