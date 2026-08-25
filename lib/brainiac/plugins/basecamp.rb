@@ -135,6 +135,9 @@ module Brainiac
 
         def reconcile_in_flight_task(epic, task)
           card_number = task["fizzy_card"]
+          # Best-effort liveness check, not atomic: the PID could exit between
+          # this check and the re-dispatch below. That's acceptable — if a race
+          # occurs, the next periodic recovery sweep (90s) will catch it.
           return false if SessionRegistry.alive?("implementation-#{card_number}")
           return false unless stale_dispatch?(task)
 
@@ -178,6 +181,10 @@ module Brainiac
 
         def recover_changes_requested_task(epic, task, triggered_by:)
           card_number = task["fizzy_card"]
+          # Guard: only recover if changes are actually still requested. The caller
+          # checks this too, but this makes the method safe to call standalone
+          # (e.g., if gate approvals arrive between the caller's check and here).
+          return false unless ReviewGate.changes_requested?(task)
           return false if SessionRegistry.alive?("implementation-#{card_number}")
 
           TaskState.transition!(task, :request_changes, triggered_by: triggered_by)

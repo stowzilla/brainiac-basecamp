@@ -18,7 +18,7 @@ rescue LoadError
       end
       yield
     ensure
-      singleton.alias_method(method_name, original)
+      singleton.define_method(method_name, singleton.instance_method(original))
       singleton.remove_method(original)
     end
   end

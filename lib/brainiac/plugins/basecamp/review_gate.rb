@@ -85,6 +85,11 @@ module Brainiac
 
           # Each configured gate gets one durable state record, keyed by agent name.
           # This also migrates persisted state from releases that used flat arrays.
+          #
+          # NOTE: This method intentionally MUTATES the task hash on read — it lazily
+          # initializes gate entries for any newly-configured gates. This means adding
+          # a gate to config and calling gate_states on a persisted task will insert a
+          # new "pending" entry automatically. Do not refactor into a pure reader.
           def gate_states(task)
             migrate_legacy_gate_state!(task)
             task["gate_states"] ||= {}
