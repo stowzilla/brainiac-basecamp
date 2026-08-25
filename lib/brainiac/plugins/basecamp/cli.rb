@@ -264,41 +264,67 @@ module Brainiac
               puts "✓ Added bot account '#{name}' (person_id: #{person_id}, agent: #{agent})"
 
             when "sync"
-              # Auto-resolve person IDs for all configured bot accounts
+              # Auto-discover agents from ~/.brainiac/agents.json and resolve their
+              # Basecamp person IDs. Creates bot_account entries for any that match.
               config = load_config
-              bots = config["bot_accounts"] || {}
-              if bots.empty?
-                puts "No bot accounts configured. Add one first:"
-                puts "  brainiac basecamp bot add Galen"
+              config["bot_accounts"] ||= {}
+
+              agents = load_agents_registry
+              if agents.empty?
+                puts "No agents found in ~/.brainiac/agents.json"
                 return
               end
 
-              puts "Syncing person IDs from Basecamp..."
+              puts "Syncing bot accounts from agents registry..."
+              puts "Found #{agents.size} agent(s): #{agents.map { |_k, v| v['display_name'] || _k }.join(', ')}"
+              puts ""
+
+              added = 0
               updated = 0
-              bots.each do |name, account|
-                agent = account["default_agent"]
-                resolved_id = auto_resolve_person_id(agent)
+              not_found = 0
+
+              agents.each do |key, agent_config|
+                display_name = agent_config["display_name"] || key.capitalize
+                # Skip the meta "brainiac" agent
+                next if key == "brainiac"
+
+                resolved_id = auto_resolve_person_id(display_name)
+
                 if resolved_id
-                  if account["person_id"].to_s != resolved_id.to_s
-                    account["person_id"] = resolved_id
-                    updated += 1
-                    puts "  ✓ #{agent}: #{resolved_id}"
+                  existing = config["bot_accounts"].find { |_k, v| v["default_agent"] == display_name }
+
+                  if existing
+                    _existing_key, existing_account = existing
+                    if existing_account["person_id"].to_s != resolved_id.to_s
+                      existing_account["person_id"] = resolved_id
+                      updated += 1
+                      puts "  \u2191 #{display_name}: updated person_id \u2192 #{resolved_id}"
+                    else
+                      puts "  \u00b7 #{display_name}: #{resolved_id} (unchanged)"
+                    end
                   else
-                    puts "  · #{agent}: #{resolved_id} (unchanged)"
+                    # Create new bot_account entry using agent key as the account name
+                    config["bot_accounts"][key] = {
+                      "person_id" => resolved_id,
+                      "default_agent" => display_name
+                    }
+                    added += 1
+                    puts "  + #{display_name}: #{resolved_id} (new)"
                   end
                 else
-                  puts "  ✗ #{agent}: not found in Basecamp"
+                  puts "  \u2717 #{display_name}: not found in Basecamp"
+                  not_found += 1
                 end
               end
 
-              if updated.positive?
+              if (added + updated).positive?
                 save_config(config)
-                puts "\n✓ Updated #{updated} bot account(s)"
+                puts ""
+                puts "\u2713 Added #{added}, updated #{updated} bot account(s)" if added.positive? || updated.positive?
               else
-                puts "\nAll person IDs already up to date."
+                puts "\nAll bot accounts already up to date."
               end
-
-            when "list"
+              puts "  (#{not_found} agent(s) not found in Basecamp)" if not_found.positive?
               config = load_config
               bots = config["bot_accounts"] || {}
               if bots.empty?
@@ -868,6 +894,18 @@ module Brainiac
 
             # Otherwise first contains-match
             candidates.first&.dig("id")&.to_s
+          end
+
+          # Load the agents registry from ~/.brainiac/agents.json
+          #
+          # @return [Hash] Agent key => config hash
+          def load_agents_registry
+            agents_file = File.join(BRAINIAC_DIR, "agents.json")
+            return {} unless File.exist?(agents_file)
+
+            JSON.parse(File.read(agents_file))
+          rescue JSON::ParserError
+            {}
           end
 
           def load_config
