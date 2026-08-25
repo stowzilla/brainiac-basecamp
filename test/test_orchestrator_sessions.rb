@@ -63,10 +63,14 @@ class TestOrchestratorSessions < Minitest::Test
     Brainiac::Plugins::Basecamp::Hooks.send(:register_agent_completed)
 
     Orchestrator.stub(:find_epic_for_card, epic) do
-      Brainiac.emit(:agent_completed, source: :fizzy, card_number: 1234,
-                    agent_name: "Kaylee",
-                    exit_status: 1,
-                    signaled: false)
+      Brainiac.emit(
+        :agent_completed,
+        source: :fizzy,
+        card_number: 1234,
+        agent_name: "Kaylee",
+        exit_status: 1,
+        signaled: false
+      )
     end
 
     refute Registry.implementation_alive?(1234)

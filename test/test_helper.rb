@@ -9,7 +9,7 @@ rescue LoadError
   # Minitest 6 removed the mock extension. Keep the test suite runnable with
   # the system Ruby as well as the project's Minitest 5 dependency.
   class Object
-    def stub(method_name, value, &block)
+    def stub(method_name, value, &)
       singleton = class << self; self; end
       original = "__test_original_#{method_name}"
       singleton.alias_method(original, method_name)
