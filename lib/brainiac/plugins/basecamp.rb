@@ -52,149 +52,122 @@ module Brainiac
             LOG.info "[Basecamp] #{active.size} active epic(s) in progress"
             active.each { |e| LOG.info "[Basecamp]   - #{e['title']} (#{e['tasks']&.count { |t| t['status'] == 'complete' }}/#{e['tasks']&.size} complete)" }
 
-            # Resume active epics in background after server is ready
+            # Reconcile active epics in background after server is ready. The
+            # session registry was cleared above, so this treats all inherited
+            # agent sessions as dead and safely starts fresh work where needed.
             Thread.new do
               sleep 10 # Wait for server to fully start
-              resume_active_epics(active)
+              reconcile_active_epics(active, triggered_by: "startup_recovery")
             rescue StandardError => e
-              LOG.error "[Basecamp] Error resuming epics: #{e.message}" if defined?(LOG)
+              LOG.error "[Basecamp:Recovery] Startup reconciliation failed: #{e.message}" if defined?(LOG)
             end
           end
 
-          # Start background health check thread for active epics
+          # Start the periodic recovery loop for active epics.
           start_epic_health_monitor
 
           LOG.info "[Basecamp] Plugin registered (webhook: /basecamp, review_gate: #{Config.review_gate})"
         end
 
-        # Background thread that periodically checks for stuck epic states and auto-heals.
-        # Runs every 90 seconds to catch:
-        # - final_decision tasks where PR is already merged
-        # - in_flight tasks where impl agent isn't assigned
-        # - in_review tasks where all gates have actually approved (webhook missed)
-        # - dead sessions that need reaping
+        # Background thread that periodically runs the same reconciliation used
+        # after startup. Recovery owns liveness reaping and state repair; normal
+        # hooks own the immediate event path.
         def start_epic_health_monitor
           @health_monitor_thread = Thread.new do
             loop do
               sleep 90  # Check every 90 seconds
 
               begin
-                # Reap dead sessions and sweep old entries
-                SessionRegistry.reap_dead!
-                SessionRegistry.sweep!
-
-                active_epics = Orchestrator.active_epics
-                next if active_epics.empty?
-
-                active_epics.each do |epic|
-                  health_check_epic(epic)
-                end
+                reconcile_active_epics(Orchestrator.active_epics, triggered_by: "periodic_recovery")
               rescue StandardError => e
-                LOG.error "[Basecamp:HealthCheck] Error: #{e.message}" if defined?(LOG)
+                LOG.error "[Basecamp:Recovery] Periodic reconciliation failed: #{e.message}" if defined?(LOG)
               end
             end
           end
           @health_monitor_thread.abort_on_exception = false
         end
 
-        # Check an epic for stuck states and auto-heal
-        def health_check_epic(epic)
-          healed_any = false
+        # The sole restart/periodic reconciliation entry point. It deliberately
+        # uses the exact transitions and gate-state operations used by hooks.
+        def reconcile_active_epics(epics = Orchestrator.active_epics, triggered_by: "recovery")
+          SessionRegistry.reap_dead!
+          SessionRegistry.sweep!
+          epics.each { |epic| reconcile_epic(epic, triggered_by: triggered_by) }
+        end
 
-          epic["tasks"]&.each do |task|
-            card_number = task["fizzy_card"]
-            status = task["status"]
-            pr_number = task["pr_number"]
-            project_key = task["project"]
-            case status
-            when "final_decision"
-              # Check if PR is already merged
-              if pr_number && project_key
-                projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
-                projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
-                github_repo = projects.dig(project_key, "github_repo")
+        def reconcile_epic(epic, triggered_by: "recovery")
+          tasks = epic["tasks"] || []
+          tasks.each { |task| TaskState.migrate!(task, triggered_by: triggered_by) }
 
-                if github_repo
-                  pr_state, = Open3.capture2("gh", "pr", "view", pr_number.to_s, "--repo", github_repo, "--json", "state", "-q", ".state")
-                  if pr_state.strip == "MERGED"
-                    LOG.info "[Basecamp:HealthCheck] PR ##{pr_number} merged but task ##{card_number} stuck in final_decision — healing" if defined?(LOG)
-                    Orchestrator.on_card_completed(card_number)
-                    healed_any = true
-                  end
-                end
-              end
-            when "in_flight"
-              # Check implementation-agent liveness via SessionRegistry.
-              session_alive = SessionRegistry.any_alive_for_card?(card_number)
-              if session_alive
-                # Agent is running — nothing to heal
-                next
-              end
-
-              dispatched_at = task["dispatched_at"]
-              if dispatched_at
-                elapsed = Time.now - Time.parse(dispatched_at)
-                # Only re-dispatch if enough time has passed (agent may not have registered yet)
-                if elapsed > STALE_DISPATCH_TIMEOUT
-                  impl_agent = epic["agent"]
-                  LOG.info "[Basecamp:HealthCheck] Task ##{card_number} in_flight with no live session (elapsed #{elapsed.round}s) — re-dispatching #{impl_agent}" if defined?(LOG)
-
-                  # Re-dispatch by re-assigning the card (triggers webhook)
-                  task["dispatched_at"] = Time.now.iso8601
-                  fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
-                  if fizzy_user_id
-                    Hooks.send(:safe_assign_card, card_number, fizzy_user_id)
-                    healed_any = true
-                  end
-                end
-              elsif ReviewGate.changes_requested?(task)
-                # Recover a changes-requested task with no dispatch timestamp.
-                impl_agent = epic["agent"]
-                LOG.info "[Basecamp:HealthCheck] Task ##{card_number} in_flight with changes_requested but no dispatched_at — re-dispatching #{impl_agent}" if defined?(LOG)
-                task["dispatched_at"] = Time.now.iso8601
-                fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
-                if fizzy_user_id
-                  Hooks.send(:safe_assign_card, card_number, fizzy_user_id)
-                  healed_any = true
-                end
-              end
-
-            when "in_review"
-              healed_any = heal_in_review_task(epic, task, card_number, pr_number, project_key) || healed_any
-            end
-          end
-
-          # If we healed anything, check if we can dispatch more tasks
-          if healed_any
-            Orchestrator.send(:dispatch_unblocked_tasks, epic)
+          if tasks.any? && tasks.all? { |task| TaskState.in?(task, :complete) }
+            tasks.each { |task| Orchestrator.send(:mark_todo_complete, epic, task["fizzy_card"]) }
+            Orchestrator.send(:complete_epic, epic)
             Orchestrator.send(:save_epic, epic)
+            return true
           end
+
+          # Reconcile every task in this pass. `Enumerable#any?` would stop at
+          # the first repaired task and defer later repairs to the next sweep.
+          changed = tasks.map do |task|
+            reconcile_task(epic, task, triggered_by: triggered_by)
+          end.any?
+
+          Orchestrator.send(:dispatch_unblocked_tasks, epic) if changed
+          Orchestrator.send(:save_epic, epic) if changed
+          changed
         end
 
         private
 
-        def heal_in_review_task(epic, task, card_number, pr_number, project_key)
+        def reconcile_task(epic, task, triggered_by:)
+          case TaskState.state(task)
+          when "in_flight"
+            reconcile_in_flight_task(epic, task)
+          when "in_review"
+            reconcile_in_review_task(epic, task, triggered_by: triggered_by)
+          when "final_decision"
+            reconcile_final_decision_task(epic, task)
+          else
+            false
+          end
+        end
+
+        def reconcile_in_flight_task(epic, task)
+          card_number = task["fizzy_card"]
+          return false if SessionRegistry.alive?("implementation-#{card_number}")
+          return false unless stale_dispatch?(task)
+
+          agent = Orchestrator.send(:resolve_agent_for_project, task["project"]) || epic["agent"]
+          return false unless (fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, agent))
+
+          LOG.info "[Basecamp:Recovery] Re-dispatching implementation for ##{card_number}; no live session" if defined?(LOG)
+          task["dispatched_at"] = Time.now.iso8601
+          Hooks.send(:safe_assign_card, card_number, fizzy_user_id)
+          true
+        end
+
+        def reconcile_in_review_task(epic, task, triggered_by:)
+          card_number = task["fizzy_card"]
+          pr_number = task["pr_number"]
+          project_key = task["project"]
           return false unless pr_number && project_key && ReviewGate.enabled?
 
-          projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
-          projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+          projects = projects_config
           repo_path = projects.dig(project_key, "repo_path")
           github_repo = projects.dig(project_key, "github_repo")
           return false unless repo_path
 
           ReviewGate.sync_from_github(task, repo_path: repo_path)
           if ReviewGate.all_gates_passed?(task)
-            LOG.info "[Basecamp:HealthCheck] All gates passed for ##{card_number} but still in_review — healing" if defined?(LOG)
-            task["status"] = "final_decision"
+            LOG.info "[Basecamp:Recovery] All gates passed for ##{card_number}; dispatching final decision" if defined?(LOG)
+            TaskState.transition!(task, :approve, triggered_by: triggered_by, guard: ReviewGate.all_gates_passed?(task))
             task["awaiting_final_decision"] = true
-            Hooks.send(:save_epic_state, epic)
             Hooks.send(:dispatch_final_decision, epic, task, {})
             return true
           end
 
           if ReviewGate.all_gates_responded?(task) && ReviewGate.changes_requested?(task)
-            recover_changes_requested_task(epic, task, card_number)
-            return true
+            return recover_changes_requested_task(epic, task, triggered_by: triggered_by)
           end
           return false unless github_repo
 
@@ -202,149 +175,58 @@ module Brainiac
             epic: epic, task: task, pr_number: pr_number,
             repo_name: github_repo, repo_path: repo_path
           )
-          Hooks.send(:save_epic_state, epic) if dispatched.any?
           dispatched.any?
         end
 
-        def recover_changes_requested_task(epic, task, card_number)
-          impl_agent = epic["agent"]
-          card_json, = Open3.capture2("fizzy", "card", "show", card_number.to_s, "--json")
-          card_data = JSON.parse(card_json) rescue {}
-          assignee_names = (card_data.dig("data", "assignees") || []).map { |assignee| assignee["name"]&.downcase }
-
-          LOG.info "[Basecamp:HealthCheck] All gates responded for ##{card_number} with changes_requested — transitioning to in_flight" if defined?(LOG)
-          task["status"] = "in_flight"
-          Hooks.send(:save_epic_state, epic)
-          return if assignee_names.include?(impl_agent.downcase)
-
-          fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
-          Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id) if fizzy_user_id
-        end
-
-        # Resume active epics on server startup.
-        # For each epic, checks task states and takes appropriate action.
-        def resume_active_epics(epics)
-          epics.each do |epic|
-            LOG.info "[Basecamp] Resuming epic: #{epic['title']}" if defined?(LOG)
-
-            # Check if all tasks are complete — finalize the epic
-            if epic["tasks"]&.all? { |t| t["status"] == "complete" }
-              LOG.info "[Basecamp] Resume: all tasks complete — finalizing epic" if defined?(LOG)
-
-              # Mark each Basecamp todo as complete (in case they weren't marked during normal flow)
-              epic["tasks"].each do |task|
-                Orchestrator.send(:mark_todo_complete, epic, task["fizzy_card"])
-              end
-
-              Orchestrator.send(:complete_epic, epic)
-              Orchestrator.send(:save_epic, epic)
-              next
-            end
-
-            epic["tasks"]&.each do |task|
-              card_number = task["fizzy_card"]
-              status = task["status"]
-              LOG.info "[Basecamp] Resume: task ##{card_number} status=#{status}" if defined?(LOG)
-
-              case status
-              when "in_review", "in_flight"
-                # Sync gate state from GitHub and decide next action
-                resume_in_review_task(epic, task)
-              when "final_decision"
-                # Final decision was pending — check if we can merge
-                resume_final_decision_task(epic, task)
-              when "pending"
-                # Check if dependencies are met and dispatch
-                # (This is handled by dispatch_unblocked_tasks normally)
-                next
-              end
-            end
-
-            # Dispatch any unblocked tasks
-            Orchestrator.send(:dispatch_unblocked_tasks, epic)
-          end
-        end
-
-        def resume_in_review_task(epic, task)
+        def recover_changes_requested_task(epic, task, triggered_by:)
           card_number = task["fizzy_card"]
+          return false if SessionRegistry.alive?("implementation-#{card_number}")
+
+          agent = Orchestrator.send(:resolve_agent_for_project, task["project"]) || epic["agent"]
+          return false unless (fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, agent))
+
+          TaskState.transition!(task, :request_changes, triggered_by: triggered_by)
+          task["dispatched_at"] = Time.now.iso8601
+          Hooks.send(:safe_assign_card, card_number, fizzy_user_id)
+          true
+        end
+
+        def reconcile_final_decision_task(epic, task)
           pr_number = task["pr_number"]
-
-          unless pr_number
-            LOG.info "[Basecamp] Task ##{card_number} has no PR yet — skipping resume" if defined?(LOG)
-            return
-          end
-
-          # Get project config for repo path
           project_key = task["project"]
-          projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
-          projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
-          repo_path = projects.dig(project_key, "repo_path")
+          return false unless pr_number && project_key
 
-          unless repo_path
-            LOG.warn "[Basecamp] No repo_path for project #{project_key}" if defined?(LOG)
-            return
-          end
-
-          # Sync gate approvals from GitHub
-          sync_result = ReviewGate.sync_from_github(task, repo_path: repo_path)
-          if sync_result[:synced]
-            changes = sync_result[:changes] || {}
-            if changes[:approvals_added]&.any?
-              LOG.info "[Basecamp] Resume: synced approvals for ##{card_number}: #{changes[:approvals_added].join(', ')}" if defined?(LOG)
+          projects = projects_config
+          github_repo = projects.dig(project_key, "github_repo")
+          if github_repo
+            pr_state, = Open3.capture2("gh", "pr", "view", pr_number.to_s, "--repo", github_repo, "--json", "state", "-q", ".state")
+            if pr_state.strip == "MERGED"
+              Orchestrator.on_card_completed(task["fizzy_card"])
+              return true
             end
           end
 
-          # Check if all gates have approved
-          if ReviewGate.all_gates_passed?(task)
-            LOG.info "[Basecamp] Resume: all gates passed for ##{card_number} — dispatching final decision" if defined?(LOG)
-            TaskState.transition!(task, :approve, triggered_by: "startup_resume", guard: ReviewGate.all_gates_passed?(task))
-            task["awaiting_final_decision"] = true
-            Hooks.send(:save_epic_state, epic)
-            Hooks.send(:dispatch_final_decision, epic, task, {})
-          elsif ReviewGate.changes_requested?(task)
-            # Gates requested changes — after a restart, no agent session is running even if assigned.
-            # Always re-dispatch the impl agent to address the feedback.
-            impl_agent = epic["agent"]
-            LOG.info "[Basecamp] Resume: ##{card_number} has changes requested — re-dispatching #{impl_agent}" if defined?(LOG)
+          card_number = task["fizzy_card"]
+          return false if SessionRegistry.alive?("final-decision-#{card_number}")
+          return false unless task["awaiting_final_decision"] || ReviewGate.all_gates_passed?(task)
 
-            # Transition to in_flight so the agent gets the right context
-            TaskState.transition!(task, :request_changes, triggered_by: "startup_resume")
-            Hooks.send(:save_epic_state, epic)
-
-            # Re-assign card to trigger a fresh dispatch via the Fizzy webhook
-            fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, impl_agent)
-            if fizzy_user_id
-              Hooks.send(:safe_assign_card, card_number, fizzy_user_id)
-            end
-          else
-            github_repo = projects.dig(project_key, "github_repo")
-            unless github_repo
-              LOG.warn "[Basecamp] Resume: ##{card_number} — cannot dispatch gates, no github_repo for #{project_key}" if defined?(LOG)
-              return
-            end
-
-            dispatched = ReviewGate.redispatch_stale_gates(
-              epic: epic, task: task, pr_number: pr_number,
-              repo_name: github_repo, repo_path: repo_path
-            )
-            Hooks.send(:save_epic_state, epic) if dispatched.any?
-          end
+          task["awaiting_final_decision"] = true
+          Hooks.send(:dispatch_final_decision, epic, task, {})
+          true
         end
 
-        def resume_final_decision_task(epic, task)
-          card_number = task["fizzy_card"]
-          LOG.info "[Basecamp] Resume: checking final_decision task ##{card_number}, awaiting=#{task['awaiting_final_decision']}" if defined?(LOG)
+        def stale_dispatch?(task)
+          dispatched_at = task["dispatched_at"]
+          return true unless dispatched_at
 
-          # If awaiting_final_decision is set, re-dispatch
-          # Also handle the case where it's nil but gates are all approved (stale state)
-          if task["awaiting_final_decision"] || ReviewGate.all_gates_passed?(task)
-            LOG.info "[Basecamp] Resume: dispatching final decision for ##{card_number}" if defined?(LOG)
-            task["awaiting_final_decision"] = true
-            Hooks.send(:save_epic_state, epic)
-            Hooks.send(:dispatch_final_decision, epic, task, {})
-          else
-            LOG.info "[Basecamp] Resume: final_decision task ##{card_number} not ready (awaiting=#{task['awaiting_final_decision']}, gates_passed=#{ReviewGate.all_gates_passed?(task)})" if defined?(LOG)
-          end
+          Time.now - Time.parse(dispatched_at) > STALE_DISPATCH_TIMEOUT
+        rescue ArgumentError
+          true
+        end
+
+        def projects_config
+          projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
+          File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
         end
 
         def setup_routes(app)
