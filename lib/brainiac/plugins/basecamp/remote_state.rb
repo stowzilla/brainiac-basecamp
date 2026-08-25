@@ -290,11 +290,17 @@ module Brainiac
           def parse_document_content(content)
             return nil if content.nil? || content.empty?
 
-            # Decode HTML entities first, then strip tags.
-            # Order matters: decoding before stripping ensures that entity-encoded
-            # tags (e.g. &lt;script&gt;) are caught by the tag removal pass.
-            text = content.gsub("&lt;", "<").gsub("&gt;", ">").gsub("&amp;", "&").gsub("&quot;", "\"")
-            text = text.gsub(/<[^>]+>/, "").strip
+            # Strip HTML tags and decode entities in a loop until stable.
+            # Looping prevents incomplete sanitization where nested/encoded tags
+            # (e.g. &lt;scr&lt;script&gt;ipt&gt;) survive a single pass.
+            text = content.dup
+            loop do
+              prev = text
+              text = text.gsub(/<[^>]+>/, "")
+              text = text.gsub("&lt;", "<").gsub("&gt;", ">").gsub("&amp;", "&").gsub("&quot;", "\"")
+              break if text == prev
+            end
+            text = text.strip
 
             return nil if text.empty?
 
