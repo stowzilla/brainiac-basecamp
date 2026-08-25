@@ -5,8 +5,11 @@ require_relative "test_helper"
 class TestReviewGate < Minitest::Test
   ReviewGate = Brainiac::Plugins::Basecamp::ReviewGate
   Config = Brainiac::Plugins::Basecamp::Config
+  Registry = Brainiac::Plugins::Basecamp::SessionRegistry
 
   def setup
+    Registry.reset!
+    Registry.suppress_global_forward = true
     config = {
       "review_gates" => [
         { "agent" => "Avon", "role" => "test-engineer" },
@@ -84,6 +87,23 @@ class TestReviewGate < Minitest::Test
     state = ReviewGate.gate_states(review_task)["avon"]
     assert_equal "dispatched", state["status"]
     assert_equal 2, state["dispatch_count"]
+  end
+
+  def test_live_session_blocks_redispatch_of_a_stale_gate
+    review_task = task
+    ReviewGate.gate_states(review_task)["avon"].merge!(
+      "status" => "dispatched", "dispatched_at" => (Time.now - 301).iso8601, "dispatch_count" => 1
+    )
+    ReviewGate.gate_states(review_task)["brainiac"]["status"] = "approved"
+    Registry.register_session("gate-avon-1224", Process.pid, card_number: 1224)
+
+    assert_empty ReviewGate.redispatch_stale_gates(
+      epic: { "id" => "epic-1", "title" => "Test" }, task: review_task,
+      pr_number: 12, repo_name: "stowzilla/test", repo_path: Dir.pwd
+    )
+    state = ReviewGate.gate_states(review_task)["avon"]
+    assert_equal "dispatched", state["status"]
+    assert_equal 1, state["dispatch_count"]
   end
 
   def test_gate_times_out_after_its_redispatch_budget

@@ -70,4 +70,59 @@ class TestRecovery < Minitest::Test
     assert_equal "test_recovery", task.fetch("transitions").last.fetch("triggered_by")
     assert dispatched
   end
+
+  def test_final_decision_reconciliation_completes_a_merged_pr
+    decision_task = task(status: "final_decision").merge("pr_number" => 21)
+    completed_card = nil
+
+    Basecamp.stub(:projects_config, { "brainiac-basecamp" => { "github_repo" => "example/repo" } }) do
+      Open3.stub(:capture2, ["MERGED\n", nil]) do
+        Orchestrator.stub(:on_card_completed, ->(card) { completed_card = card }) do
+          assert Basecamp.send(:reconcile_final_decision_task, {}, decision_task)
+        end
+      end
+    end
+
+    assert_equal 1226, completed_card
+  end
+
+  def test_final_decision_reconciliation_redispatches_when_no_session_is_live
+    decision_task = task(status: "final_decision").merge("pr_number" => 21, "awaiting_final_decision" => true)
+    dispatched = false
+
+    Basecamp.stub(:projects_config, {}) do
+      Hooks.stub(:dispatch_final_decision, ->(*) { dispatched = true }) do
+        assert Basecamp.send(:reconcile_final_decision_task, { "id" => "epic-1" }, decision_task)
+      end
+    end
+
+    assert dispatched
+    assert decision_task["awaiting_final_decision"]
+  end
+
+  def test_reconcile_epic_finalizes_when_all_tasks_are_complete
+    epic = {
+      "id" => "epic-1",
+      "tasks" => [task(status: "complete"), task(status: "complete").merge("fizzy_card" => 1227)]
+    }
+    completed_cards = []
+    saved = false
+
+    Orchestrator.stub(:mark_todo_complete, ->(_epic, card) { completed_cards << card }) do
+      Orchestrator.stub(:complete_epic, ->(completed_epic) { completed_epic["status"] = "complete" }) do
+        Orchestrator.stub(:save_epic, ->(_epic) { saved = true }) do
+          assert Basecamp.reconcile_epic(epic, triggered_by: "test_recovery")
+        end
+      end
+    end
+
+    assert_equal [1226, 1227], completed_cards
+    assert_equal "complete", epic["status"]
+    assert saved
+  end
+
+  def test_stale_dispatch_treats_missing_and_malformed_timestamps_as_stale
+    assert Basecamp.send(:stale_dispatch?, task.merge("dispatched_at" => nil))
+    assert Basecamp.send(:stale_dispatch?, task.merge("dispatched_at" => "not-a-time"))
+  end
 end
