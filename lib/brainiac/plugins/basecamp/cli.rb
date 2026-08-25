@@ -2,6 +2,8 @@
 
 require "json"
 require "open3"
+require_relative "config"
+require_relative "epic"
 
 module Brainiac
   module Plugins
