@@ -181,8 +181,6 @@ module Brainiac
               if review_state == "approved"
                 LOG.info "[Basecamp:Hooks] Gate APPROVED: #{agent_name} (#{role}) on card ##{card_number}" if defined?(LOG)
                 ReviewGate.record_approval(task, agent: agent_name, role: role)
-                # Clear this gate from changes_requested if it was there
-                task["changes_requested_by"]&.delete(agent_name)
                 epic["updated_at"] = Time.now.iso8601
 
                 if ReviewGate.all_gates_passed?(task)
@@ -195,17 +193,15 @@ module Brainiac
                     LOG.error "[Basecamp:Hooks] Final decision dispatch failed: #{e.message}" if defined?(LOG)
                   end
                 else
-                  approvals = task["gate_approvals"] || []
-                  remaining = ReviewGate.gates.size - approvals.size
-                  LOG.info "[Basecamp:Hooks] #{approvals.size}/#{ReviewGate.gates.size} gates passed, #{remaining} remaining" if defined?(LOG)
+                  approved = ReviewGate.gate_states(task).values.count { |state| state["status"] == "approved" }
+                  remaining = ReviewGate.gates.size - approved
+                  LOG.info "[Basecamp:Hooks] #{approved}/#{ReviewGate.gates.size} gates passed, #{remaining} remaining" if defined?(LOG)
                   save_epic_state(epic)
                 end
               elsif review_state == "changes_requested"
                 LOG.info "[Basecamp:Hooks] Gate CHANGES_REQUESTED: #{agent_name} (#{role}) on card ##{card_number}" if defined?(LOG)
 
-                # Track which gates requested changes
-                task["changes_requested_by"] ||= []
-                task["changes_requested_by"] << agent_name unless task["changes_requested_by"].include?(agent_name)
+                ReviewGate.record_changes_requested(task, agent: agent_name, role: role)
 
                 # Check if all gates have now responded (either approved or requested changes)
                 all_responded = all_gates_responded?(task)
@@ -226,7 +222,7 @@ module Brainiac
                   end
                 else
                   # Wait for remaining gates to respond
-                  responded = (task["gate_approvals"]&.size || 0) + (task["changes_requested_by"]&.size || 0)
+                  responded = ReviewGate.responded_count(task)
                   remaining = ReviewGate.gates.size - responded
                   LOG.info "[Basecamp:Hooks] #{responded}/#{ReviewGate.gates.size} gates responded, waiting for #{remaining} more" if defined?(LOG)
                   save_epic_state(epic)
@@ -243,7 +239,7 @@ module Brainiac
                       next unless epic_reloaded
 
                       task_reloaded = epic_reloaded["tasks"]&.find { |t| t["fizzy_card"] == card_number.to_i }
-                      if task_reloaded && task_reloaded["status"] == "in_review" && task_reloaded["changes_requested_by"]&.any?
+                      if task_reloaded && task_reloaded["status"] == "in_review" && ReviewGate.changes_requested?(task_reloaded)
                         LOG.info "[Basecamp:Hooks] Debounce timeout for card ##{card_number} — forcing dispatch" if defined?(LOG)
                         task_reloaded["status"] = "in_flight"
                         task_reloaded.delete("changes_debounce_started")
@@ -263,12 +259,7 @@ module Brainiac
 
           # Check if all configured gates have responded (either approved or requested changes)
           def all_gates_responded?(task)
-            approvals = (task["gate_approvals"] || []).map { |a| a["agent"].downcase }
-            changes = (task["changes_requested_by"] || []).map(&:downcase)
-            responded = approvals + changes
-
-            required = ReviewGate.gates.map { |g| g["agent"].downcase }
-            required.all? { |agent| responded.include?(agent) }
+            ReviewGate.all_gates_responded?(task)
           end
 
           # Match a GitHub reviewer login to a configured gate agent.
@@ -442,8 +433,9 @@ module Brainiac
                   # Final decision mode — agent reads gate feedback and decides
                   if current_task["awaiting_final_decision"]
                     pr_number = current_task["pr_number"]
-                    approvals = current_task["gate_approvals"] || []
-                    gate_agents = approvals.map { |a| a["agent"] }.join(", ")
+                    gate_agents = ReviewGate.gate_states(current_task).values
+                                            .select { |state| state["status"] == "approved" }
+                                            .map { |state| state["agent"] }.join(", ")
 
                     context_lines << ""
                     context_lines << "## ⚡ FINAL DECISION REQUIRED"
@@ -660,8 +652,9 @@ module Brainiac
             end
 
             # Build prompt for final decision
-            gate_approvals = task["gate_approvals"] || []
-            gate_agents = gate_approvals.map { |a| a["agent"] }.join(", ")
+            gate_agents = ReviewGate.gate_states(task).values
+                                    .select { |state| state["status"] == "approved" }
+                                    .map { |state| state["agent"] }.join(", ")
 
             prompt = <<~PROMPT
               ## Final Decision Required — Fizzy Card ##{card_number}
