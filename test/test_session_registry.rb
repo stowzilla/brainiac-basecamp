@@ -6,6 +6,21 @@ require_relative "../lib/brainiac/plugins/basecamp/session_registry"
 class TestSessionRegistry < Minitest::Test
   Registry = Brainiac::Plugins::Basecamp::SessionRegistry
 
+  def test_tracks_fizzy_implementation_session_with_epic_metadata
+    epic = { "id" => "epic-99" }
+
+    Brainiac::Plugins::Basecamp::Orchestrator.stub(:find_epic_for_card, epic) do
+      Registry.track_global_implementation_session("card-1234", Process.pid,
+                                                   log_file: "/tmp/agent.log", agent_name: "Kaylee")
+    end
+
+    session = Registry.find_session(Registry.implementation_session_id(1234))
+    assert_equal Process.pid, session["pid"]
+    assert_equal "Kaylee", session["agent_name"]
+    assert_equal "epic-99", session["epic_id"]
+    assert_equal 1234, session["card_number"]
+  end
+
   def setup
     Registry.reset!
     Registry.suppress_global_forward = true

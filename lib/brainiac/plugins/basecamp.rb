@@ -35,6 +35,7 @@ module Brainiac
 
           # Clear all sessions on startup — PIDs from prior runs are untrustworthy
           SessionRegistry.clear_all!
+          SessionRegistry.install_global_registration_hook!
 
           # Register lifecycle hooks
           Hooks.register_all!

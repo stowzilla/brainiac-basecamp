@@ -36,13 +36,21 @@ module Brainiac
           def register_agent_completed
             Brainiac.on(:agent_completed) do |ctx|
               next unless ctx[:source] == :fizzy
-              next unless ctx[:exit_status]&.zero? && !ctx[:signaled]
 
               card_number = ctx[:card_number]
               next unless card_number
 
               epic = Orchestrator.find_epic_for_card(card_number)
               next unless epic
+
+              implementation_session = SessionRegistry.find_session(
+                SessionRegistry.implementation_session_id(card_number)
+              )
+              if implementation_session && implementation_session["agent_name"].to_s.casecmp?(ctx[:agent_name].to_s)
+                SessionRegistry.mark_dead(implementation_session["task_id"])
+              end
+
+              next unless ctx[:exit_status]&.zero? && !ctx[:signaled]
 
               review_gate = epic["review_gate"] || Config.review_gate
 
@@ -721,16 +729,6 @@ module Brainiac
               )
               LOG.info "[Basecamp:Hooks] Spawned #{agent_name} (pid #{pid}) for final decision on card ##{card_number}" if defined?(LOG)
             end
-          end
-
-          def mark_in_review(epic, card_number)
-            task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
-            return unless task
-
-            TaskState.transition!(task, :submit_for_review, triggered_by: "pr_merge_wait")
-            task["review_started_at"] = Time.now.iso8601
-            epic["updated_at"] = Time.now.iso8601
-            save_epic_state(epic)
           end
 
           def auto_merge_and_advance(epic, card_number, ctx)

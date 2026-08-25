@@ -30,6 +30,7 @@ module Brainiac
       module SessionRegistry
         BRAINIAC_DIR = ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac"))
         SESSIONS_FILE = File.join(BRAINIAC_DIR, "basecamp_sessions.json")
+        IMPLEMENTATION_SESSION_PREFIX = "implementation-"
 
         class << self
           # Register an active agent session.
@@ -137,6 +138,62 @@ module Brainiac
                 s["status"] == "active" &&
                 pid_alive?(s["pid"])
             end
+          end
+
+          # Stable task ID for the implementation agent assigned to a Fizzy card.
+          # Keep this distinct from gate and final-decision IDs so a live reviewer
+          # cannot prevent implementation work from being re-dispatched.
+          def implementation_session_id(card_number)
+            "#{IMPLEMENTATION_SESSION_PREFIX}#{card_number.to_i}"
+          end
+
+          def implementation_alive?(card_number)
+            alive?(implementation_session_id(card_number))
+          end
+
+          # Mirror Fizzy's real implementation-agent spawn into this registry.
+          # Fizzy invokes the global register_session("card-<number>", pid) immediately
+          # after run_agent returns; Basecamp installs a small observer around that
+          # method so it can attach epic metadata without duplicating Fizzy dispatch.
+          def track_global_implementation_session(card_key, pid, log_file: nil, agent_name: nil)
+            match = /\Acard-(\d+)\z/.match(card_key.to_s)
+            return unless match
+
+            card_number = match[1].to_i
+            epic = Orchestrator.find_epic_for_card(card_number)
+            return unless epic
+
+            register_session(
+              implementation_session_id(card_number), pid,
+              log_file: log_file,
+              agent_name: agent_name,
+              epic_id: epic["id"],
+              card_number: card_number
+            )
+          end
+
+          # Installs the observer once the core session helper is available. Keeping
+          # the wrapper here means Basecamp remains compatible with the normal Fizzy
+          # assignment flow, while liveness remains owned by SessionRegistry.
+          def install_global_registration_hook!
+            return if @global_registration_hook_installed
+            return unless Object.private_method_defined?(:register_session)
+
+            observer = Module.new do
+              def register_session(card_key, pid, **kwargs)
+                result = super
+                Brainiac::Plugins::Basecamp::SessionRegistry.track_global_implementation_session(
+                  card_key,
+                  pid,
+                  log_file: kwargs[:log_file],
+                  agent_name: kwargs[:agent_name]
+                )
+                result
+              end
+            end
+
+            Object.prepend(observer)
+            @global_registration_hook_installed = true
           end
 
           # Get all active sessions for a card number.
