@@ -4,6 +4,7 @@ require "json"
 require "open3"
 require_relative "config"
 require_relative "epic"
+require_relative "remote_state"
 
 module Brainiac
   module Plugins
