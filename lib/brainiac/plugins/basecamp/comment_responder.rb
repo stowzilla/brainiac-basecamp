@@ -15,6 +15,10 @@ module Brainiac
       # The dispatched agent receives the comment content as a prompt with epic context,
       # and posts its reply back via Client.add_comment.
       module CommentResponder
+        # Regex for parsing Basecamp bc-attachment mention elements.
+        # Uses atomic groups (?>...) to prevent catastrophic backtracking on malformed input.
+        BC_MENTION_RE = /<bc-attachment(?>[^>]{0,1000})content-type="(?>[^"]{0,100})mention"(?>[^>]{0,1000})>@?([^<]+)<\/bc-attachment>/
+
         class << self
           # Process a comment_created webhook and dispatch the appropriate agent.
           #
@@ -177,7 +181,7 @@ module Brainiac
 
             # Strategy 1: Parse bc-attachment mentions (Basecamp's native format)
             # The sgid encodes the person — but we can match by the visible name text
-            content.scan(/<bc-attachment[^>]*content-type="[^"]*mention"[^>]*>@?([^<]+)<\/bc-attachment>/) do |match|
+            content.scan(BC_MENTION_RE) do |match|
               mention_name = match[0].strip
               bot_accounts.each do |_key, account|
                 agent = account["default_agent"]
@@ -196,14 +200,22 @@ module Brainiac
           end
 
           # Strip HTML tags but preserve mention names as readable text.
+          # Uses bounded atomic groups to prevent polynomial regex backtracking,
+          # and loops until stable to prevent incomplete sanitization (e.g. nested tags
+          # that reconstruct dangerous elements after a single pass).
           #
           # @param html [String] HTML content
           # @return [String] Clean text
           def strip_html_preserve_mentions(html)
             # Replace bc-attachment mentions with @Name
-            text = html.gsub(/<bc-attachment[^>]*content-type="[^"]*mention"[^>]*>@?([^<]+)<\/bc-attachment>/, '@\1')
-            # Strip remaining HTML tags
-            text = text.gsub(/<[^>]+>/, "")
+            text = html.gsub(BC_MENTION_RE, '@\1')
+            # Strip remaining HTML tags — loop until no tags remain to prevent
+            # incomplete sanitization (e.g. "<scr<b>ipt>" → "<script>" after one pass)
+            loop do
+              before = text
+              text = text.gsub(/<[^<>]+>/, "")
+              break if text == before
+            end
             # Clean up whitespace
             text.gsub(/\s+/, " ").strip
           end
