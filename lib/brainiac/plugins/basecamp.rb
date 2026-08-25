@@ -5,6 +5,7 @@ require_relative "basecamp/metadata"
 require_relative "basecamp/config"
 require_relative "basecamp/client"
 require_relative "basecamp/epic"
+require_relative "basecamp/task_state"
 require_relative "basecamp/epic_branch"
 require_relative "basecamp/session_registry"
 require_relative "basecamp/review_gate"
@@ -295,7 +296,7 @@ module Brainiac
           # Check if all gates have approved
           if ReviewGate.all_gates_passed?(task)
             LOG.info "[Basecamp] Resume: all gates passed for ##{card_number} — dispatching final decision" if defined?(LOG)
-            task["status"] = "final_decision"
+            TaskState.transition!(task, :approve, triggered_by: "startup_resume", guard: ReviewGate.all_gates_passed?(task))
             task["awaiting_final_decision"] = true
             Hooks.send(:save_epic_state, epic)
             Hooks.send(:dispatch_final_decision, epic, task, {})
@@ -306,7 +307,7 @@ module Brainiac
             LOG.info "[Basecamp] Resume: ##{card_number} has changes requested — re-dispatching #{impl_agent}" if defined?(LOG)
 
             # Transition to in_flight so the agent gets the right context
-            task["status"] = "in_flight"
+            TaskState.transition!(task, :request_changes, triggered_by: "startup_resume")
             Hooks.send(:save_epic_state, epic)
 
             # Re-assign card to trigger a fresh dispatch via the Fizzy webhook

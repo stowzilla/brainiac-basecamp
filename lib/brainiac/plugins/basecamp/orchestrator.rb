@@ -120,7 +120,7 @@ module Brainiac
 
             # Mark the task as complete in our state
             if task
-              task["status"] = "complete"
+              TaskState.transition!(task, :complete, triggered_by: "fizzy_card_completed")
               task["completed_at"] = Time.now.iso8601
               epic["updated_at"] = Time.now.iso8601
               log_event(epic, "task_completed", "Card ##{card_number} completed")
@@ -215,7 +215,9 @@ module Brainiac
             # Start with tasks from the API (incomplete todos)
             updated_tasks = new_tasks.map do |task|
               existing = existing_by_card[task.fizzy_card]
-              status = if task.completed
+              status = if task.completed && existing
+                         existing["status"]
+                       elsif task.completed
                          "complete"
                        elsif existing&.dig("status")
                          # Preserve existing status (in_flight, in_review, final_decision, etc.)
@@ -243,11 +245,17 @@ module Brainiac
 
               # Preserve PR and gate state from existing task
               if existing
-                %w[dispatched_at pr_number pr_repo gate_states
+                %w[dispatched_at pr_number pr_repo gates_dispatched_at gate_approvals
+                   changes_requested_by gate_redispatch_counts gate_states
                    awaiting_final_decision changes_debounce_started
-                   fizzy_internal_id].each do |key|
+                   fizzy_internal_id transitions].each do |key|
                   new_task[key] = existing[key] if existing.key?(key)
                 end
+              end
+
+              TaskState.migrate!(new_task, triggered_by: "basecamp_sync")
+              if task.completed && !TaskState.in?(new_task, :complete)
+                TaskState.transition!(new_task, :complete, triggered_by: "basecamp_todo_completed")
               end
 
               new_task
@@ -309,7 +317,7 @@ module Brainiac
             # Mark as in-flight in our state
             epic_task = epic["tasks"].find { |t| t["fizzy_card"] == card_number }
             if epic_task
-              epic_task["status"] = "in_flight"
+              TaskState.transition!(epic_task, :dispatch, triggered_by: "orchestrator_dispatch")
               epic_task["dispatched_at"] = Time.now.iso8601
             end
             epic["updated_at"] = Time.now.iso8601
@@ -357,7 +365,7 @@ module Brainiac
 
               task["pr_number"] = pr_number
               task["pr_repo"] = work_item.dig("sources", "github", "repo")
-              task["status"] = "in_review"
+              TaskState.transition!(task, :submit_for_review, triggered_by: "existing_pr_sync")
             end
           rescue StandardError => e
             LOG.warn "[Basecamp:Orchestrator] Error syncing PR state: #{e.message}" if defined?(LOG)
@@ -393,7 +401,7 @@ module Brainiac
               # Check if all gates already passed
               if ReviewGate.all_gates_passed?(task)
                 LOG.info "[Basecamp:Orchestrator] Gates already passed for card ##{card_number} — dispatching final decision" if defined?(LOG)
-                task["status"] = "final_decision"
+                TaskState.transition!(task, :approve, triggered_by: "existing_pr_gate_sync", guard: ReviewGate.all_gates_passed?(task))
                 task["awaiting_final_decision"] = true
                 # Final decision dispatch happens in resume logic
               else

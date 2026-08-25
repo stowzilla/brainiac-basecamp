@@ -227,7 +227,7 @@ module Brainiac
             end
 
             # Update task state
-            task["status"] = "in_review"
+            TaskState.transition!(task, :submit_for_review, triggered_by: "review_gate_dispatch")
 
             dispatched
           end

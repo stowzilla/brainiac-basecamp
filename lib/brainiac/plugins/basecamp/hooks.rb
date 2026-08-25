@@ -64,7 +64,7 @@ module Brainiac
 
                 if ReviewGate.enabled?
                   # Dispatch review gates in parallel after a delay (wait for PR to be created)
-                  task["status"] = "in_review"
+                  TaskState.transition!(task, :submit_for_review, triggered_by: "agent_completed")
                   epic["updated_at"] = Time.now.iso8601
                   save_epic_state(epic)
 
@@ -209,7 +209,7 @@ module Brainiac
                 if all_responded
                   # All gates have reviewed — dispatch implementation agent to address ALL feedback
                   LOG.info "[Basecamp:Hooks] All gates responded for card ##{card_number} — dispatching fixes" if defined?(LOG)
-                  task["status"] = "in_flight"
+                  TaskState.transition!(task, :request_changes, triggered_by: "review_changes_requested")
                   task.delete("changes_debounce_started")
                   save_epic_state(epic)
 
@@ -241,7 +241,7 @@ module Brainiac
                       task_reloaded = epic_reloaded["tasks"]&.find { |t| t["fizzy_card"] == card_number.to_i }
                       if task_reloaded && task_reloaded["status"] == "in_review" && ReviewGate.changes_requested?(task_reloaded)
                         LOG.info "[Basecamp:Hooks] Debounce timeout for card ##{card_number} — forcing dispatch" if defined?(LOG)
-                        task_reloaded["status"] = "in_flight"
+                        TaskState.transition!(task_reloaded, :request_changes, triggered_by: "review_changes_timeout")
                         task_reloaded.delete("changes_debounce_started")
                         save_epic_state(epic_reloaded)
                         # Re-assign card to trigger dispatch
@@ -371,7 +371,7 @@ module Brainiac
 
               # Reset approvals and re-dispatch gates
               ReviewGate.reset_approvals(task)
-              task["status"] = "in_review"
+              TaskState.transition!(task, :submit_for_review, triggered_by: "pr_synchronized")
               epic["updated_at"] = Time.now.iso8601
               save_epic_state(epic)
 
@@ -581,7 +581,7 @@ module Brainiac
             task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
             return unless task
 
-            task["status"] = "in_review"
+            TaskState.transition!(task, :submit_for_review, triggered_by: "pr_merge_wait")
             task["review_started_at"] = Time.now.iso8601
             epic["updated_at"] = Time.now.iso8601
             save_epic_state(epic)
@@ -620,7 +620,7 @@ module Brainiac
 
             # Mark task as awaiting final decision
             task["awaiting_final_decision"] = true
-            task["status"] = "final_decision"
+            TaskState.transition!(task, :approve, triggered_by: "all_gates_approved", guard: ReviewGate.all_gates_passed?(task))
             epic["updated_at"] = Time.now.iso8601
             save_epic_state(epic)
 
@@ -727,7 +727,7 @@ module Brainiac
             task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
             return unless task
 
-            task["status"] = "in_review"
+            TaskState.transition!(task, :submit_for_review, triggered_by: "pr_merge_wait")
             task["review_started_at"] = Time.now.iso8601
             epic["updated_at"] = Time.now.iso8601
             save_epic_state(epic)
@@ -777,7 +777,7 @@ module Brainiac
                 Orchestrator.on_card_completed(card_number)
               else
                 LOG.warn "[Basecamp:Hooks] Could not merge card ##{card_number} — manual intervention needed" if defined?(LOG)
-                task["status"] = "merge_failed"
+                TaskState.transition!(task, :merge_failed, triggered_by: "epic_branch_merge_failed")
                 save_epic_state(epic)
               end
             end
