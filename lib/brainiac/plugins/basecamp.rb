@@ -380,6 +380,9 @@ module Brainiac
           epics.each do |epic|
             LOG.info "[Basecamp] Resuming epic: #{epic['title']}" if defined?(LOG)
 
+            # Ensure epic memory exists (for epics that started before the feature existed)
+            EpicMemory.ensure_exists_for(epic)
+
             # Check if all tasks are complete — finalize the epic
             if epic["tasks"]&.all? { |t| t["status"] == "complete" }
               LOG.info "[Basecamp] Resume: all tasks complete — finalizing epic" if defined?(LOG)
