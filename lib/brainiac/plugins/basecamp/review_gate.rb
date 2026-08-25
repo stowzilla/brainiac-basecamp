@@ -196,7 +196,7 @@ module Brainiac
             end
 
             # Update task state
-            task["status"] = "in_review"
+            TaskState.transition!(task, :submit_for_review, triggered_by: "review_gate_dispatch")
             task["gates_dispatched_at"] = Time.now.iso8601
             task["gate_approvals"] ||= []
 
