@@ -175,12 +175,10 @@ module Brainiac
             [200, { status: "noted" }.to_json]
           end
 
-          # Handle comments on todos that are part of an epic.
-          # Could be used for @bot commands within Basecamp comments.
-          def handle_comment(_payload, recording)
-            # Future: detect @bot commands in comments
-            # e.g., "@Galen pause", "@Galen skip", "@Galen reassign to Sherlock"
-            [200, { status: "noted" }.to_json]
+          # Handle comments on epic todolists or todos within epics.
+          # Routes to the mentioned agent, last responder, or epic's default agent.
+          def handle_comment(payload, recording)
+            CommentResponder.handle(payload, recording)
           end
         end
       end

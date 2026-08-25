@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "json"
+require "open3"
 
 module Brainiac
   module Plugins
@@ -88,7 +89,7 @@ module Brainiac
             puts "  2. Add bot accounts:     brainiac basecamp bot add <name> <person-id> <agent>"
             puts "  3. Map projects:         brainiac basecamp projects map <brainiac-key> <basecamp-id>"
             puts "  4. Set review gate:      brainiac basecamp set review-gate <on_complete|on_pr_merge>"
-            puts "  5. Set up webhooks:      basecamp webhooks create \"https://your-ngrok/basecamp\" --types \"Todo,Todolist\" --in <project>"
+            puts "  5. Set up webhooks:      basecamp webhooks create \"https://your-ngrok/basecamp\" --types \"Todo,Todolist,Comment\" --in <project>"
             puts "  6. Restart brainiac:     brainiac restart"
           end
 
@@ -217,11 +218,37 @@ module Brainiac
               person_id = args.shift
               agent = args.shift
 
-              unless name && person_id && agent
-                puts "Usage: brainiac basecamp bot add <name> <basecamp-person-id> <default-agent>"
+              # If person_id is omitted but agent is given, or only agent name given,
+              # try to auto-resolve from Basecamp
+              if name && !person_id
+                # Single arg: treat as agent name, auto-resolve
+                agent = name
+                person_id = auto_resolve_person_id(agent)
+                unless person_id
+                  puts "❌ Could not find '#{agent}' in Basecamp people list."
+                  puts "   Try: basecamp people list --jq '.data[] | {id, name}'"
+                  return
+                end
+                name = agent.downcase
+              elsif name && person_id && !agent
+                # Two args: name + agent, auto-resolve person_id
+                agent = person_id
+                person_id = auto_resolve_person_id(agent)
+                unless person_id
+                  puts "❌ Could not find '#{agent}' in Basecamp people list."
+                  puts "   Provide the person_id manually:"
+                  puts "   brainiac basecamp bot add <name> <person-id> <agent>"
+                  return
+                end
+              elsif !(name && person_id && agent)
+                puts "Usage: brainiac basecamp bot add <agent-name>"
+                puts "       brainiac basecamp bot add <name> <agent-name>"
+                puts "       brainiac basecamp bot add <name> <basecamp-person-id> <agent-name>"
                 puts ""
-                puts "Example:"
-                puts "  brainiac basecamp bot add andy-server 12345 Galen"
+                puts "Examples:"
+                puts "  brainiac basecamp bot add Galen                    # auto-resolves person_id"
+                puts "  brainiac basecamp bot add andy-server Galen        # auto-resolves person_id"
+                puts "  brainiac basecamp bot add andy-server 52992796 Galen"
                 return
               end
 
@@ -233,6 +260,41 @@ module Brainiac
               }
               save_config(config)
               puts "✓ Added bot account '#{name}' (person_id: #{person_id}, agent: #{agent})"
+
+            when "sync"
+              # Auto-resolve person IDs for all configured bot accounts
+              config = load_config
+              bots = config["bot_accounts"] || {}
+              if bots.empty?
+                puts "No bot accounts configured. Add one first:"
+                puts "  brainiac basecamp bot add Galen"
+                return
+              end
+
+              puts "Syncing person IDs from Basecamp..."
+              updated = 0
+              bots.each do |name, account|
+                agent = account["default_agent"]
+                resolved_id = auto_resolve_person_id(agent)
+                if resolved_id
+                  if account["person_id"].to_s != resolved_id.to_s
+                    account["person_id"] = resolved_id
+                    updated += 1
+                    puts "  ✓ #{agent}: #{resolved_id}"
+                  else
+                    puts "  · #{agent}: #{resolved_id} (unchanged)"
+                  end
+                else
+                  puts "  ✗ #{agent}: not found in Basecamp"
+                end
+              end
+
+              if updated.positive?
+                save_config(config)
+                puts "\n✓ Updated #{updated} bot account(s)"
+              else
+                puts "\nAll person IDs already up to date."
+              end
 
             when "list"
               config = load_config
@@ -328,7 +390,9 @@ module Brainiac
                 status                                  Check plugin status
                 epics [--all]                           List active epics (--all for completed too)
                 link <card> <url>                       Link a Fizzy card to a Basecamp todo
-                bot add <name> <person-id> <agent>      Add a bot account mapping
+                bot add <agent-name>                    Add bot (auto-resolves person_id from Basecamp)
+                bot add <name> <person-id> <agent>      Add bot with explicit person_id
+                bot sync                                Re-resolve all bot person IDs from Basecamp
                 bot list                                List bot accounts
                 bot remove <name>                       Remove a bot account
                 projects map <key> <basecamp-id>        Map a Brainiac project to Basecamp
@@ -677,6 +741,30 @@ module Brainiac
                                                           "epics" => epics,
                                                           "updated_at" => Time.now.iso8601
                                                         }))
+          end
+
+          def auto_resolve_person_id(agent_name)
+            output, status = Open3.capture2(
+              "basecamp", "people", "list", "--jq",
+              ".data[] | select(.name | ascii_downcase | contains(\"#{agent_name.downcase}\")) | {id, name}"
+            )
+            return nil unless status.success? && !output.strip.empty?
+
+            # Parse each JSON line — prefer exact match
+            candidates = []
+            output.each_line do |line|
+              person = JSON.parse(line.strip)
+              candidates << person
+            rescue JSON::ParserError
+              next
+            end
+
+            # Exact name match first
+            exact = candidates.find { |p| p["name"]&.downcase == agent_name.downcase }
+            return exact["id"].to_s if exact
+
+            # Otherwise first contains-match
+            candidates.first&.dig("id")&.to_s
           end
 
           def load_config
