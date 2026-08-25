@@ -15,9 +15,8 @@ module Brainiac
       # The dispatched agent receives the comment content as a prompt with epic context,
       # and posts its reply back via Client.add_comment.
       module CommentResponder
-        # Regex for parsing Basecamp bc-attachment mention elements.
-        # Uses atomic groups (?>...) to prevent catastrophic backtracking on malformed input.
-        BC_MENTION_RE = /<bc-attachment(?>[^>]{0,1000})content-type="(?>[^"]{0,100})mention"(?>[^>]{0,1000})>@?([^<]+)<\/bc-attachment>/
+        MENTION_TAG_OPEN = "<bc-attachment"
+        MENTION_TAG_CLOSE = "</bc-attachment>"
 
         class << self
           # Process a comment_created webhook and dispatch the appropriate agent.
@@ -181,8 +180,8 @@ module Brainiac
 
             # Strategy 1: Parse bc-attachment mentions (Basecamp's native format)
             # The sgid encodes the person — but we can match by the visible name text
-            content.scan(BC_MENTION_RE) do |match|
-              mention_name = match[0].strip
+            each_basecamp_mention(content) do |mention_content|
+              mention_name = strip_html_tags(mention_content).delete_prefix("@").strip
               bot_accounts.each do |_key, account|
                 agent = account["default_agent"]
                 # Match if the mention text contains the agent name (case insensitive)
@@ -207,17 +206,85 @@ module Brainiac
           # @param html [String] HTML content
           # @return [String] Clean text
           def strip_html_preserve_mentions(html)
-            # Replace bc-attachment mentions with @Name
-            text = html.gsub(BC_MENTION_RE, '@\1')
-            # Strip remaining HTML tags — loop until no tags remain to prevent
-            # incomplete sanitization (e.g. "<scr<b>ipt>" → "<script>" after one pass)
-            loop do
-              before = text
-              text = text.gsub(/<[^<>]+>/, "")
-              break if text == before
+            text = +""
+            cursor = 0
+
+            while (tag_start = html.index("<", cursor))
+              text << html[cursor...tag_start]
+              tag_end = html.index(">", tag_start + 1)
+              break unless tag_end
+
+              tag = html[tag_start..tag_end]
+              if basecamp_mention_tag?(tag)
+                closing_start = html.index(MENTION_TAG_CLOSE, tag_end + 1)
+                break unless closing_start
+
+                mention_content = html[(tag_end + 1)...closing_start]
+                text << "@#{strip_html_tags(mention_content).delete_prefix('@').strip}"
+                cursor = closing_start + MENTION_TAG_CLOSE.size
+                next
+              end
+
+              cursor = tag_end + 1
             end
-            # Clean up whitespace
-            text.gsub(/\s+/, " ").strip
+
+            text << html[cursor..] unless cursor >= html.length || tag_start
+            text.split.join(" ")
+          end
+
+          # Iterate over the text from native Basecamp mention attachments. This uses
+          # bounded String operations rather than a backtracking regular expression,
+          # because comment content comes from an untrusted webhook payload.
+          def each_basecamp_mention(html)
+            cursor = 0
+
+            while (tag_start = html.index(MENTION_TAG_OPEN, cursor))
+              tag_end = html.index(">", tag_start + 1)
+              break unless tag_end
+
+              closing_start = html.index(MENTION_TAG_CLOSE, tag_end + 1)
+              break unless closing_start
+
+              tag = html[tag_start..tag_end]
+              yield html[(tag_end + 1)...closing_start] if basecamp_mention_tag?(tag)
+              cursor = closing_start + MENTION_TAG_CLOSE.size
+            end
+          end
+
+          # Return whether an attachment tag has a content-type value containing
+          # "mention". Basecamp uses application/vnd.basecamp.mention.
+          def basecamp_mention_tag?(tag)
+            marker = "content-type="
+            marker_start = tag.downcase.index(marker)
+            return false unless marker_start
+
+            value_start = marker_start + marker.length
+            quote = tag[value_start]
+            return false unless ['"', "'"].include?(quote)
+
+            value_end = tag.index(quote, value_start + 1)
+            return false unless value_end
+
+            tag[(value_start + 1)...value_end].downcase.include?("mention")
+          end
+
+          # Remove markup without returning a dangling '<' sequence. An unclosed tag
+          # is discarded with the remainder of the input, keeping the result safe as
+          # plain text if it is ever rendered by a downstream consumer.
+          def strip_html_tags(html)
+            text = +""
+            cursor = 0
+
+            while (tag_start = html.index("<", cursor))
+              text << html[cursor...tag_start]
+              tag_end = html.index(">", tag_start + 1)
+              return text if tag_end.nil?
+
+              cursor = tag_end + 1
+            end
+
+            text << html[cursor..]
+            text
           end
 
           # Dispatch an agent to respond to the Basecamp comment.
