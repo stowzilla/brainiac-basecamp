@@ -40,6 +40,10 @@ module Brainiac
             end
           end
 
+          # The canonical set of webhook event types this plugin needs.
+          # Add new types here as features are added — webhook sync will pick them up.
+          REQUIRED_WEBHOOK_TYPES = %w[Todo Todolist Comment].freeze
+
           private
 
           def cmd_setup
@@ -91,7 +95,8 @@ module Brainiac
             puts "  2. Add bot accounts:     brainiac basecamp bot add <name> <person-id> <agent>"
             puts "  3. Map projects:         brainiac basecamp projects map <brainiac-key> <basecamp-id>"
             puts "  4. Set review gate:      brainiac basecamp set review-gate <on_complete|on_pr_merge>"
-            puts "  5. Set up webhooks:      basecamp webhooks create \"https://your-ngrok/basecamp\" --types \"Todo,Todolist,Comment\" --in <project>"
+            puts "  5. Set up webhooks:      basecamp webhooks create \"https://your-ngrok/basecamp\" " \
+                 "--types \"Todo,Todolist,Comment\" --in <project>"
             puts "  6. Restart brainiac:     brainiac restart"
           end
 
@@ -276,7 +281,7 @@ module Brainiac
               end
 
               puts "Syncing bot accounts from agents registry..."
-              puts "Found #{agents.size} agent(s): #{agents.map { |_k, v| v['display_name'] || _k }.join(', ')}"
+              puts "Found #{agents.size} agent(s): #{agents.map { |k, v| v['display_name'] || k }.join(', ')}"
               puts ""
 
               added = 0
@@ -295,12 +300,12 @@ module Brainiac
 
                   if existing
                     _existing_key, existing_account = existing
-                    if existing_account["person_id"].to_s != resolved_id.to_s
+                    if existing_account["person_id"].to_s == resolved_id.to_s
+                      puts "  \u00b7 #{display_name}: #{resolved_id} (unchanged)"
+                    else
                       existing_account["person_id"] = resolved_id
                       updated += 1
                       puts "  \u2191 #{display_name}: updated person_id \u2192 #{resolved_id}"
-                    else
-                      puts "  \u00b7 #{display_name}: #{resolved_id} (unchanged)"
                     end
                   else
                     # Create new bot_account entry using agent key as the account name
@@ -421,10 +426,6 @@ module Brainiac
               puts "  sync    Ensure all project webhooks have the required event types"
             end
           end
-
-          # The canonical set of webhook event types this plugin needs.
-          # Add new types here as features are added — webhook sync will pick them up.
-          REQUIRED_WEBHOOK_TYPES = %w[Todo Todolist Comment].freeze
 
           def cmd_webhook_sync
             config = load_config

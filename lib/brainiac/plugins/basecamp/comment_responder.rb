@@ -26,7 +26,7 @@ module Brainiac
           # @return [Array(Integer, String)] HTTP status code and response body
           def handle(payload, recording)
             content = recording["content"] || ""
-            creator = payload.dig("creator") || {}
+            creator = payload["creator"] || {}
             creator_id = creator["id"]&.to_s
             parent = recording["parent"] || {}
             parent_type = parent["type"]
@@ -98,18 +98,16 @@ module Brainiac
 
               # Parse each JSON line (could be multiple matches)
               output.each_line do |line|
-                begin
-                  person = JSON.parse(line.strip)
-                  # Exact match preferred, otherwise first contains-match
-                  if person["name"]&.downcase == name.downcase
-                    results[name] = person["id"].to_s
-                    break
-                  elsif !results.key?(name)
-                    results[name] = person["id"].to_s
-                  end
-                rescue JSON::ParserError
-                  next
+                person = JSON.parse(line.strip)
+                # Exact match preferred, otherwise first contains-match
+                if person["name"]&.downcase == name.downcase
+                  results[name] = person["id"].to_s
+                  break
+                elsif !results.key?(name)
+                  results[name] = person["id"].to_s
                 end
+              rescue JSON::ParserError
+                next
               end
             end
 
@@ -125,7 +123,7 @@ module Brainiac
           # @param parent_title [String] Title of the parent
           # @param project_id [String] Basecamp bucket/project ID
           # @return [Hash, nil] Epic state or nil
-          def resolve_epic_for_comment(parent_type, parent_id, parent_title, project_id)
+          def resolve_epic_for_comment(parent_type, parent_id, _parent_title, _project_id)
             active_epics = Orchestrator.active_epics
 
             case parent_type
@@ -137,10 +135,6 @@ module Brainiac
               active_epics.find do |e|
                 e["tasks"]&.any? { |t| t["todo_id"].to_s == parent_id.to_s }
               end
-            else
-              # Try matching by project — comment might be on a different recording type
-              # that we linked to the epic
-              nil
             end
           end
 
@@ -182,7 +176,7 @@ module Brainiac
             # The sgid encodes the person — but we can match by the visible name text
             each_basecamp_mention(content) do |mention_content|
               mention_name = strip_html_tags(mention_content).delete_prefix("@").strip
-              bot_accounts.each do |_key, account|
+              bot_accounts.each_value do |account|
                 agent = account["default_agent"]
                 # Match if the mention text contains the agent name (case insensitive)
                 return agent if mention_name.downcase.include?(agent.downcase)
@@ -190,7 +184,7 @@ module Brainiac
             end
 
             # Strategy 2: Plain text @AgentName pattern (fallback for simple comments)
-            bot_accounts.each do |_key, account|
+            bot_accounts.each_value do |account|
               agent = account["default_agent"]
               return agent if content.match?(/(?:^|\s)@#{Regexp.escape(agent)}\b/i)
             end
@@ -347,39 +341,37 @@ module Brainiac
 
             begin
               pid, log_file = Hooks.send(:run_agent,
-                prompt,
-                project_config: project_config,
-                chdir: repo_path,
-                log_name: "basecamp-comment-#{epic['id']}-#{Time.now.strftime('%Y%m%d-%H%M%S')}",
-                agent_name: agent_name,
-                source: :basecamp,
-                env: {}
-              )
+                                         prompt,
+                                         project_config: project_config,
+                                         chdir: repo_path,
+                                         log_name: "basecamp-comment-#{epic['id']}-#{Time.now.strftime('%Y%m%d-%H%M%S')}",
+                                         agent_name: agent_name,
+                                         source: :basecamp,
+                                         env: {})
             rescue NameError
               if Object.respond_to?(:run_agent, true)
                 pid, log_file = Object.send(:run_agent,
-                  prompt,
-                  project_config: project_config,
-                  chdir: repo_path,
-                  log_name: "basecamp-comment-#{epic['id']}-#{Time.now.strftime('%Y%m%d-%H%M%S')}",
-                  agent_name: agent_name,
-                  source: :basecamp,
-                  env: {}
-                )
+                                            prompt,
+                                            project_config: project_config,
+                                            chdir: repo_path,
+                                            log_name: "basecamp-comment-#{epic['id']}-#{Time.now.strftime('%Y%m%d-%H%M%S')}",
+                                            agent_name: agent_name,
+                                            source: :basecamp,
+                                            env: {})
               else
                 LOG.warn "[Basecamp:Comment] run_agent not available — comment response skipped" if defined?(LOG)
                 return
               end
             end
 
-            if pid
-              if defined?(register_session)
-                register_session(card_key, pid, log_file: log_file, agent_name: agent_name)
-              elsif Object.respond_to?(:register_session, true)
-                Object.send(:register_session, card_key, pid, log_file: log_file, agent_name: agent_name)
-              end
-              LOG.info "[Basecamp:Comment] Spawned #{agent_name} (pid #{pid}) to respond on epic '#{epic['title']}'" if defined?(LOG)
+            return unless pid
+
+            if defined?(register_session)
+              register_session(card_key, pid, log_file: log_file, agent_name: agent_name)
+            elsif Object.respond_to?(:register_session, true)
+              Object.send(:register_session, card_key, pid, log_file: log_file, agent_name: agent_name)
             end
+            LOG.info "[Basecamp:Comment] Spawned #{agent_name} (pid #{pid}) to respond on epic '#{epic['title']}'" if defined?(LOG)
           end
         end
       end
