@@ -215,10 +215,8 @@ module Brainiac
             # Start with tasks from the API (incomplete todos)
             updated_tasks = new_tasks.map do |task|
               existing = existing_by_card[task.fizzy_card]
-              status = if task.completed && existing
-                         existing["status"]
-                       elsif task.completed
-                         "complete"
+              status = if task.completed
+                         existing&.dig("status") || "complete"
                        elsif existing&.dig("status")
                          # Preserve existing status (in_flight, in_review, final_decision, etc.)
                          existing["status"]
@@ -270,26 +268,36 @@ module Brainiac
             epic["updated_at"] = Time.now.iso8601
           end
 
-          # Dispatch unblocked tasks that aren't already in-flight or complete.
+          # Dispatch unblocked tasks that do not have a live implementation session.
           def dispatch_unblocked_tasks(epic)
             tasks = epic["tasks"].map do |t|
+              # A stale in_flight state is diagnostic state, not liveness evidence.
+              # It becomes dispatchable again only after the implementation session has
+              # died; in_review/final_decision remain intentionally non-dispatchable.
+              dispatch_status = if TaskState.in?(t, :in_flight) && !SessionRegistry.implementation_alive?(t["fizzy_card"])
+                                  :pending
+                                else
+                                  t["status"].to_sym
+                                end
               Epic::Task.new(
                 todo_id: t["todo_id"],
                 fizzy_card: t["fizzy_card"],
                 title: t["title"],
                 depends_on: t["depends_on"] || [],
-                status: t["status"].to_sym,
+                status: dispatch_status,
                 completed: t["status"] == "complete",
                 project: t["project"]
               )
             end
 
-            # Find unblocked tasks that aren't already in-flight or complete
+            # The registry, rather than Fizzy assignment or a persisted status field,
+            # is the authority for whether an implementation dispatch is already live.
             unblocked = Epic.unblocked_tasks(tasks)
-            in_flight_cards = epic["tasks"].select { |t| t["status"] == "in_flight" }.map { |t| t["fizzy_card"] }
             complete_cards = epic["tasks"].select { |t| t["status"] == "complete" }.map { |t| t["fizzy_card"] }
 
-            ready_to_dispatch = unblocked.reject { |t| in_flight_cards.include?(t.fizzy_card) || complete_cards.include?(t.fizzy_card) }
+            ready_to_dispatch = unblocked.reject do |task|
+              complete_cards.include?(task.fizzy_card) || SessionRegistry.implementation_alive?(task.fizzy_card)
+            end
 
             ready_to_dispatch.each do |task|
               dispatch_card(epic, task)
@@ -306,6 +314,11 @@ module Brainiac
           # Uses the project-specific agent if configured, otherwise falls back to the epic's agent.
           def dispatch_card(epic, task)
             card_number = task.fizzy_card
+
+            if SessionRegistry.implementation_alive?(card_number)
+              LOG.info "[Basecamp:Orchestrator] Skipping Fizzy card ##{card_number} — implementation session is still live" if defined?(LOG)
+              return false
+            end
 
             # Resolve agent from project config — each project can have its own default agent
             project_key = task.is_a?(Hash) ? task["project"] : task.project
@@ -335,6 +348,8 @@ module Brainiac
                 profile: agent.downcase
               )
             end
+
+            true
           end
 
           # Sync PR state from work_items for cards that already have open PRs.
