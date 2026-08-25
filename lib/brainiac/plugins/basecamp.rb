@@ -115,9 +115,16 @@ module Brainiac
             reconcile_task(epic, task, triggered_by: triggered_by)
           end.any?
 
-          Orchestrator.send(:dispatch_unblocked_tasks, epic) if changed
-          Orchestrator.send(:save_epic, epic) if changed
-          changed
+          # Always attempt to dispatch unblocked tasks during recovery. Even if no
+          # individual task changed state, there may be pending tasks whose
+          # dependencies are satisfied that were never dispatched (e.g., after a
+          # cancellation was reversed or an epic was healed manually).
+          has_pending = tasks.any? { |t| TaskState.in?(t, :pending) }
+          if changed || has_pending
+            Orchestrator.send(:dispatch_unblocked_tasks, epic)
+            Orchestrator.send(:save_epic, epic)
+          end
+          changed || has_pending
         end
 
         private
