@@ -261,4 +261,10 @@ class TestEpicParser < Minitest::Test
 
     assert_equal "dev02", env
   end
+
+  def test_extract_deploy_env_handles_many_unclosed_markers
+    title = "[deploy:" * 10_000
+
+    assert_nil Brainiac::Plugins::Basecamp::Epic.extract_deploy_env(title)
+  end
 end

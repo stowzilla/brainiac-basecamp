@@ -133,8 +133,17 @@ module Brainiac
           # @return [String, nil] Environment name or nil
           def extract_deploy_env(title, description = nil)
             # Try [deploy:env] format in title (preferred)
-            if (match = title&.match(/\[deploy:([^\]]+)\]/))
-              return match[1].strip
+            if title
+              marker = "[deploy:"
+              value_start = title.index(marker)
+              if value_start
+                value_start += marker.length
+                value_end = title.index("]", value_start)
+                if value_end
+                  environment = title[value_start...value_end].strip
+                  return environment unless environment.empty?
+                end
+              end
             end
 
             # Fallback: try deploy:env in description
