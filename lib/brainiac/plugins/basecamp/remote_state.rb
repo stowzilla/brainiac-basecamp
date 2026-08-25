@@ -290,11 +290,11 @@ module Brainiac
           def parse_document_content(content)
             return nil if content.nil? || content.empty?
 
-            # Strip HTML tags if present (Basecamp wraps content in <div> tags)
-            text = content.gsub(/<[^>]+>/, "").strip
-
-            # Decode HTML entities
-            text = text.gsub("&lt;", "<").gsub("&gt;", ">").gsub("&amp;", "&").gsub("&quot;", "\"")
+            # Decode HTML entities first, then strip tags.
+            # Order matters: decoding before stripping ensures that entity-encoded
+            # tags (e.g. &lt;script&gt;) are caught by the tag removal pass.
+            text = content.gsub("&lt;", "<").gsub("&gt;", ">").gsub("&amp;", "&").gsub("&quot;", "\"")
+            text = text.gsub(/<[^>]+>/, "").strip
 
             return nil if text.empty?
 
