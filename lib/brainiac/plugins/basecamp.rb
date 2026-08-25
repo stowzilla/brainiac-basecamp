@@ -105,9 +105,11 @@ module Brainiac
             return true
           end
 
-          changed = tasks.any? do |task|
+          # Reconcile every task in this pass. `Enumerable#any?` would stop at
+          # the first repaired task and defer later repairs to the next sweep.
+          changed = tasks.map do |task|
             reconcile_task(epic, task, triggered_by: triggered_by)
-          end
+          end.any?
 
           Orchestrator.send(:dispatch_unblocked_tasks, epic) if changed
           Orchestrator.send(:save_epic, epic) if changed
@@ -179,11 +181,11 @@ module Brainiac
           card_number = task["fizzy_card"]
           return false if SessionRegistry.alive?("implementation-#{card_number}")
 
+          agent = Orchestrator.send(:resolve_agent_for_project, task["project"]) || epic["agent"]
+          return false unless (fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, agent))
+
           TaskState.transition!(task, :request_changes, triggered_by: triggered_by)
           task["dispatched_at"] = Time.now.iso8601
-          agent = Orchestrator.send(:resolve_agent_for_project, task["project"]) || epic["agent"]
-          return true unless (fizzy_user_id = Orchestrator.send(:resolve_fizzy_user_id, agent))
-
           Hooks.send(:safe_assign_card, card_number, fizzy_user_id)
           true
         end
