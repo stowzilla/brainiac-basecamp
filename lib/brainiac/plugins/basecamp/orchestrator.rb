@@ -49,9 +49,6 @@ module Brainiac
             LOG.info "[Basecamp:Orchestrator] Started epic '#{title}' (todolist #{todolist_id}) " \
                      "with agent #{agent}, review_gate: #{review_gate}" if defined?(LOG)
 
-            # Initialize epic memory for cross-task shared knowledge
-            EpicMemory.initialize_for(epic)
-
             # FIRST: Populate tasks with project info from Fizzy card tags
             # This must happen BEFORE creating epic branches so we know which repos are involved
             populate_tasks(epic)
@@ -123,7 +120,7 @@ module Brainiac
 
             # Mark the task as complete in our state
             if task
-              task["status"] = "complete"
+              TaskState.transition!(task, :complete, triggered_by: "fizzy_card_completed")
               task["completed_at"] = Time.now.iso8601
               epic["updated_at"] = Time.now.iso8601
               log_event(epic, "task_completed", "Card ##{card_number} completed")
@@ -192,8 +189,6 @@ module Brainiac
             load_epics.find { |e| e["id"] == epic_id }
           end
 
-          WEBHOOK_CHECK_COOLDOWN = 300 # 5 minutes
-
           private
 
           # Resolve current todolist state from Basecamp and dispatch unblocked cards.
@@ -221,7 +216,7 @@ module Brainiac
             updated_tasks = new_tasks.map do |task|
               existing = existing_by_card[task.fizzy_card]
               status = if task.completed
-                         "complete"
+                         existing&.dig("status") || "complete"
                        elsif existing&.dig("status")
                          # Preserve existing status (in_flight, in_review, final_decision, etc.)
                          existing["status"]
@@ -249,10 +244,16 @@ module Brainiac
               # Preserve PR and gate state from existing task
               if existing
                 %w[dispatched_at pr_number pr_repo gates_dispatched_at gate_approvals
-                   changes_requested_by awaiting_final_decision changes_debounce_started
-                   fizzy_internal_id].each do |key|
+                   changes_requested_by gate_redispatch_counts gate_states
+                   awaiting_final_decision changes_debounce_started
+                   fizzy_internal_id transitions].each do |key|
                   new_task[key] = existing[key] if existing.key?(key)
                 end
+              end
+
+              TaskState.migrate!(new_task, triggered_by: "basecamp_sync")
+              if task.completed && !TaskState.in?(new_task, :complete)
+                TaskState.transition!(new_task, :complete, triggered_by: "basecamp_todo_completed")
               end
 
               new_task
@@ -268,28 +269,42 @@ module Brainiac
             epic["updated_at"] = Time.now.iso8601
           end
 
-          # Dispatch unblocked tasks that aren't already in-flight or complete.
-          # Ensures Fizzy webhooks are active before dispatching (prevents silent failures).
+          # Dispatch unblocked tasks that do not have a live implementation session.
           def dispatch_unblocked_tasks(epic)
-            ensure_fizzy_webhooks_active
             tasks = epic["tasks"].map do |t|
+              # A stale in_flight state is diagnostic state, not liveness evidence.
+              # It becomes dispatchable again only after the implementation session has
+              # died; in_review/final_decision remain intentionally non-dispatchable.
+              # Give a newly assigned implementation agent time to register its
+              # session. Without this grace period, a recovery pass that just
+              # re-assigned a stale card can immediately assign it a second time
+              # before Fizzy's normal spawn hook has run.
+              dispatch_status = if TaskState.in?(t, :in_flight) &&
+                                   !SessionRegistry.implementation_alive?(t["fizzy_card"]) &&
+                                   stale_implementation_dispatch?(t)
+                                  :pending
+                                else
+                                  t["status"].to_sym
+                                end
               Epic::Task.new(
                 todo_id: t["todo_id"],
                 fizzy_card: t["fizzy_card"],
                 title: t["title"],
                 depends_on: t["depends_on"] || [],
-                status: t["status"].to_sym,
+                status: dispatch_status,
                 completed: t["status"] == "complete",
                 project: t["project"]
               )
             end
 
-            # Find unblocked tasks that aren't already in-flight or complete
+            # The registry, rather than Fizzy assignment or a persisted status field,
+            # is the authority for whether an implementation dispatch is already live.
             unblocked = Epic.unblocked_tasks(tasks)
-            in_flight_cards = epic["tasks"].select { |t| t["status"] == "in_flight" }.map { |t| t["fizzy_card"] }
             complete_cards = epic["tasks"].select { |t| t["status"] == "complete" }.map { |t| t["fizzy_card"] }
 
-            ready_to_dispatch = unblocked.reject { |t| in_flight_cards.include?(t.fizzy_card) || complete_cards.include?(t.fizzy_card) }
+            ready_to_dispatch = unblocked.reject do |task|
+              complete_cards.include?(task.fizzy_card) || SessionRegistry.implementation_alive?(task.fizzy_card)
+            end
 
             ready_to_dispatch.each do |task|
               dispatch_card(epic, task)
@@ -307,6 +322,11 @@ module Brainiac
           def dispatch_card(epic, task)
             card_number = task.fizzy_card
 
+            if SessionRegistry.implementation_alive?(card_number)
+              LOG.info "[Basecamp:Orchestrator] Skipping Fizzy card ##{card_number} — implementation session is still live" if defined?(LOG)
+              return false
+            end
+
             # Resolve agent from project config — each project can have its own default agent
             project_key = task.is_a?(Hash) ? task["project"] : task.project
             agent = resolve_agent_for_project(project_key) || epic["agent"]
@@ -316,16 +336,14 @@ module Brainiac
             # Mark as in-flight in our state
             epic_task = epic["tasks"].find { |t| t["fizzy_card"] == card_number }
             if epic_task
-              epic_task["status"] = "in_flight"
+              TaskState.transition!(epic_task, :dispatch, triggered_by: "orchestrator_dispatch")
               epic_task["dispatched_at"] = Time.now.iso8601
             end
             epic["updated_at"] = Time.now.iso8601
 
             log_event(epic, "dispatched", "Card ##{card_number} dispatched to #{agent}")
 
-            # Assign the card in Fizzy via CLI — this triggers the normal Fizzy webhook flow.
-            # If the agent is already assigned (stale state from a disabled webhook),
-            # the method will cycle the assignment to re-trigger the webhook.
+            # Assign the card in Fizzy via CLI — this triggers the normal Fizzy webhook flow
             assign_fizzy_card(card_number, agent)
 
             # Post a comment on the Basecamp todo
@@ -337,6 +355,17 @@ module Brainiac
                 profile: agent.downcase
               )
             end
+
+            true
+          end
+
+          def stale_implementation_dispatch?(task)
+            dispatched_at = task["dispatched_at"]
+            return true unless dispatched_at
+
+            Time.now - Time.parse(dispatched_at) > STALE_DISPATCH_TIMEOUT
+          rescue ArgumentError
+            true
           end
 
           # Sync PR state from work_items for cards that already have open PRs.
@@ -366,7 +395,7 @@ module Brainiac
 
               task["pr_number"] = pr_number
               task["pr_repo"] = work_item.dig("sources", "github", "repo")
-              task["status"] = "in_review"
+              TaskState.transition!(task, :submit_for_review, triggered_by: "existing_pr_sync")
             end
           rescue StandardError => e
             LOG.warn "[Basecamp:Orchestrator] Error syncing PR state: #{e.message}" if defined?(LOG)
@@ -387,9 +416,6 @@ module Brainiac
               pr_number = task["pr_number"]
               project_key = task["project"]
 
-              # Skip if gates already dispatched
-              next if task["gates_dispatched_at"]
-
               # Get repo info
               projects_file = File.join(BRAINIAC_DIR, "projects.json")
               projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
@@ -405,7 +431,7 @@ module Brainiac
               # Check if all gates already passed
               if ReviewGate.all_gates_passed?(task)
                 LOG.info "[Basecamp:Orchestrator] Gates already passed for card ##{card_number} — dispatching final decision" if defined?(LOG)
-                task["status"] = "final_decision"
+                TaskState.transition!(task, :approve, triggered_by: "existing_pr_gate_sync", guard: ReviewGate.all_gates_passed?(task))
                 task["awaiting_final_decision"] = true
                 # Final decision dispatch happens in resume logic
               else
@@ -425,10 +451,7 @@ module Brainiac
           end
 
           # Assign a Fizzy card to an agent via Fizzy CLI.
-          # If the agent is already assigned, unassigns and reassigns to re-trigger the webhook
-          # (Fizzy webhooks can silently become disabled, causing the original assignment to be lost).
-          #
-          # @return [Symbol] :assigned, :reassigned, or :failed
+          # If the agent is already assigned, skip — the webhook should have already fired.
           def assign_fizzy_card(card_number, agent)
             agent_config = load_agent_registry[agent.downcase]
             fizzy_name = agent_config&.dig("fizzy_name") || agent
@@ -437,34 +460,18 @@ module Brainiac
             fizzy_user_id = resolve_fizzy_user_id(fizzy_name)
             unless fizzy_user_id
               LOG.error "[Basecamp:Orchestrator] Could not resolve Fizzy user ID for '#{fizzy_name}'" if defined?(LOG)
-              return :failed
+              return
             end
 
-            # Check if agent is already assigned
+            # Check if agent is already assigned — if so, skip (webhook should have fired)
             stdout, _, status = Open3.capture3("fizzy", "card", "show", card_number.to_s, "--json")
             if status.success?
               card_data = JSON.parse(stdout).dig("data") rescue nil
               if card_data
                 current_assignees = (card_data["assignees"] || []).map { |a| a["id"] }
                 if current_assignees.include?(fizzy_user_id)
-                  # Agent is already assigned — webhook may not have fired (disabled webhook).
-                  # Unassign then reassign to trigger a fresh webhook delivery.
-                  LOG.warn "[Basecamp:Orchestrator] Agent already assigned to ##{card_number} — " \
-                           "cycling assignment to re-trigger webhook" if defined?(LOG)
-
-                  # Fizzy assign TOGGLES, so calling it removes the assignment
-                  Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
-                  sleep 1 # Brief pause to ensure the unassign is processed
-
-                  # Now reassign — this should trigger the webhook
-                  stdout2, stderr2, status2 = Open3.capture3("fizzy", "card", "assign", card_number.to_s, "--user", fizzy_user_id)
-                  if status2.success?
-                    LOG.info "[Basecamp:Orchestrator] Reassigned Fizzy ##{card_number} to #{fizzy_name} (webhook re-triggered)" if defined?(LOG)
-                    return :reassigned
-                  else
-                    LOG.error "[Basecamp:Orchestrator] Failed to reassign Fizzy ##{card_number}: #{stderr2.strip}" if defined?(LOG)
-                    return :failed
-                  end
+                  LOG.info "[Basecamp:Orchestrator] Agent already assigned to ##{card_number}, skipping (webhook should have fired)" if defined?(LOG)
+                  return
                 end
               end
             end
@@ -473,77 +480,11 @@ module Brainiac
 
             if status.success?
               LOG.info "[Basecamp:Orchestrator] Assigned Fizzy ##{card_number} to #{fizzy_name} (#{fizzy_user_id})" if defined?(LOG)
-              :assigned
             else
               LOG.error "[Basecamp:Orchestrator] Failed to assign Fizzy ##{card_number}: #{stderr.strip}" if defined?(LOG)
-              :failed
             end
           rescue Errno::ENOENT => e
             LOG.error "[Basecamp:Orchestrator] fizzy CLI not found: #{e.message}" if defined?(LOG)
-            :failed
-          end
-
-          # Ensure Fizzy webhooks are active before dispatching cards.
-          # Fizzy webhooks can silently become disabled (e.g., after repeated delivery failures),
-          # causing assigned cards to never trigger agent work. This pre-flight check reactivates
-          # any disabled brainiac webhooks.
-          #
-          # Uses a cooldown to avoid hammering the API on every dispatch batch.
-          def ensure_fizzy_webhooks_active
-            now = Time.now
-            @last_webhook_check ||= Time.at(0)
-            return if (now - @last_webhook_check) < WEBHOOK_CHECK_COOLDOWN
-
-            @last_webhook_check = now
-
-            # Read fizzy config to get admin_token and board list
-            fizzy_config_file = File.join(BRAINIAC_DIR, "fizzy.json")
-            return unless File.exist?(fizzy_config_file)
-
-            fizzy_config = JSON.parse(File.read(fizzy_config_file))
-            admin_token = fizzy_config["admin_token"]
-            boards = fizzy_config["boards"] || {}
-
-            unless admin_token
-              LOG.debug "[Basecamp:Orchestrator] Fizzy webhook check skipped (no admin_token in fizzy.json)" if defined?(LOG)
-              return
-            end
-
-            env = { "FIZZY_TOKEN" => admin_token }
-            reactivated = 0
-
-            boards.each do |board_key, board_config|
-              board_id = board_config["board_id"]
-              next unless board_id
-
-              stdout, _, status = Open3.capture3(env, "fizzy", "webhook", "list",
-                                                 "--board", board_id, "--all", "--json",
-                                                 chdir: Dir.home)
-              next unless status.success?
-
-              webhooks = JSON.parse(stdout)["data"] || []
-              webhooks.each do |webhook|
-                next unless webhook["name"]&.start_with?("brainiac")
-                next if webhook["active"]
-
-                wh_name = webhook["name"]
-                LOG.warn "[Basecamp:Orchestrator] Fizzy webhook '#{wh_name}' on board '#{board_key}' is INACTIVE — reactivating" if defined?(LOG)
-                _, _, reactivate_status = Open3.capture3(env, "fizzy", "webhook", "reactivate", webhook["id"],
-                                                         "--board", board_id, chdir: Dir.home)
-                if reactivate_status.success?
-                  reactivated += 1
-                  LOG.info "[Basecamp:Orchestrator] Reactivated webhook '#{webhook['name']}' on board '#{board_key}'" if defined?(LOG)
-                else
-                  LOG.error "[Basecamp:Orchestrator] Failed to reactivate webhook '#{webhook['name']}' on board '#{board_key}'" if defined?(LOG)
-                end
-              end
-            rescue StandardError => e
-              LOG.warn "[Basecamp:Orchestrator] Webhook check failed for board '#{board_key}': #{e.message}" if defined?(LOG)
-            end
-
-            LOG.info "[Basecamp:Orchestrator] Fizzy webhook health check: #{reactivated} reactivated" if reactivated.positive?
-          rescue StandardError => e
-            LOG.warn "[Basecamp:Orchestrator] Fizzy webhook health check failed: #{e.message}" if defined?(LOG)
           end
 
           # Resolve a Fizzy user ID from their display name.
@@ -645,18 +586,6 @@ module Brainiac
               "- ##{t['fizzy_card']}: #{t['title']}#{dep_str}"
             end.join("\n")
 
-            # Include existing epic memory if any
-            epic_memory_path = EpicMemory.path_for(epic["basecamp_todolist_id"])
-            epic_memory_section = if EpicMemory.exists?(epic["basecamp_todolist_id"])
-                                    <<~MEM
-
-                                      ### Epic Memory (shared knowledge so far)
-                                      Read the epic memory file at `#{epic_memory_path}` for decisions and patterns established in previous tasks.
-                                    MEM
-                                  else
-                                    ""
-                                  end
-
             prompt = <<~PROMPT
               ## Epic Review: #{epic['title']}
 
@@ -667,7 +596,7 @@ module Brainiac
 
               ### Remaining tasks (with current dependencies):
               #{remaining_summary}
-              #{epic_memory_section}
+
               ### Your job:
               1. Read the memory files for completed tasks to understand what was implemented
               2. Check if remaining tasks still make sense given the implementation decisions
@@ -680,20 +609,10 @@ module Brainiac
 
               Memory files are at: `~/.brainiac/brain/memory/#{agent_name&.downcase}/card-<number>.md`
 
-              ### Update Epic Memory (IMPORTANT)
-              After your review, update the epic memory file at `#{epic_memory_path}` with:
-              - **Architectural decisions** made during task ##{completed_card_number}
-              - **Patterns established** that should be followed in remaining tasks
-              - **Gotchas** discovered that future tasks should know about
-              - **Cross-task notes** about relationships or dependencies
-
-              This is shared knowledge — other agents will read it. Be concise but thorough.
-              Append a new section, don't replace the existing content.
-
-              Then post a brief summary comment on the Basecamp todolist:
+              After reviewing, post a brief summary comment on the Basecamp todolist:
               `basecamp comments create #{epic['basecamp_todolist_id']} "Epic review after ##{completed_card_number}: <your summary>" --in #{epic['basecamp_project_id']}`
 
-              Keep the basecamp comment concise — this is a checkpoint, not a full analysis.
+              Keep it concise — this is a checkpoint, not a full analysis.
             PROMPT
 
             # Get project config for the agent
@@ -720,9 +639,15 @@ module Brainiac
                                               card_number: completed_card_number)
                                 end
 
-                # Register session for waybar
-                if pid && Object.respond_to?(:register_session, true)
-                  Object.send(:register_session, card_key, pid, log_file: log_file, agent_name: agent_name)
+                # Register session in SessionRegistry for liveness tracking
+                if pid
+                  SessionRegistry.register_session(
+                    card_key, pid,
+                    log_file: log_file,
+                    agent_name: agent_name,
+                    epic_id: epic["id"],
+                    card_number: completed_card_number
+                  )
                 end
 
                 # Wait for the review to complete
@@ -744,15 +669,6 @@ module Brainiac
             return unless task && task["todo_id"]
 
             Client.run_safe("todos", "complete", task["todo_id"].to_s, "--json",
-                           profile: epic["agent"]&.downcase)
-          end
-
-          # Mark a Basecamp todo as incomplete (undo premature completion).
-          def uncheck_todo(epic, card_number)
-            task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
-            return unless task && task["todo_id"]
-
-            Client.run_safe("todos", "uncomplete", task["todo_id"].to_s, "--json",
                            profile: epic["agent"]&.downcase)
           end
 
@@ -783,9 +699,6 @@ module Brainiac
             log_event(epic, "completed", "All tasks complete — epic finished!")
 
             LOG.info "[Basecamp:Orchestrator] Epic '#{epic['title']}' completed!" if defined?(LOG)
-
-            # Archive epic memory (preserves it for future reference)
-            EpicMemory.cleanup(epic["basecamp_todolist_id"], archive: true)
 
             # If epic_branch mode, open final PRs to main
             if epic["review_gate"] == "epic_branch" && epic["epic_branches"]&.any?
@@ -892,43 +805,14 @@ module Brainiac
           end
 
           # Create epic branches for all projects involved in this epic.
-          # CRITICAL: If this fails, epic_branches will be empty and agents will
-          # open PRs against the default branch instead of the epic branch.
-          # We log loudly and retry resolution of project repos if initial attempt fails.
           def create_epic_branches_for(epic)
             project_repos = resolve_project_repos(epic)
-
-            if project_repos.empty?
-              # Fallback: try to resolve from the basecamp project mapping directly
-              mapped_project = Config.brainiac_project_for(epic["basecamp_project_id"])
-              if mapped_project
-                projects_file = File.join(BRAINIAC_DIR, "projects.json")
-                all_projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
-                repo = all_projects.dig(mapped_project, "repo_path")
-                project_repos = { mapped_project => repo } if repo
-              end
-            end
-
-            if project_repos.empty?
-              LOG.error "[Basecamp:Orchestrator] Cannot create epic branches — no project repos resolved. " \
-                        "Tasks have projects: #{(epic['tasks'] || []).map { |t| t['project'] }.compact.uniq.inspect}. " \
-                        "Epic will proceed WITHOUT epic branches — PRs will target the default branch!" if defined?(LOG)
-              log_event(epic, "branches_failed", "No project repos resolved — epic branches not created")
-              return
-            end
+            return if project_repos.empty?
 
             epic["epic_branches"] = EpicBranch.create_epic_branches(epic, project_repos)
-
-            if epic["epic_branches"].empty?
-              LOG.error "[Basecamp:Orchestrator] create_epic_branches returned empty — branch creation failed" if defined?(LOG)
-              log_event(epic, "branches_failed", "Branch creation returned empty for repos: #{project_repos.keys.join(', ')}")
-            else
-              log_event(epic, "branches_created", "Epic branches: #{epic['epic_branches'].values.uniq.join(', ')}")
-            end
+            log_event(epic, "branches_created", "Epic branches: #{epic['epic_branches'].values.uniq.join(', ')}")
           rescue StandardError => e
-            LOG.error "[Basecamp:Orchestrator] Failed to create epic branches: #{e.class}: #{e.message}" \
-                      "\n#{e.backtrace.first(3).join("\n")}" if defined?(LOG)
-            log_event(epic, "branches_failed", "Exception: #{e.message}")
+            LOG.error "[Basecamp:Orchestrator] Failed to create epic branches: #{e.message}" if defined?(LOG)
           end
 
           # Open final PRs from epic branches to main.

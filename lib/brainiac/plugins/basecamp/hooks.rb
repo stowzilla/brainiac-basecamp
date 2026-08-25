@@ -16,7 +16,7 @@ module Brainiac
       #   :resolve_base_branch — returns epic branch as worktree base
       #   :resolve_pr_target — returns epic branch as PR target
       module Hooks
-        class << self # rubocop:disable Metrics/ClassLength
+        class << self
           def register_all!
             register_agent_completed
             register_pr_merged
@@ -36,13 +36,21 @@ module Brainiac
           def register_agent_completed
             Brainiac.on(:agent_completed) do |ctx|
               next unless ctx[:source] == :fizzy
-              next unless ctx[:exit_status]&.zero? && !ctx[:signaled]
 
               card_number = ctx[:card_number]
               next unless card_number
 
               epic = Orchestrator.find_epic_for_card(card_number)
               next unless epic
+
+              implementation_session = SessionRegistry.find_session(
+                SessionRegistry.implementation_session_id(card_number)
+              )
+              if implementation_session && implementation_session["agent_name"].to_s.casecmp?(ctx[:agent_name].to_s)
+                SessionRegistry.mark_dead(implementation_session["task_id"])
+              end
+
+              next unless ctx[:exit_status]&.zero? && !ctx[:signaled]
 
               review_gate = epic["review_gate"] || Config.review_gate
 
@@ -64,7 +72,7 @@ module Brainiac
 
                 if ReviewGate.enabled?
                   # Dispatch review gates in parallel after a delay (wait for PR to be created)
-                  task["status"] = "in_review"
+                  TaskState.transition!(task, :submit_for_review, triggered_by: "agent_completed")
                   epic["updated_at"] = Time.now.iso8601
                   save_epic_state(epic)
 
@@ -123,18 +131,6 @@ module Brainiac
               if epic_branches.include?(base_branch)
                 LOG.info "[Basecamp:Hooks] PR merged to epic branch #{base_branch} for card ##{card_number} — advancing" if defined?(LOG)
                 Orchestrator.on_card_completed(card_number)
-              elsif epic_branches.empty?
-                # Fallback: epic_branches was never populated (branch creation failed).
-                # If the task is in final_decision or in_review, the merge still represents
-                # completion — advance the epic regardless of which branch was targeted.
-                task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
-                if task && %w[final_decision in_review in_flight].include?(task["status"])
-                  if defined?(LOG)
-                    LOG.warn "[Basecamp:Hooks] epic_branches is empty but PR merged to '#{base_branch}' " \
-                             "for card ##{card_number} (status: #{task['status']}) — advancing anyway (branch creation likely failed)"
-                  end
-                  Orchestrator.on_card_completed(card_number)
-                end
               end
             end
           end
@@ -193,8 +189,6 @@ module Brainiac
               if review_state == "approved"
                 LOG.info "[Basecamp:Hooks] Gate APPROVED: #{agent_name} (#{role}) on card ##{card_number}" if defined?(LOG)
                 ReviewGate.record_approval(task, agent: agent_name, role: role)
-                # Clear this gate from changes_requested if it was there
-                task["changes_requested_by"]&.delete(agent_name)
                 epic["updated_at"] = Time.now.iso8601
 
                 if ReviewGate.all_gates_passed?(task)
@@ -207,17 +201,15 @@ module Brainiac
                     LOG.error "[Basecamp:Hooks] Final decision dispatch failed: #{e.message}" if defined?(LOG)
                   end
                 else
-                  approvals = task["gate_approvals"] || []
-                  remaining = ReviewGate.gates.size - approvals.size
-                  LOG.info "[Basecamp:Hooks] #{approvals.size}/#{ReviewGate.gates.size} gates passed, #{remaining} remaining" if defined?(LOG)
+                  approved = ReviewGate.gate_states(task).values.count { |state| state["status"] == "approved" }
+                  remaining = ReviewGate.gates.size - approved
+                  LOG.info "[Basecamp:Hooks] #{approved}/#{ReviewGate.gates.size} gates passed, #{remaining} remaining" if defined?(LOG)
                   save_epic_state(epic)
                 end
               elsif review_state == "changes_requested"
                 LOG.info "[Basecamp:Hooks] Gate CHANGES_REQUESTED: #{agent_name} (#{role}) on card ##{card_number}" if defined?(LOG)
 
-                # Track which gates requested changes
-                task["changes_requested_by"] ||= []
-                task["changes_requested_by"] << agent_name unless task["changes_requested_by"].include?(agent_name)
+                ReviewGate.record_changes_requested(task, agent: agent_name, role: role)
 
                 # Check if all gates have now responded (either approved or requested changes)
                 all_responded = all_gates_responded?(task)
@@ -225,16 +217,15 @@ module Brainiac
                 if all_responded
                   # All gates have reviewed — dispatch implementation agent to address ALL feedback
                   LOG.info "[Basecamp:Hooks] All gates responded for card ##{card_number} — dispatching fixes" if defined?(LOG)
-                  task["status"] = "in_flight"
-                  task["dispatched_at"] = Time.now.iso8601
+                  TaskState.transition!(task, :request_changes, triggered_by: "review_changes_requested")
                   task.delete("changes_debounce_started")
                   save_epic_state(epic)
 
-                  # Spawn agent directly — safe_assign_card won't work if already assigned
+                  LOG.info "[Basecamp:Hooks] Direct-dispatching implementation for fixes on ##{card_number}" if defined?(LOG)
                   dispatch_impl_directly(epic, task)
                 else
                   # Wait for remaining gates to respond
-                  responded = (task["gate_approvals"]&.size || 0) + (task["changes_requested_by"]&.size || 0)
+                  responded = ReviewGate.responded_count(task)
                   remaining = ReviewGate.gates.size - responded
                   LOG.info "[Basecamp:Hooks] #{responded}/#{ReviewGate.gates.size} gates responded, waiting for #{remaining} more" if defined?(LOG)
                   save_epic_state(epic)
@@ -251,13 +242,12 @@ module Brainiac
                       next unless epic_reloaded
 
                       task_reloaded = epic_reloaded["tasks"]&.find { |t| t["fizzy_card"] == card_number.to_i }
-                      if task_reloaded && task_reloaded["status"] == "in_review" && task_reloaded["changes_requested_by"]&.any?
+                      if task_reloaded && task_reloaded["status"] == "in_review" && ReviewGate.changes_requested?(task_reloaded)
                         LOG.info "[Basecamp:Hooks] Debounce timeout for card ##{card_number} — forcing dispatch" if defined?(LOG)
-                        task_reloaded["status"] = "in_flight"
-                        task_reloaded["dispatched_at"] = Time.now.iso8601
+                        TaskState.transition!(task_reloaded, :request_changes, triggered_by: "review_changes_timeout")
                         task_reloaded.delete("changes_debounce_started")
                         save_epic_state(epic_reloaded)
-                        # Spawn agent directly — safe_assign_card won't work if already assigned
+                        # Re-assign card to trigger dispatch
                         dispatch_impl_directly(epic_reloaded, task_reloaded)
                       end
                     rescue StandardError => e
@@ -271,12 +261,7 @@ module Brainiac
 
           # Check if all configured gates have responded (either approved or requested changes)
           def all_gates_responded?(task)
-            approvals = (task["gate_approvals"] || []).map { |a| a["agent"].downcase }
-            changes = (task["changes_requested_by"] || []).map(&:downcase)
-            responded = approvals + changes
-
-            required = ReviewGate.gates.map { |g| g["agent"].downcase }
-            required.all? { |agent| responded.include?(agent) }
+            ReviewGate.all_gates_responded?(task)
           end
 
           # Match a GitHub reviewer login to a configured gate agent.
@@ -380,40 +365,15 @@ module Brainiac
               next unless epic["review_gate"] == "epic_branch" && ReviewGate.enabled?
 
               task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
-              next unless task && task["status"] == "in_flight"
-
-              # Ensure pr_number is set — it may be missing if initial gate dispatch
-              # failed to persist it or if state was lost during serialization.
-              unless task["pr_number"]
-                pr_number = ctx.dig(:pull_request, "number") || ctx[:pr_number]
-                if pr_number
-                  task["pr_number"] = pr_number.to_i
-                  LOG.info "[Basecamp:Hooks] Backfilled pr_number=#{pr_number} for card ##{card_number}" if defined?(LOG)
-                else
-                  # Try to find it from the branch
-                  project_key = task["project"] || Config.brainiac_project_for(epic["basecamp_project_id"])
-                  projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
-                  projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
-                  repo_path = projects.dig(project_key, "repo_path")
-                  if repo_path
-                    branch = ctx[:branch] || "fizzy-#{card_number}-*"
-                    found_pr = find_pr_number(repo_path: repo_path, branch: branch)
-                    if found_pr
-                      task["pr_number"] = found_pr
-                      LOG.info "[Basecamp:Hooks] Resolved pr_number=#{found_pr} for card ##{card_number} via branch lookup" if defined?(LOG)
-                    end
-                  end
-                end
-              end
-
-              next unless task["pr_number"]
+              # Re-trigger gates if task is in_flight (agent working/pushed fixes)
+              # No need to check for prior reviews — if task is in_flight with a PR, gates should review
+              next unless task && task["status"] == "in_flight" && task["pr_number"]
 
               LOG.info "[Basecamp:Hooks] PR updated for card ##{card_number} — re-triggering review gates" if defined?(LOG)
 
               # Reset approvals and re-dispatch gates
               ReviewGate.reset_approvals(task)
-              task["changes_requested_by"] = []
-              task["status"] = "in_review"
+              TaskState.transition!(task, :submit_for_review, triggered_by: "pr_synchronized")
               epic["updated_at"] = Time.now.iso8601
               save_epic_state(epic)
 
@@ -446,23 +406,6 @@ module Brainiac
                 ""
               ]
 
-              # Inject epic memory if it exists (shared knowledge across the epic)
-              epic_memory = EpicMemory.read(epic["basecamp_todolist_id"])
-              if epic_memory
-                context_lines << "### Epic Memory (Shared Knowledge)"
-                context_lines << ""
-                context_lines << "The following is shared knowledge accumulated from previous tasks in this epic."
-                context_lines << "Reference this when making implementation decisions."
-                context_lines << ""
-                context_lines << "```markdown"
-                context_lines << epic_memory.lines.first(50).join # Limit to first 50 lines to avoid context overflow
-                if epic_memory.lines.size > 50
-                  context_lines << "... (truncated — full file at ~/.brainiac/brain/memory/epics/epic-#{epic['basecamp_todolist_id']}.md)"
-                end
-                context_lines << "```"
-                context_lines << ""
-              end
-
               # List completed tasks with their memory files for reference
               completed_tasks = tasks.select { |t| t["status"] == "complete" }
               if completed_tasks.any?
@@ -492,8 +435,9 @@ module Brainiac
                   # Final decision mode — agent reads gate feedback and decides
                   if current_task["awaiting_final_decision"]
                     pr_number = current_task["pr_number"]
-                    approvals = current_task["gate_approvals"] || []
-                    gate_agents = approvals.map { |a| a["agent"] }.join(", ")
+                    gate_agents = ReviewGate.gate_states(current_task).values
+                                            .select { |state| state["status"] == "approved" }
+                                            .map { |state| state["agent"] }.join(", ")
 
                     context_lines << ""
                     context_lines << "## ⚡ FINAL DECISION REQUIRED"
@@ -524,17 +468,12 @@ module Brainiac
           end
 
           # Return the epic branch as the worktree base for cards in an active epic.
-          # If the epic branch doesn't exist for this task's project yet, create it lazily.
           def register_resolve_base_branch
             Brainiac.on(:resolve_base_branch) do |ctx|
               card_number = ctx[:card_number]
               next unless card_number
 
               branch = EpicBranch.epic_branch_for_card(card_number)
-
-              # Lazy creation: if no branch exists for this task's project, create one now
-              branch ||= EpicBranch.ensure_epic_branch_for_card(card_number)
-
               next unless branch
 
               "origin/#{branch}"
@@ -542,15 +481,12 @@ module Brainiac
           end
 
           # Return the epic branch as the PR target for cards in an active epic.
-          # Same lazy-creation logic as resolve_base_branch.
           def register_resolve_pr_target
             Brainiac.on(:resolve_pr_target) do |ctx|
               card_number = ctx[:card_number]
               next unless card_number
 
-              branch = EpicBranch.epic_branch_for_card(card_number)
-              branch ||= EpicBranch.ensure_epic_branch_for_card(card_number)
-              branch
+              EpicBranch.epic_branch_for_card(card_number)
             end
           end
 
@@ -647,7 +583,7 @@ module Brainiac
             task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
             return unless task
 
-            task["status"] = "in_review"
+            TaskState.transition!(task, :submit_for_review, triggered_by: "pr_merge_wait")
             task["review_started_at"] = Time.now.iso8601
             epic["updated_at"] = Time.now.iso8601
             save_epic_state(epic)
@@ -675,37 +611,18 @@ module Brainiac
             github_repo = project_config&.dig("github_repo")
 
             # Check if PR is already merged (handles manual merges, webhook misses, etc.)
-            if github_repo && pr_number&.to_i&.positive?
+            if github_repo && pr_number
               pr_state, = Open3.capture2("gh", "pr", "view", pr_number.to_s, "--repo", github_repo, "--json", "state", "-q", ".state")
               if pr_state.strip == "MERGED"
                 LOG.info "[Basecamp:Hooks] PR ##{pr_number} already merged — marking card ##{card_number} complete" if defined?(LOG)
                 Orchestrator.on_card_completed(card_number)
                 return
               end
-
-              # SAFEGUARD: Verify PR targets the epic branch (not main/master).
-              # If epic_branches is populated and the PR targets the wrong base, retarget it.
-              epic_branches = epic["epic_branches"] || {}
-              expected_base = epic_branches[project_key] || epic_branches.values.first
-              if expected_base
-                actual_base, = Open3.capture2("gh", "pr", "view", pr_number.to_s, "--repo", github_repo, "--json", "baseRefName", "-q",
-".baseRefName")
-                actual_base = actual_base.strip
-                if !actual_base.empty? && actual_base != expected_base
-                  LOG.warn "[Basecamp:Hooks] PR ##{pr_number} targets '#{actual_base}' but expected '#{expected_base}' — retargeting" if defined?(LOG)
-                  _, stderr, status = Open3.capture3("gh", "pr", "edit", pr_number.to_s, "--repo", github_repo, "--base", expected_base)
-                  if status.success?
-                    LOG.info "[Basecamp:Hooks] Retargeted PR ##{pr_number} to '#{expected_base}'" if defined?(LOG)
-                  elsif defined?(LOG)
-                    LOG.error "[Basecamp:Hooks] Failed to retarget PR ##{pr_number}: #{stderr.strip}"
-                  end
-                end
-              end
             end
 
             # Mark task as awaiting final decision
             task["awaiting_final_decision"] = true
-            task["status"] = "final_decision"
+            TaskState.transition!(task, :approve, triggered_by: "all_gates_approved", guard: ReviewGate.all_gates_passed?(task))
             epic["updated_at"] = Time.now.iso8601
             save_epic_state(epic)
 
@@ -737,19 +654,9 @@ module Brainiac
             end
 
             # Build prompt for final decision
-            gate_approvals = task["gate_approvals"] || []
-            gate_agents = gate_approvals.map { |a| a["agent"] }.join(", ")
-
-            # Determine expected target branch for the prompt
-            epic_branches = epic["epic_branches"] || {}
-            expected_base = epic_branches[project_key] || epic_branches.values.first
-            target_note = if expected_base
-                            "\n**IMPORTANT:** This PR should target `#{expected_base}` (the epic branch). " \
-                              "If `gh pr view #{pr_number} --json baseRefName` shows a different base, " \
-                              "do NOT merge — report the mismatch instead.\n"
-                          else
-                            ""
-                          end
+            gate_agents = ReviewGate.gate_states(task).values
+                                    .select { |state| state["status"] == "approved" }
+                                    .map { |state| state["agent"] }.join(", ")
 
             prompt = <<~PROMPT
               ## Final Decision Required — Fizzy Card ##{card_number}
@@ -762,7 +669,7 @@ module Brainiac
                  ```
                  gh pr merge #{pr_number} --squash --delete-branch
                  ```
-              #{target_note}
+
               Note: You cannot self-approve PRs you authored. Merge directly since gates have approved.
 
               After merging, update the Fizzy card with a brief status comment.
@@ -805,148 +712,16 @@ module Brainiac
               end
             end
 
-            # Register session for waybar visibility
+            # Register session in SessionRegistry for liveness tracking
             if pid
-              if defined?(register_session)
-                register_session(card_key, pid, log_file: log_file, agent_name: agent_name)
-              elsif Object.respond_to?(:register_session, true)
-                Object.send(:register_session, card_key, pid, log_file: log_file, agent_name: agent_name)
-              end
-              LOG.info "[Basecamp:Hooks] Spawned #{agent_name} (pid #{pid}) for final decision on card ##{card_number}" if defined?(LOG)
-            end
-          end
-
-          # Dispatch the implementation agent directly (spawns via run_agent) to address
-          # changes_requested feedback. Used by resume and health-check when the agent is
-          # no longer running but the Fizzy card is still assigned (so safe_assign_card
-          # would bail out with "already assigned, skipping").
-          #
-          # @param epic [Hash] Epic state
-          # @param task [Hash] Task within the epic
-          # @return [void]
-          def dispatch_impl_directly(epic, task)
-            card_number = task["fizzy_card"]
-            agent_name = epic["agent"]
-            pr_number = task["pr_number"]
-            project_key = task["project"]
-            card_key = "changes-requested-#{card_number}"
-
-            # Guard: don't spawn a duplicate if a session is already running for this task
-            session_alive = if defined?(session_active?)
-                              session_active?(card_key)
-                            elsif Object.respond_to?(:session_active?, true)
-                              Object.send(:session_active?, card_key)
-                            else
-                              false
-                            end
-
-            if session_alive
-              LOG.info "[Basecamp:Hooks] Session already active for #{card_key} — skipping dispatch" if defined?(LOG)
-              return
-            end
-
-            LOG.info "[Basecamp:Hooks] Direct-dispatching #{agent_name} for changes_requested on card ##{card_number}" if defined?(LOG)
-
-            # Get project config
-            projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
-            projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
-            project_config = projects[project_key]
-
-            unless project_config
-              LOG.error "[Basecamp:Hooks] No project config for '#{project_key}' — cannot direct-dispatch" if defined?(LOG)
-              return
-            end
-
-            repo_path = project_config["repo_path"]
-            unless repo_path
-              LOG.error "[Basecamp:Hooks] No repo_path for project '#{project_key}' — cannot direct-dispatch" if defined?(LOG)
-              return
-            end
-
-            # Ensure pr_number is set — look it up if missing.
-            # This is critical for the pr_synchronized hook to re-trigger gates after fixes.
-            unless pr_number
-              found_pr = find_pr_number(repo_path: repo_path, branch: "fizzy-#{card_number}-*")
-              if found_pr
-                pr_number = found_pr
-                task["pr_number"] = pr_number
-                task["pr_repo"] = project_config["github_repo"]
-                save_epic_state(epic)
-                LOG.info "[Basecamp:Hooks] Backfilled pr_number=#{pr_number} for card ##{card_number} during direct dispatch" if defined?(LOG)
-              elsif defined?(LOG)
-                LOG.warn "[Basecamp:Hooks] Could not find PR for card ##{card_number} — gates won't re-trigger after fixes"
-              end
-            end
-
-            # Find the worktree for this card
-            work_items_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "work_items.json")
-            worktree_path = repo_path  # Default to main repo
-            if File.exist?(work_items_file)
-              work_items = JSON.parse(File.read(work_items_file))
-              work_item = work_items.values.find { |wi| wi.dig("sources", "fizzy", "card_number") == card_number }
-              worktree_path = work_item["worktree"] if work_item&.dig("worktree")
-            end
-
-            # Build prompt
-            changers = (task["changes_requested_by"] || []).join(", ")
-            prompt = <<~PROMPT
-              ## Changes Requested — Fizzy Card ##{card_number}
-
-              Review gates have requested changes on your PR#{" ##{pr_number}" if pr_number}.
-              Reviewers who requested changes: #{changers}
-
-              Your job:
-              1. Read the review feedback: #{pr_number ? "`gh pr view #{pr_number} --comments`" : 'check the Fizzy card comments'}
-              2. Address all requested changes
-              3. Commit and push your fixes
-
-              After pushing, update the Fizzy card with a brief status comment noting what you fixed.
-            PROMPT
-
-            # Resolve GitHub App token so agent's `gh` commands run as their bot identity
-            github_repo = project_config&.dig("github_repo")
-            agent_env = github_repo ? ReviewGate.send(:resolve_agent_github_env, agent_name, github_repo) : {}
-
-            # Spawn the agent directly
-            pid = nil
-            log_file = nil
-
-            begin
-              pid, log_file = method(:run_agent).call(
-                prompt,
-                project_config: project_config,
-                chdir: worktree_path,
-                log_name: "changes-requested-#{card_number}",
+              SessionRegistry.register_session(
+                card_key, pid,
+                log_file: log_file,
                 agent_name: agent_name,
-                source: :basecamp,
-                card_number: card_number,
-                env: agent_env
+                epic_id: epic["id"],
+                card_number: card_number
               )
-            rescue NameError
-              if Object.respond_to?(:run_agent, true)
-                pid, log_file = Object.send(:run_agent,
-                  prompt,
-                  project_config: project_config,
-                  chdir: worktree_path,
-                  log_name: "changes-requested-#{card_number}",
-                  agent_name: agent_name,
-                  source: :basecamp,
-                  card_number: card_number,
-                  env: agent_env)
-              else
-                LOG.warn "[Basecamp:Hooks] run_agent not available — direct impl dispatch skipped" if defined?(LOG)
-                return
-              end
-            end
-
-            # Register session for waybar visibility
-            if pid
-              if defined?(register_session)
-                register_session(card_key, pid, log_file: log_file, agent_name: agent_name)
-              elsif Object.respond_to?(:register_session, true)
-                Object.send(:register_session, card_key, pid, log_file: log_file, agent_name: agent_name)
-              end
-              LOG.info "[Basecamp:Hooks] Spawned #{agent_name} (pid #{pid}) for changes_requested on card ##{card_number}" if defined?(LOG)
+              LOG.info "[Basecamp:Hooks] Spawned #{agent_name} (pid #{pid}) for final decision on card ##{card_number}" if defined?(LOG)
             end
           end
 
@@ -994,10 +769,50 @@ module Brainiac
                 Orchestrator.on_card_completed(card_number)
               else
                 LOG.warn "[Basecamp:Hooks] Could not merge card ##{card_number} — manual intervention needed" if defined?(LOG)
-                task["status"] = "merge_failed"
+                TaskState.transition!(task, :merge_failed, triggered_by: "epic_branch_merge_failed")
                 save_epic_state(epic)
               end
             end
+          end
+
+          # Start an implementation agent even when Fizzy still considers the
+          # card assigned. Re-assigning a card is intentionally a no-op in that
+          # situation, which used to leave recovery loops unable to make progress.
+          def dispatch_impl_directly(epic, task)
+            card_number = task["fizzy_card"]
+            session_id = SessionRegistry.implementation_session_id(card_number)
+            return if SessionRegistry.alive?(session_id)
+
+            project_key = task["project"]
+            projects_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "projects.json")
+            projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+            project_config = projects[project_key]
+            return unless project_config && project_config["repo_path"]
+
+            agent_name = Orchestrator.send(:resolve_agent_for_project, project_key) || epic["agent"]
+            prompt = <<~PROMPT
+              ## Changes Requested — Fizzy Card ##{card_number}
+
+              Review feedback needs attention on PR ##{task["pr_number"]}. Read the review,
+              make the requested fixes, commit and push them, then update the Fizzy card.
+            PROMPT
+            github_repo = project_config["github_repo"]
+            agent_env = github_repo ? ReviewGate.send(:resolve_agent_github_env, agent_name, github_repo) : {}
+            pid, log_file = method(:run_agent).call(
+              prompt, project_config: project_config, chdir: project_config["repo_path"],
+              log_name: session_id, agent_name: agent_name, source: :basecamp,
+              card_number: card_number, env: agent_env
+            )
+            return unless pid
+
+            SessionRegistry.register_session(
+              session_id, pid, log_file: log_file, agent_name: agent_name,
+              epic_id: epic["id"], card_number: card_number
+            )
+          rescue NameError
+            LOG.warn "[Basecamp:Hooks] run_agent unavailable — implementation recovery skipped" if defined?(LOG)
+          rescue StandardError => e
+            LOG.error "[Basecamp:Hooks] Direct implementation dispatch failed: #{e.message}" if defined?(LOG)
           end
 
           # Find a PR number by branch name pattern.

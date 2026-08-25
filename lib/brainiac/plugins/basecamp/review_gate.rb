@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "open3"
+require "time"
 
 module Brainiac
   module Plugins
@@ -29,6 +30,7 @@ module Brainiac
       # Gates can also be triggered by a Fizzy card tag "review-gates" for non-epic PRs.
       module ReviewGate
         BRAINIAC_DIR = ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac"))
+        RESPONDED_STATUSES = %w[approved changes_requested].freeze
 
         class << self
           # Get the configured review gates as normalized hashes.
@@ -64,11 +66,33 @@ module Brainiac
           def all_gates_passed?(task)
             return true unless enabled?
 
-            approvals = task["gate_approvals"] || []
-            required_agents = gates.map { |g| g["agent"].downcase }
-            approved_agents = approvals.map { |a| a["agent"].downcase }
+            gate_states(task).values.all? { |state| state["status"] == "approved" }
+          end
 
-            required_agents.all? { |agent| approved_agents.include?(agent) }
+          def all_gates_responded?(task)
+            return true unless enabled?
+
+            gate_states(task).values.all? { |state| RESPONDED_STATUSES.include?(state["status"]) }
+          end
+
+          def changes_requested?(task)
+            gate_states(task).values.any? { |state| state["status"] == "changes_requested" }
+          end
+
+          def responded_count(task)
+            gate_states(task).values.count { |state| RESPONDED_STATUSES.include?(state["status"]) }
+          end
+
+          # Each configured gate gets one durable state record, keyed by agent name.
+          # This also migrates persisted state from releases that used flat arrays.
+          def gate_states(task)
+            migrate_legacy_gate_state!(task)
+            task["gate_states"] ||= {}
+            gates.each do |gate|
+              key = gate_key(gate["agent"])
+              task["gate_states"][key] ||= new_gate_state(gate)
+            end
+            task["gate_states"]
           end
 
           # Sync gate approvals from GitHub PR reviews (self-healing).
@@ -110,22 +134,15 @@ module Brainiac
               next unless review_state
 
               if review_state == "approved"
-                # Record approval if not already recorded
-                unless (task["gate_approvals"] || []).any? { |a| a["agent"].downcase == agent.downcase }
+                state = gate_state(task, agent, role)
+                was_changes_requested = state["status"] == "changes_requested"
+                unless state["status"] == "approved"
                   record_approval(task, agent: agent, role: role)
                   changes[:approvals_added] << agent
                 end
-                # Clear from changes_requested if present
-                if task["changes_requested_by"]&.include?(agent)
-                  task["changes_requested_by"].delete(agent)
-                  changes[:changes_cleared] << agent
-                end
+                changes[:changes_cleared] << agent if was_changes_requested
               elsif review_state == "changes_requested"
-                # Remove any stale approval
-                task["gate_approvals"]&.reject! { |a| a["agent"].downcase == agent.downcase }
-                # Track changes_requested
-                task["changes_requested_by"] ||= []
-                task["changes_requested_by"] << agent unless task["changes_requested_by"].include?(agent)
+                record_changes_requested(task, agent: agent, role: role)
               end
             end
 
@@ -140,22 +157,31 @@ module Brainiac
           # @param agent [String] Agent that approved
           # @param role [String] Gate role
           def record_approval(task, agent:, role:)
-            task["gate_approvals"] ||= []
-            # Don't duplicate
-            return if task["gate_approvals"].any? { |a| a["agent"].downcase == agent.downcase }
+            state = gate_state(task, agent, role)
+            changed = state["status"] != "approved"
+            state["status"] = "approved"
+            state["responded_at"] = Time.now.iso8601 if changed || state["responded_at"].nil?
+            state
+          end
 
-            task["gate_approvals"] << {
-              "agent" => agent,
-              "role" => role,
-              "approved_at" => Time.now.iso8601
-            }
+          def record_changes_requested(task, agent:, role:)
+            state = gate_state(task, agent, role)
+            changed = state["status"] != "changes_requested"
+            state["status"] = "changes_requested"
+            state["responded_at"] = Time.now.iso8601 if changed || state["responded_at"].nil?
+            state
           end
 
           # Reset gate approvals (when changes are requested and code is updated).
           #
           # @param task [Hash] Task state (mutated in place)
           def reset_approvals(task)
-            task["gate_approvals"] = []
+            gate_states(task).each_value do |state|
+              state["status"] = "pending"
+              state["dispatched_at"] = nil
+              state["responded_at"] = nil
+              state["dispatch_count"] = 0
+            end
           end
 
           # Dispatch all gate agents to review a PR in parallel.
@@ -166,23 +192,17 @@ module Brainiac
           # @param pr_number [Integer, String] PR number
           # @param repo_name [String] e.g. "stowzilla/brainiac-basecamp"
           # @param repo_path [String] Local repo path
-          # @param is_rereview [Boolean] True if this is a re-review after changes
           # @return [Array<String>] Agent names dispatched
-          def dispatch_gates(epic:, task:, pr_number:, repo_name:, repo_path:, is_rereview: false)
+          def dispatch_gates(epic:, task:, pr_number:, repo_name:, repo_path:)
             dispatched = []
 
-            # Get current HEAD SHA for tracking incremental reviews
-            current_sha = get_pr_head_sha(pr_number: pr_number, repo_path: repo_path)
+            gate_states(task).each_value do |state|
+              next unless state["status"] == "pending"
 
-            # Determine if this is a re-review and what SHA to diff from
-            last_reviewed_sha = task["last_reviewed_sha"]
-            diff_from_sha = is_rereview && last_reviewed_sha ? last_reviewed_sha : nil
+              agent_name = state["agent"]
+              role = state["role"] || "review"
 
-            gates.each do |gate|
-              agent_name = gate["agent"]
-              role = gate["role"] || "review"
-
-              LOG.info "[Basecamp:ReviewGate] Dispatching #{agent_name} (#{role}) to review PR ##{pr_number}#{" (incremental from #{diff_from_sha[0..7]})" if diff_from_sha}" if defined?(LOG)
+              LOG.info "[Basecamp:ReviewGate] Dispatching #{agent_name} (#{role}) to review PR ##{pr_number}" if defined?(LOG)
 
               # Dispatch the gate agent via brainiac-github's PR review mechanism.
               # The agent gets the PR diff and reviews it using their bot identity.
@@ -194,102 +214,32 @@ module Brainiac
                   repo_name: repo_name,
                   repo_path: repo_path,
                   card_number: task["fizzy_card"],
-                  epic: epic,
-                  diff_from_sha: diff_from_sha
+                  epic: epic
                 )
               rescue StandardError => e
                 LOG.error "[Basecamp:ReviewGate] Failed to dispatch #{agent_name}: #{e.message}" if defined?(LOG)
               end
 
               dispatched << agent_name
+              state["status"] = "dispatched"
+              state["dispatched_at"] = Time.now.iso8601
+              state["dispatch_count"] += 1
             end
 
             # Update task state
-            task["status"] = "in_review"
-            task["gates_dispatched_at"] = Time.now.iso8601
-            task["gate_approvals"] ||= []
-
-            # Track the SHA we're reviewing for incremental diff on next round
-            task["last_reviewed_sha"] = current_sha if current_sha
+            TaskState.transition!(task, :submit_for_review, triggered_by: "review_gate_dispatch")
 
             dispatched
           end
 
-          # Dispatch only gate agents that have NOT yet responded (no approval, no changes_requested).
-          # Used during resume/health-check when some gates responded but others didn't.
-          #
-          # Tracks per-gate re-dispatch count to prevent infinite loops when a gate agent
-          # keeps crashing. After MAX_GATE_REDISPATCH_RETRIES, stops retrying that gate.
-          #
-          # IMPORTANT: Does NOT overwrite gates_dispatched_at — that timestamp represents
-          # the original dispatch and is used for stale detection. Overwriting it would
-          # reset the timeout window on every partial re-dispatch, causing infinite loops.
-          #
-          # @param epic [Hash] Epic state
-          # @param task [Hash] Task state
-          # @param pr_number [Integer, String] PR number
-          # @param repo_name [String] e.g. "stowzilla/brainiac-basecamp"
-          # @param repo_path [String] Local repo path
-          # @param is_rereview [Boolean] True if this is a re-review after implementation fixes
-          # @return [Array<String>] Agent names dispatched
-          def dispatch_missing_gates(epic:, task:, pr_number:, repo_name:, repo_path:, is_rereview: false)
-            responded_agents = Set.new
-            (task["gate_approvals"] || []).each { |a| responded_agents << a["agent"].downcase }
-            (task["changes_requested_by"] || []).each { |a| responded_agents << a.downcase }
-
-            missing_gates = gates.reject { |g| responded_agents.include?(g["agent"].downcase) }
-            return [] if missing_gates.empty?
-
-            # Track per-gate re-dispatch counts to prevent infinite loops
-            task["gate_redispatch_counts"] ||= {}
-
-            # For re-reviews, determine incremental diff range
-            diff_from_sha = is_rereview && task["last_reviewed_sha"] ? task["last_reviewed_sha"] : nil
-            current_sha = get_pr_head_sha(pr_number: pr_number, repo_path: repo_path)
-
-            dispatched = []
-
-            missing_gates.each do |gate|
-              agent_name = gate["agent"]
-              role = gate["role"] || "review"
-
-              # Check retry count — stop if we've exceeded the max
-              retries = task["gate_redispatch_counts"][agent_name.downcase] || 0
-              if retries >= MAX_GATE_REDISPATCH_RETRIES
-                LOG.warn "[Basecamp:ReviewGate] Gate #{agent_name} exceeded max re-dispatch retries (#{retries}/#{MAX_GATE_REDISPATCH_RETRIES}) — skipping" if defined?(LOG)
-                next
-              end
-
-              LOG.info "[Basecamp:ReviewGate] Re-dispatching missing gate #{agent_name} (#{role}) to review PR ##{pr_number} (retry #{retries + 1}/#{MAX_GATE_REDISPATCH_RETRIES})#{' (incremental)' if diff_from_sha}" if defined?(LOG)
-
-              task["gate_redispatch_counts"][agent_name.downcase] = retries + 1
-
-              Thread.new do
-                dispatch_agent_for_review(
-                  agent_name: agent_name,
-                  role: role,
-                  pr_number: pr_number,
-                  repo_name: repo_name,
-                  repo_path: repo_path,
-                  card_number: task["fizzy_card"],
-                  epic: epic,
-                  diff_from_sha: diff_from_sha
-                )
-              rescue StandardError => e
-                LOG.error "[Basecamp:ReviewGate] Failed to dispatch #{agent_name}: #{e.message}" if defined?(LOG)
-              end
-
-              dispatched << agent_name
+          # Re-dispatch only stale records. A gate that has used its full retry
+          # budget becomes explicitly timed_out instead of silently disappearing.
+          def redispatch_stale_gates(epic:, task:, pr_number:, repo_name:, repo_path:)
+            stale_gate_states(task).each do |state|
+              state["status"] = state["dispatch_count"] > MAX_GATE_REDISPATCH_RETRIES ? "timed_out" : "pending"
             end
 
-            # Record when this partial re-dispatch happened (for diagnostics)
-            # but do NOT overwrite gates_dispatched_at — that's the original timestamp
-            task["last_redispatch_at"] = Time.now.iso8601
-
-            # Update last_reviewed_sha for next round
-            task["last_reviewed_sha"] = current_sha if current_sha
-
-            dispatched
+            dispatch_gates(epic: epic, task: task, pr_number: pr_number, repo_name: repo_name, repo_path: repo_path)
           end
 
           # Build the summary comment for Fizzy after all gates pass and merge completes.
@@ -298,7 +248,7 @@ module Brainiac
           # @param pr_url [String] PR URL
           # @return [String] HTML comment for Fizzy
           def build_gate_summary_comment(task, pr_url:)
-            approvals = task["gate_approvals"] || []
+            approvals = gate_states(task).values.select { |state| state["status"] == "approved" }
             lines = []
             lines << "<p>✅ <strong>All review gates passed</strong> — merged into epic branch.</p>"
             lines << "<p><a href=\"#{pr_url}\">PR Link</a></p>"
@@ -321,33 +271,72 @@ module Brainiac
 
           private
 
-          # Get the HEAD SHA of a PR (for tracking incremental reviews).
-          #
-          # @param pr_number [Integer, String] PR number
-          # @param repo_path [String] Local repo path
-          # @return [String, nil] Commit SHA or nil if failed
-          def get_pr_head_sha(pr_number:, repo_path:)
-            stdout, _, status = Open3.capture3(
-              "gh", "pr", "view", pr_number.to_s,
-              "--json", "headRefOid",
-              "--jq", ".headRefOid",
-              chdir: repo_path
-            )
-            return nil unless status.success?
+          def gate_key(agent)
+            agent.to_s.downcase
+          end
 
-            sha = stdout.strip
-            sha.empty? ? nil : sha
-          rescue StandardError => e
-            LOG.warn "[Basecamp:ReviewGate] Failed to get PR head SHA: #{e.message}" if defined?(LOG)
-            nil
+          def new_gate_state(gate)
+            {
+              "agent" => gate["agent"],
+              "role" => gate["role"] || "review",
+              "status" => "pending",
+              "dispatched_at" => nil,
+              "responded_at" => nil,
+              "dispatch_count" => 0
+            }
+          end
+
+          def gate_state(task, agent, role = nil)
+            gate_states(task)[gate_key(agent)] ||= new_gate_state("agent" => agent, "role" => role)
+          end
+
+          def stale_gate_states(task)
+            gate_states(task).values.select do |state|
+              next false unless state["status"] == "dispatched" && state["dispatched_at"]
+              next false if SessionRegistry.alive?("gate-#{state['agent'].to_s.downcase}-#{task['fizzy_card']}")
+
+              Time.now - Time.parse(state["dispatched_at"]) > STALE_DISPATCH_TIMEOUT
+            end
+          end
+
+          def migrate_legacy_gate_state!(task)
+            return if task["gate_states"]
+
+            task["gate_states"] = {}
+            approvals = task["gate_approvals"] || []
+            changes_requested = (task["changes_requested_by"] || []).map(&:downcase)
+            dispatched_at = task["gates_dispatched_at"]
+            redispatch_counts = task["gate_redispatch_counts"] || {}
+
+            gates.each do |gate|
+              key = gate_key(gate["agent"])
+              approval = approvals.find { |entry| gate_key(entry["agent"]) == key }
+              status = if approval
+                         "approved"
+                       elsif changes_requested.include?(key)
+                         "changes_requested"
+                       elsif dispatched_at
+                         "dispatched"
+                       else
+                         "pending"
+                       end
+              task["gate_states"][key] = new_gate_state(gate).merge(
+                "status" => status,
+                "dispatched_at" => dispatched_at,
+                "responded_at" => approval&.fetch("approved_at", nil),
+                "dispatch_count" => redispatch_counts[key] || (dispatched_at ? 1 : 0)
+              )
+            end
+
+            task.delete("gate_approvals")
+            task.delete("changes_requested_by")
+            task.delete("gates_dispatched_at")
+            task.delete("gate_redispatch_counts")
           end
 
           # Dispatch a single gate agent to review a PR.
           # This creates a review prompt and runs the agent in the repo directory.
-          #
-          # @param diff_from_sha [String, nil] If present, this is a re-review and agent should
-          #   focus on changes since this SHA (incremental review)
-          def dispatch_agent_for_review(agent_name:, role:, pr_number:, repo_name:, repo_path:, card_number:, epic:, diff_from_sha: nil)
+          def dispatch_agent_for_review(agent_name:, role:, pr_number:, repo_name:, repo_path:, card_number:, epic:)
             # Build a review-specific prompt for the gate agent
             prompt = build_gate_review_prompt(
               agent_name: agent_name,
@@ -355,8 +344,7 @@ module Brainiac
               pr_number: pr_number,
               repo_name: repo_name,
               card_number: card_number,
-              epic_title: epic["title"],
-              diff_from_sha: diff_from_sha
+              epic_title: epic["title"]
             )
 
             # Resolve the agent's GitHub token for their bot identity
@@ -396,89 +384,43 @@ module Brainiac
               end
             end
 
-            # Register session for waybar visibility
-            if pid && defined?(register_session)
-              register_session(card_key, pid, log_file: log_file, agent_name: agent_name)
-            elsif pid && Object.respond_to?(:register_session, true)
-              Object.send(:register_session, card_key, pid, log_file: log_file, agent_name: agent_name)
-            end
+            # Register session in SessionRegistry for liveness tracking
+            return unless pid
+
+            SessionRegistry.register_session(
+              card_key, pid,
+              log_file: log_file,
+              agent_name: agent_name,
+              epic_id: epic["id"],
+              card_number: card_number
+            )
+            LOG.info "[Basecamp:ReviewGate] Spawned #{agent_name} (pid #{pid}) for gate review on card ##{card_number}" if defined?(LOG)
           end
 
           # Build the prompt for a gate review agent.
-          #
-          # @param diff_from_sha [String, nil] If present, this is an incremental re-review
-          def build_gate_review_prompt(agent_name:, role:, pr_number:, repo_name:, card_number:, epic_title:, diff_from_sha: nil)
-            if diff_from_sha
-              # Incremental re-review prompt — focus only on new changes
-              <<~PROMPT
-                You are RE-REVIEWING PR ##{pr_number} on #{repo_name} as part of epic: "#{epic_title}".
-                Your role: **#{role}**
+          def build_gate_review_prompt(agent_name:, role:, pr_number:, repo_name:, card_number:, epic_title:)
+            <<~PROMPT
+              You are reviewing PR ##{pr_number} on #{repo_name} as part of epic: "#{epic_title}".
+              Your role: **#{role}**
 
-                This is an INCREMENTAL REVIEW — you already reviewed this PR and requested changes.
-                The implementation agent has pushed fixes. Focus on what changed.
+              This is a review gate — the epic cannot proceed until you approve.
 
-                **Step 1: Read the context to understand WHY changes were made:**
-                ```
-                gh pr view #{pr_number}
-                gh pr view #{pr_number} --comments
-                git log #{diff_from_sha}..HEAD --oneline
-                ```
+              Review the PR changes with `gh pr diff #{pr_number}` and `gh pr view #{pr_number}`.
 
-                - `gh pr view` shows the PR description (implementation rationale)
-                - `--comments` shows discussion and review responses
-                - `git log` shows commit messages explaining each fix
+              Based on your role (#{role}):
+              #{role_instructions(role)}
 
-                Read these BEFORE looking at the code changes.
+              After your review:
+              - If the code meets your standards: `gh pr review #{pr_number} --approve --body "your summary"`
+              - If changes are needed: `gh pr review #{pr_number} --request-changes --body "what needs fixing"`
 
-                **Step 2: View the NEW changes since your last review:**
-                ```
-                git fetch origin && git diff #{diff_from_sha}..HEAD
-                ```
+              Be thorough but pragmatic. This is Fizzy card ##{card_number}.
 
-                Or compare in GitHub: `#{repo_name}/compare/#{diff_from_sha[0..7]}...HEAD`
-
-                If you need the full context, you can still use `gh pr diff #{pr_number}`, but prioritize
-                reviewing the incremental changes first.
-
-                Based on your role (#{role}):
-                #{role_instructions(role)}
-
-                After your review:
-                - If the fixes address your concerns: `gh pr review #{pr_number} --approve --body "your summary"`
-                - If more changes are needed: `gh pr review #{pr_number} --request-changes --body "what still needs fixing"`
-
-                Be thorough but pragmatic. This is Fizzy card ##{card_number}.
-
-                IMPORTANT RESTRICTIONS:
-                - Do NOT open new PRs or modify code — you are a reviewer only
-                - Do NOT comment on the Fizzy card — your review goes on GitHub only
-                - Do NOT use the fizzy CLI at all
-              PROMPT
-            else
-              # Initial full review prompt
-              <<~PROMPT
-                You are reviewing PR ##{pr_number} on #{repo_name} as part of epic: "#{epic_title}".
-                Your role: **#{role}**
-
-                This is a review gate — the epic cannot proceed until you approve.
-
-                Review the PR changes with `gh pr diff #{pr_number}` and `gh pr view #{pr_number}`.
-
-                Based on your role (#{role}):
-                #{role_instructions(role)}
-
-                After your review:
-                - If the code meets your standards: `gh pr review #{pr_number} --approve --body "your summary"`
-                - If changes are needed: `gh pr review #{pr_number} --request-changes --body "what needs fixing"`
-
-                Be thorough but pragmatic. This is Fizzy card ##{card_number}.
-
-                IMPORTANT RESTRICTIONS:
-                - Do NOT open new PRs or modify code — you are a reviewer only
-                - Do NOT comment on the Fizzy card — your review goes on GitHub only
-                - Do NOT use the fizzy CLI at all
-              PROMPT
-            end
+              IMPORTANT RESTRICTIONS:
+              - Do NOT open new PRs or modify code — you are a reviewer only
+              - Do NOT comment on the Fizzy card — your review goes on GitHub only
+              - Do NOT use the fizzy CLI at all
+            PROMPT
           end
 
           # Role-specific review instructions.

@@ -1,0 +1,124 @@
+# frozen_string_literal: true
+
+require_relative "test_helper"
+
+class TestRecovery < Minitest::Test
+  Basecamp = Brainiac::Plugins::Basecamp
+  Registry = Basecamp::SessionRegistry
+  TaskState = Basecamp::TaskState
+  ReviewGate = Basecamp::ReviewGate
+  Orchestrator = Basecamp::Orchestrator
+  Hooks = Basecamp::Hooks
+
+  def setup
+    Registry.reset!
+    Registry.suppress_global_forward = true
+  end
+
+  def task(status: "in_flight")
+    {
+      "fizzy_card" => 1226,
+      "project" => "brainiac-basecamp",
+      "status" => status,
+      "dispatched_at" => (Time.now - Basecamp::STALE_DISPATCH_TIMEOUT - 1).iso8601
+    }
+  end
+
+  def test_live_implementation_session_blocks_stale_redispatch
+    task = task()
+    Registry.register_session("implementation-1226", Process.pid, card_number: 1226)
+
+    result = Basecamp.send(:reconcile_in_flight_task, { "agent" => "Kaylee" }, task)
+
+    refute result
+  end
+
+  def test_dead_implementation_session_is_redispatched_after_grace_period
+    task = task()
+    dispatched = nil
+
+    Hooks.stub(:dispatch_impl_directly, ->(_epic, recovered_task) { dispatched = recovered_task }) do
+      assert Basecamp.send(:reconcile_in_flight_task, { "agent" => "Kaylee" }, task)
+    end
+
+    assert_same task, dispatched
+    assert_operator Time.parse(task["dispatched_at"]), :>, Time.now - 5
+  end
+
+  def test_gate_recovery_transitions_through_task_state
+    task = task(status: "in_review").merge("pr_number" => 12)
+    epic = { "id" => "epic-1", "agent" => "Kaylee" }
+    dispatched = false
+
+    ReviewGate.stub(:enabled?, true) do
+      ReviewGate.stub(:sync_from_github, { synced: true }) do
+        ReviewGate.stub(:all_gates_passed?, true) do
+          Hooks.stub(:dispatch_final_decision, ->(*) { dispatched = true }) do
+            Basecamp.stub(:projects_config, { "brainiac-basecamp" => { "repo_path" => Dir.pwd, "github_repo" => "example/repo" } }) do
+              assert Basecamp.send(:reconcile_in_review_task, epic, task, triggered_by: "test_recovery")
+            end
+          end
+        end
+      end
+    end
+
+    assert TaskState.in?(task, :final_decision)
+    assert_equal "test_recovery", task.fetch("transitions").last.fetch("triggered_by")
+    assert dispatched
+  end
+
+  def test_final_decision_reconciliation_completes_a_merged_pr
+    decision_task = task(status: "final_decision").merge("pr_number" => 21)
+    completed_card = nil
+
+    Basecamp.stub(:projects_config, { "brainiac-basecamp" => { "github_repo" => "example/repo" } }) do
+      Open3.stub(:capture2, ["MERGED\n", nil]) do
+        Orchestrator.stub(:on_card_completed, ->(card) { completed_card = card }) do
+          assert Basecamp.send(:reconcile_final_decision_task, {}, decision_task)
+        end
+      end
+    end
+
+    assert_equal 1226, completed_card
+  end
+
+  def test_final_decision_reconciliation_redispatches_when_no_session_is_live
+    decision_task = task(status: "final_decision").merge("pr_number" => 21, "awaiting_final_decision" => true)
+    dispatched = false
+
+    Basecamp.stub(:projects_config, {}) do
+      Hooks.stub(:dispatch_final_decision, ->(*) { dispatched = true }) do
+        assert Basecamp.send(:reconcile_final_decision_task, { "id" => "epic-1" }, decision_task)
+      end
+    end
+
+    assert dispatched
+    assert decision_task["awaiting_final_decision"]
+  end
+
+  def test_reconcile_epic_finalizes_when_all_tasks_are_complete
+    epic = {
+      "id" => "epic-1",
+      "tasks" => [task(status: "complete"), task(status: "complete").merge("fizzy_card" => 1227)]
+    }
+    completed_cards = []
+    saved = false
+
+    Orchestrator.stub(:mark_todo_complete, ->(_epic, card) { completed_cards << card }) do
+      Orchestrator.stub(:complete_epic, ->(completed_epic) { completed_epic["status"] = "complete" }) do
+        Orchestrator.stub(:save_epic, ->(_epic) { saved = true }) do
+          assert Basecamp.reconcile_epic(epic, triggered_by: "test_recovery")
+        end
+      end
+    end
+
+    assert_equal [1226, 1227], completed_cards
+    assert_equal "complete", epic["status"]
+    assert saved
+  end
+
+  def test_stale_dispatch_treats_missing_and_malformed_timestamps_as_stale
+    assert Basecamp.send(:stale_dispatch?, task.merge("dispatched_at" => nil))
+    assert Basecamp.send(:stale_dispatch?, task.merge("dispatched_at" => "not-a-time"))
+  end
+end
