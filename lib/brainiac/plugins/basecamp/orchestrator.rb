@@ -281,7 +281,7 @@ module Brainiac
               # before Fizzy's normal spawn hook has run.
               dispatch_status = if TaskState.in?(t, :in_flight) &&
                                    !SessionRegistry.implementation_alive?(t["fizzy_card"]) &&
-                                   stale_implementation_dispatch?(t)
+                                   Basecamp.send(:stale_dispatch?, t)
                                   :pending
                                 else
                                   t["status"].to_sym
@@ -356,15 +356,6 @@ module Brainiac
               )
             end
 
-            true
-          end
-
-          def stale_implementation_dispatch?(task)
-            dispatched_at = task["dispatched_at"]
-            return true unless dispatched_at
-
-            Time.now - Time.parse(dispatched_at) > STALE_DISPATCH_TIMEOUT
-          rescue ArgumentError
             true
           end
 

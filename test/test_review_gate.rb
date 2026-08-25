@@ -36,6 +36,21 @@ class TestReviewGate < Minitest::Test
     )
   end
 
+  def test_gate_states_lazily_adds_a_new_configured_gate
+    ReviewGate.gate_states(task)
+    File.write(
+      Config::CONFIG_FILE,
+      JSON.generate(
+        "review_gates" => [{ "agent" => "Galen", "role" => "code-reviewer" }]
+      )
+    )
+    Config.load!
+
+    states = ReviewGate.gate_states(task)
+
+    assert_equal "pending", states.fetch("galen").fetch("status")
+  end
+
   def test_legacy_gate_fields_are_migrated_to_state_records
     legacy_task = task.merge(
       "gates_dispatched_at" => "2026-08-24T12:00:00Z",

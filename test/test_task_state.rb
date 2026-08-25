@@ -57,4 +57,13 @@ class TestTaskState < Minitest::Test
     assert_equal "in_flight", task["transitions"].first["to_state"]
     assert_equal "in_review", task["transitions"].last["to_state"]
   end
+
+  def test_idempotent_transition_does_not_duplicate_the_audit_trail
+    task = { "status" => "in_flight", "transitions" => [] }
+
+    TaskState.transition!(task, :dispatch, triggered_by: "recovery")
+
+    assert_equal "in_flight", task["status"]
+    assert_empty task["transitions"]
+  end
 end
