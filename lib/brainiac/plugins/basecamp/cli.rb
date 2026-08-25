@@ -37,6 +37,8 @@ module Brainiac
               cmd_set(args)
             when "reset"
               cmd_reset(args)
+            when "scrap"
+              cmd_scrap(args)
             when "webhook", "webhooks"
               cmd_webhook(args)
             else
@@ -331,6 +333,184 @@ module Brainiac
             Dir.chdir(worktree_path)
             exec ENV.fetch("SHELL", "/bin/bash")
           end
+
+          # rubocop:disable Metrics/MethodLength, Metrics/CyclomaticComplexity, Metrics/PerceivedComplexity
+          def cmd_scrap(args)
+            todolist_id = args.shift
+
+            dry_run = args.delete("--dry-run") || args.delete("-n")
+            confirmed = args.delete("--confirm") || args.delete("-y")
+            keep_cards = args.delete("--keep-cards")
+
+            unless todolist_id
+              puts "Usage: brainiac basecamp scrap <todolist-id> [options]"
+              puts ""
+              puts "Scrap an epic — full teardown of all related resources."
+              puts ""
+              puts "Options:"
+              puts "  --confirm, -y       Skip confirmation prompt"
+              puts "  --dry-run, -n       Show what would happen without doing it"
+              puts "  --keep-cards        Don't close the Fizzy cards (keep them for re-planning)"
+              puts ""
+              puts "This will:"
+              puts "  1. Close all Fizzy cards in the epic (unless --keep-cards)"
+              puts "  2. Close any open PRs targeting the epic branch"
+              puts "  3. Delete the epic branch from all repos"
+              puts "  4. Mark all Basecamp todos complete with a 🗑️ comment"
+              puts "  5. Clean up epic memory files"
+              puts "  6. Remove the epic from state"
+              puts ""
+              puts "Active epics:"
+              load_epics.select { |e| %w[active cancelled].include?(e["status"]) }.each do |e|
+                puts "  #{e['basecamp_todolist_id']} — #{e['title']} [#{e['status']}]"
+              end
+              return
+            end
+
+            epics = load_epics
+            epic = epics.find { |e| e["basecamp_todolist_id"] == todolist_id.to_s }
+
+            unless epic
+              puts "❌ No epic found with todolist ID #{todolist_id}"
+              puts ""
+              puts "Known epics:"
+              epics.each do |e|
+                puts "  #{e['basecamp_todolist_id']} — #{e['title']} [#{e['status']}]"
+              end
+              return
+            end
+
+            tasks = epic["tasks"] || []
+            epic_branches = epic["epic_branches"] || {}
+            card_numbers = tasks.filter_map { |t| t["fizzy_card"] }
+
+            # Preview what we're about to do
+            puts dry_run ? "🔍 DRY RUN — nothing will be changed" : "🗑️  Scrapping epic: #{epic['title']}"
+            puts ""
+            puts "Epic:     #{epic['title']}"
+            puts "Status:   #{epic['status']}"
+            puts "Todolist: #{epic['basecamp_todolist_id']}"
+            puts "Tasks:    #{tasks.size}"
+            puts ""
+
+            actions = []
+
+            # 1. Fizzy cards to close
+            unless keep_cards
+              if card_numbers.any?
+                actions << { type: :close_cards, cards: card_numbers }
+                puts "  📋 Close #{card_numbers.size} Fizzy card(s): #{card_numbers.map { |c| "##{c}" }.join(', ')}"
+              end
+            else
+              puts "  📋 Keep Fizzy cards (--keep-cards)"
+            end
+
+            # 2. Close open PRs and delete epic branches
+            if epic_branches.any?
+              epic_branches.each do |project_key, branch_name|
+                actions << { type: :close_prs_and_delete_branch, project: project_key, branch: branch_name }
+                puts "  🌿 Delete branch '#{branch_name}' in #{project_key} (close open PRs first)"
+              end
+            end
+
+            # 3. Mark Basecamp todos complete
+            todo_ids = tasks.filter_map { |t| t["todo_id"] }
+            if todo_ids.any?
+              actions << { type: :complete_todos, todo_ids: todo_ids, project_id: epic["basecamp_project_id"] }
+              puts "  ✓  Mark #{todo_ids.size} Basecamp todo(s) complete"
+            end
+
+            # 4. Clean up epic memory
+            actions << { type: :cleanup_memory, todolist_id: todolist_id }
+            puts "  🧹 Clean up epic memory"
+
+            # 5. Remove from state
+            actions << { type: :remove_from_state, epic_id: epic["id"] }
+            puts "  💾 Remove epic from state file"
+
+            puts ""
+
+            if dry_run
+              puts "No changes made. Remove --dry-run to execute."
+              return
+            end
+
+            # Confirm unless --confirm passed
+            unless confirmed
+              print "Proceed? [y/N] "
+              answer = $stdin.gets&.strip&.downcase
+              unless answer == "y" || answer == "yes"
+                puts "Aborted."
+                return
+              end
+            end
+
+            puts ""
+            puts "Scrapping..."
+
+            errors = []
+
+            actions.each do |action|
+              case action[:type]
+              when :close_cards
+                action[:cards].each do |card_number|
+                  result = scrap_close_fizzy_card(card_number)
+                  if result
+                    puts "  ✓ Closed Fizzy card ##{card_number}"
+                  else
+                    errors << "Failed to close Fizzy card ##{card_number}"
+                    puts "  ✗ Failed to close Fizzy card ##{card_number}"
+                  end
+                end
+
+              when :close_prs_and_delete_branch
+                project_key = action[:project]
+                branch_name = action[:branch]
+                repo_path = resolve_repo_path(project_key)
+
+                if repo_path
+                  # Close any open PRs targeting or from the epic branch
+                  closed_prs = scrap_close_epic_prs(repo_path, branch_name)
+                  closed_prs.each { |pr| puts "  ✓ Closed PR ##{pr} in #{project_key}" }
+
+                  # Delete the remote branch
+                  if scrap_delete_branch(repo_path, branch_name)
+                    puts "  ✓ Deleted branch '#{branch_name}' in #{project_key}"
+                  else
+                    errors << "Failed to delete branch '#{branch_name}' in #{project_key}"
+                    puts "  ✗ Failed to delete branch '#{branch_name}' in #{project_key}"
+                  end
+                else
+                  errors << "Could not resolve repo path for project '#{project_key}'"
+                  puts "  ✗ Could not resolve repo path for '#{project_key}'"
+                end
+
+              when :complete_todos
+                action[:todo_ids].each do |todo_id|
+                  scrap_complete_todo(todo_id, action[:project_id], epic["agent"])
+                end
+                puts "  ✓ Marked #{action[:todo_ids].size} todo(s) complete in Basecamp"
+
+              when :cleanup_memory
+                EpicMemory.cleanup(action[:todolist_id], archive: false)
+                puts "  ✓ Cleaned up epic memory"
+
+              when :remove_from_state
+                epics.reject! { |e| e["id"] == action[:epic_id] }
+                save_epics(epics)
+                puts "  ✓ Removed epic from state"
+              end
+            end
+
+            puts ""
+            if errors.empty?
+              puts "✅ Epic scrapped successfully."
+            else
+              puts "⚠️  Epic scrapped with #{errors.size} error(s):"
+              errors.each { |e| puts "    - #{e}" }
+            end
+          end
+          # rubocop:enable Metrics/MethodLength, Metrics/CyclomaticComplexity, Metrics/PerceivedComplexity
 
           def cmd_link(args)
             fizzy_card = args.shift
@@ -663,6 +843,7 @@ module Brainiac
                 reset task <card-number> [--to <status>] Reset a task to a given status (default: pending)
                 reset epic <todolist-id> [--to <status>] Reset entire epic or all tasks within it
                 reset gates <card-number>               Clear gate approvals and re-dispatch gates
+                scrap <todolist-id> [--confirm]         Scrap an epic: close cards, delete branches, clean up
                 webhook sync                            Ensure webhooks have all required event types
 
               Config file: ~/.brainiac/basecamp.json
@@ -1010,6 +1191,112 @@ module Brainiac
                                                         }))
           end
 
+          # --- Scrap helpers ---
+
+          # Close a Fizzy card via CLI.
+          def scrap_close_fizzy_card(card_number)
+            stdout, stderr, status = Open3.capture3("fizzy", "card", "close", card_number.to_s)
+            status.success?
+          rescue StandardError => e
+            false
+          end
+
+          # Close all open PRs that reference the epic branch (head or base).
+          #
+          # @param repo_path [String] Path to the repo
+          # @param branch_name [String] Epic branch name
+          # @return [Array<Integer>] Closed PR numbers
+          def scrap_close_epic_prs(repo_path, branch_name)
+            closed = []
+
+            # Find PRs where epic branch is the base (task PRs targeting epic branch)
+            stdout, _stderr, status = Open3.capture3(
+              "gh", "pr", "list", "--base", branch_name, "--state", "open",
+              "--json", "number", "--jq", ".[].number",
+              chdir: repo_path
+            )
+            if status.success? && !stdout.strip.empty?
+              stdout.strip.split("\n").each do |pr_num|
+                close_pr(repo_path, pr_num.strip.to_i, "Scrapped as part of epic teardown")
+                closed << pr_num.strip.to_i
+              end
+            end
+
+            # Find PRs where epic branch is the head (final PR to main)
+            stdout, _stderr, status = Open3.capture3(
+              "gh", "pr", "list", "--head", branch_name, "--state", "open",
+              "--json", "number", "--jq", ".[].number",
+              chdir: repo_path
+            )
+            if status.success? && !stdout.strip.empty?
+              stdout.strip.split("\n").each do |pr_num|
+                close_pr(repo_path, pr_num.strip.to_i, "Scrapped as part of epic teardown")
+                closed << pr_num.strip.to_i
+              end
+            end
+
+            closed
+          rescue StandardError
+            closed
+          end
+
+          # Close a single PR with a comment.
+          def close_pr(repo_path, pr_number, comment)
+            Open3.capture3(
+              "gh", "pr", "close", pr_number.to_s, "--comment", "🗑️ #{comment}",
+              chdir: repo_path
+            )
+          rescue StandardError
+            # Best effort
+          end
+
+          # Delete an epic branch from the remote.
+          def scrap_delete_branch(repo_path, branch_name)
+            # Delete remote branch
+            _stdout, _stderr, status = Open3.capture3(
+              "git", "push", "origin", "--delete", branch_name,
+              chdir: repo_path
+            )
+
+            # Also delete local branch if it exists
+            Open3.capture3("git", "branch", "-D", branch_name, chdir: repo_path)
+
+            status.success?
+          rescue StandardError
+            false
+          end
+
+          # Mark a Basecamp todo complete with a scrap comment.
+          def scrap_complete_todo(todo_id, project_id, agent)
+            # Add a comment first
+            Client.run_safe(
+              "comments", "create", todo_id.to_s,
+              "🗑️ Scrapped — epic torn down via `brainiac basecamp scrap`",
+              "--in", project_id.to_s, "--json",
+              profile: agent&.downcase
+            )
+
+            # Mark complete
+            Client.run_safe(
+              "todos", "complete", todo_id.to_s,
+              "--in", project_id.to_s, "--json",
+              profile: agent&.downcase
+            )
+          rescue StandardError
+            # Best effort
+          end
+
+          # Resolve a project key to its repo path from projects.json.
+          def resolve_repo_path(project_key)
+            projects_file = File.join(BRAINIAC_DIR, "projects.json")
+            return nil unless File.exist?(projects_file)
+
+            projects = JSON.parse(File.read(projects_file))
+            projects.dig(project_key, "repo_path")
+          rescue JSON::ParserError
+            nil
+          end
+
           # --- Deploy helpers ---
 
           def list_epics_for_deploy
@@ -1150,7 +1437,7 @@ module Brainiac
       end
 
       def self.completions
-        %w[setup config status epics deploy link bot projects set reset webhook]
+        %w[setup config status epics deploy link bot projects set reset scrap webhook]
       end
     end
   end
