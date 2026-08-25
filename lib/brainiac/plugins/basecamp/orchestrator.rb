@@ -522,7 +522,7 @@ module Brainiac
           def resolve_project_from_fizzy_card(card_number)
             return nil unless card_number
 
-            # Query the Fizzy card for its tags
+            # Query the Fizzy card for its tags and board
             stdout, _, status = Open3.capture3("fizzy", "card", "show", card_number.to_s, "--json")
             return nil unless status.success?
 
@@ -531,25 +531,65 @@ module Brainiac
             card = card_data.is_a?(Hash) && card_data["data"] ? card_data["data"] : card_data
             tags = card["tags"] || []
 
-            # Extract tag names (tags can be strings or hashes with "name" key)
-            tag_names = tags.map { |t| t.is_a?(Hash) ? t["name"] : t.to_s }.map(&:downcase)
-            return nil if tag_names.empty?
-
-            # Load projects and match tags
+            # Load projects for matching
             projects_file = File.join(BRAINIAC_DIR, "projects.json")
             return nil unless File.exist?(projects_file)
 
             all_projects = JSON.parse(File.read(projects_file))
 
-            # Find the first project whose fizzy_tags intersect with the card's tags
-            all_projects.each do |key, config|
-              project_tags = (config["tags"] || config["fizzy_tags"] || []).map(&:downcase)
-              return key if tag_names.intersect?(project_tags)
+            # Priority 1: Match by card tags (same as fizzy handler)
+            tag_names = tags.map { |t| t.is_a?(Hash) ? t["name"] : t.to_s }.map(&:downcase)
+            unless tag_names.empty?
+              all_projects.each do |key, config|
+                project_tags = (config["tags"] || config["fizzy_tags"] || []).map(&:downcase)
+                return key if tag_names.intersect?(project_tags)
+              end
+            end
+
+            # Priority 2: Match by card's board → board_key → project with fizzy_board
+            # This mirrors the fizzy handler's fallback logic to prevent project mismatch
+            board_id = card.dig("board", "id")
+            if board_id
+              board_key = resolve_board_key_for_id(board_id)
+              if board_key
+                # Check for board's default_project in fizzy config
+                fizzy_config_file = File.join(BRAINIAC_DIR, "fizzy.json")
+                if File.exist?(fizzy_config_file)
+                  fizzy_config = JSON.parse(File.read(fizzy_config_file))
+                  board_config = fizzy_config.dig("boards", board_key)
+                  if board_config && board_config["default_project"]
+                    project_key = board_config["default_project"]
+                    return project_key if all_projects.key?(project_key)
+                  end
+                end
+
+                # Fall back to any project whose fizzy_board matches this board_key
+                all_projects.each do |key, config|
+                  return key if config["fizzy_board"] == board_key
+                end
+              end
             end
 
             nil
           rescue StandardError => e
             LOG.warn "[Basecamp:Orchestrator] Could not resolve project for Fizzy card ##{card_number}: #{e.message}" if defined?(LOG)
+            nil
+          end
+
+          # Resolve a fizzy board_key from a board_id by checking fizzy.json boards config.
+          def resolve_board_key_for_id(board_id)
+            fizzy_config_file = File.join(BRAINIAC_DIR, "fizzy.json")
+            return nil unless File.exist?(fizzy_config_file)
+
+            fizzy_config = JSON.parse(File.read(fizzy_config_file))
+            boards = fizzy_config["boards"] || {}
+
+            boards.each do |key, config|
+              return key if config["board_id"] == board_id
+            end
+
+            nil
+          rescue StandardError
             nil
           end
 
