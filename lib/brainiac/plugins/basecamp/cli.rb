@@ -35,6 +35,8 @@ module Brainiac
               cmd_projects(args)
             when "set"
               cmd_set(args)
+            when "sync"
+              cmd_sync
             when "reset"
               cmd_reset(args)
             when "webhook", "webhooks"
@@ -146,26 +148,26 @@ module Brainiac
             end
 
             # Check active epics
-            epics_file = File.join(BRAINIAC_DIR, "basecamp_epics.json")
-            if File.exist?(epics_file)
-              epics = JSON.parse(File.read(epics_file))
-              active = (epics["epics"] || []).count { |e| e["status"] == "active" }
-              total = (epics["epics"] || []).size
+            all_epics = load_epics
+            if all_epics.any?
+              active = all_epics.count { |e| e["status"] == "active" }
+              total = all_epics.size
               puts "  Epics:  #{active} active, #{total} total"
+              puts "  Remote: #{RemoteState.enabled? ? '✓ synced to Basecamp document' : '✗ local only'}"
             else
               puts "  Epics:  none"
             end
           end
 
           def cmd_epics(args)
-            epics_file = File.join(BRAINIAC_DIR, "basecamp_epics.json")
-            unless File.exist?(epics_file)
+            # Sync from remote if enabled (ensures we see latest state)
+            RemoteState.sync! if RemoteState.enabled? && args.include?("--sync")
+
+            epics = load_epics
+            if epics.empty?
               puts "No epics found."
               return
             end
-
-            data = JSON.parse(File.read(epics_file))
-            epics = data["epics"] || []
 
             if args.include?("--all")
               display_epics = epics
@@ -216,6 +218,25 @@ module Brainiac
                 end
               end
               puts ""
+            end
+          end
+
+          def cmd_sync
+            unless RemoteState.enabled?
+              puts "Remote state sync is not enabled."
+              puts ""
+              puts "To enable, run:"
+              puts "  brainiac basecamp set remote-state <basecamp-project-id>"
+              return
+            end
+
+            puts "Syncing epic state from Basecamp document..."
+            if RemoteState.sync!
+              epics = RemoteState.load_epics
+              active = epics.count { |e| e["status"] == "active" }
+              puts "✓ Synced #{epics.size} epic(s) (#{active} active)"
+            else
+              puts "✗ Sync failed — check your network and basecamp CLI auth"
             end
           end
 
@@ -639,13 +660,17 @@ module Brainiac
                 set fizzy-account-id <id>               Set Fizzy account ID (for card URLs)
                 set review-gate <mode>                  Set review gate (on_complete or on_pr_merge)
                 set epic-prefix <prefix>                Set epic todolist prefix (default: "Epic:")
+                set remote-state <project-id>           Enable remote state sync to Basecamp document
+                set remote-state off                    Disable remote state sync
+                sync                                    Pull latest epic state from Basecamp document
                 reset task <card-number> [--to <status>] Reset a task to a given status (default: pending)
                 reset epic <todolist-id> [--to <status>] Reset entire epic or all tasks within it
                 reset gates <card-number>               Clear gate approvals and re-dispatch gates
                 webhook sync                            Ensure webhooks have all required event types
 
               Config file: ~/.brainiac/basecamp.json
-              Epics state: ~/.brainiac/basecamp_epics.json
+              Epics state: ~/.brainiac/basecamp_epics.json (local cache)
+              Remote state: Basecamp document (source of truth when enabled)
 
               Review gate modes:
                 on_complete   — Advance to next task as soon as agent finishes (default)
@@ -678,6 +703,8 @@ module Brainiac
               puts "  fizzy-account-id <id>      Fizzy account ID (for card URLs)"
               puts "  review-gate <mode>         on_complete or on_pr_merge"
               puts "  epic-prefix <prefix>       Todolist prefix for epic detection"
+              puts "  remote-state <project-id>  Enable remote state sync (Basecamp project ID)"
+              puts "  remote-state off           Disable remote state sync"
               return
             end
 
@@ -716,9 +743,33 @@ module Brainiac
               puts "✓ Set basecamp_profile = #{value}"
               puts "  All basecamp CLI commands will use --profile #{value}"
               puts "  Set up the profile: basecamp profile create #{value} && basecamp auth login --profile #{value}"
+            when "remote-state"
+              if value == "off" || value == "false" || value == "disable"
+                config["remote_state"] = { "enabled" => false }
+                save_config(config)
+                puts "✓ Remote state sync disabled"
+                puts "  Epic state will only be stored locally"
+              else
+                config["remote_state"] = {
+                  "enabled" => true,
+                  "project_id" => value
+                }
+                save_config(config)
+                Config.load!
+                puts "✓ Remote state sync enabled (project: #{value})"
+                puts "  Creating Basecamp document for state storage..."
+                doc_id = RemoteState.ensure_document!
+                if doc_id
+                  puts "  ✓ Document created: #{doc_id}"
+                  puts "  Epic state will now sync across all machines"
+                else
+                  puts "  ✗ Failed to create document — check auth and project access"
+                  puts "  Will retry on next save operation"
+                end
+              end
             else
               puts "Unknown key: #{key}"
-              puts "Valid keys: fizzy-account-id, review-gate, epic-prefix, profile"
+              puts "Valid keys: fizzy-account-id, review-gate, epic-prefix, profile, remote-state"
             end
           end
 
@@ -972,21 +1023,14 @@ module Brainiac
           end
 
           def load_epics
-            epics_file = File.join(BRAINIAC_DIR, "basecamp_epics.json")
-            return [] unless File.exist?(epics_file)
-
-            data = JSON.parse(File.read(epics_file))
-            data["epics"] || []
-          rescue JSON::ParserError
-            []
+            RemoteState.load_epics
           end
 
           def save_epics(epics)
-            epics_file = File.join(BRAINIAC_DIR, "basecamp_epics.json")
-            File.write(epics_file, JSON.pretty_generate({
-                                                          "epics" => epics,
-                                                          "updated_at" => Time.now.iso8601
-                                                        }))
+            # Write the full array via RemoteState (save each individually to get upsert behavior)
+            # But since the CLI modifies the full array, we write it directly
+            RemoteState.send(:write_local_cache, epics)
+            RemoteState.send(:write_remote, epics) if RemoteState.enabled?
           end
 
           # --- Deploy helpers ---

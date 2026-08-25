@@ -12,10 +12,9 @@ module Brainiac
       # The orchestrator drives execution: reads the todolist, builds the dep graph,
       # assigns unblocked Fizzy cards, and advances state as cards complete.
       #
-      # State is persisted to ~/.brainiac/basecamp_epics.json.
+      # State is persisted via RemoteState (write-through: Basecamp document + local cache).
       module Orchestrator
         BRAINIAC_DIR = ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac"))
-        EPICS_FILE = File.join(BRAINIAC_DIR, "basecamp_epics.json")
 
         class << self
           # Start orchestrating an epic from a todolist.
@@ -808,27 +807,14 @@ module Brainiac
             }
           end
 
-          # Load all epics from disk.
+          # Load all epics (via RemoteState write-through cache).
           def load_epics
-            return [] unless File.exist?(EPICS_FILE)
-
-            data = JSON.parse(File.read(EPICS_FILE))
-            data["epics"] || []
-          rescue JSON::ParserError
-            []
+            RemoteState.load_epics
           end
 
-          # Save an epic to disk (upsert by ID).
+          # Save an epic (via RemoteState write-through cache — upsert by ID).
           def save_epic(epic)
-            all = load_epics
-            idx = all.index { |e| e["id"] == epic["id"] }
-            if idx
-              all[idx] = epic
-            else
-              all << epic
-            end
-
-            File.write(EPICS_FILE, JSON.pretty_generate({ "epics" => all, "updated_at" => Time.now.iso8601 }))
+            RemoteState.save_epic(epic)
           end
 
           # Load agent registry from ~/.brainiac/agents.json.

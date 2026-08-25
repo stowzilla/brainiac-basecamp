@@ -75,12 +75,8 @@ module Brainiac
                 epic["cancelled_at"] = Time.now.iso8601
                 epic["updated_at"] = Time.now.iso8601
 
-                # Save the cancellation
-                epics_file = File.join(ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")), "basecamp_epics.json")
-                all = File.exist?(epics_file) ? (JSON.parse(File.read(epics_file))["epics"] || []) : []
-                idx = all.index { |e| e["id"] == epic["id"] }
-                all[idx] = epic if idx
-                File.write(epics_file, JSON.pretty_generate({ "epics" => all, "updated_at" => Time.now.iso8601 }))
+                # Save the cancellation via RemoteState
+                RemoteState.save_epic(epic)
 
                 LOG.info "[Basecamp:Webhook] Bot unassigned — cancelled epic '#{epic['title']}'" if defined?(LOG)
                 return [200, { status: "epic_cancelled", epic_id: epic["id"] }.to_json]

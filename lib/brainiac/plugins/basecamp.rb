@@ -12,6 +12,7 @@ require_relative "basecamp/epic_memory"
 require_relative "basecamp/session_registry"
 require_relative "basecamp/review_gate"
 require_relative "basecamp/comment_responder"
+require_relative "basecamp/remote_state"
 require_relative "basecamp/orchestrator"
 require_relative "basecamp/webhook"
 require_relative "basecamp/hooks"
@@ -35,6 +36,12 @@ module Brainiac
         # @param app [Sinatra::Application] The running Brainiac server
         def register(app)
           Config.load!
+
+          # Sync epic state from Basecamp document if remote state is enabled
+          if RemoteState.enabled?
+            LOG.info "[Basecamp] Remote state sync enabled — pulling latest from Basecamp" if defined?(LOG)
+            RemoteState.sync!
+          end
 
           # Clear all sessions on startup — PIDs from prior runs are untrustworthy
           SessionRegistry.clear_all!
@@ -376,22 +383,7 @@ module Brainiac
         end
 
         def save_epic_via_api(epic)
-          epics_file = File.join(
-            ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac")),
-            "basecamp_epics.json"
-          )
-
-          all = if File.exist?(epics_file)
-                  data = JSON.parse(File.read(epics_file))
-                  data["epics"] || []
-                else
-                  []
-                end
-
-          idx = all.index { |e| e["id"] == epic["id"] }
-          all[idx] = epic if idx
-
-          File.write(epics_file, JSON.pretty_generate({ "epics" => all, "updated_at" => Time.now.iso8601 }))
+          RemoteState.save_epic(epic)
         end
       end
     end
