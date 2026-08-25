@@ -1,6 +1,30 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
+# Older Minitest releases load Object#stub from this separate file; in current
+# Minitest it is included by minitest/autorun and the file no longer exists.
+begin
+  require "minitest/mock"
+rescue LoadError
+  # Minitest 6 removed the mock extension. Keep the test suite runnable with
+  # the system Ruby as well as the project's Minitest 5 dependency.
+  class Object
+    def stub(method_name, value, &)
+      singleton = class << self; self; end
+      original = "__test_original_#{method_name}"
+      singleton.alias_method(original, method_name)
+      singleton.define_method(method_name) do |*args, **kwargs, &method_block|
+        value.respond_to?(:call) ? value.call(*args, **kwargs, &method_block) : value
+      end
+      yield
+    ensure
+      # Restoring the original unbound method retains its exact argument
+      # signature, including keyword arguments, on Ruby 3+.
+      singleton.define_method(method_name, singleton.instance_method(original))
+      singleton.remove_method(original)
+    end
+  end
+end
 require "json"
 require "fileutils"
 require "tmpdir"
