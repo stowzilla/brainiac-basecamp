@@ -287,8 +287,9 @@ module Brainiac
             # Run deploy
             success = run_deploy(worktree_path, deploy_env)
 
+            puts ""
+
             if success
-              puts ""
               puts "✅ Deploy completed successfully"
 
               # Update epic state
@@ -297,9 +298,7 @@ module Brainiac
                 "at" => Time.now.iso8601,
                 "status" => "success"
               }
-              save_epics(epics)
             else
-              puts ""
               puts "❌ Deploy failed"
 
               epic["last_deploy"] = {
@@ -307,8 +306,9 @@ module Brainiac
                 "at" => Time.now.iso8601,
                 "status" => "failed"
               }
-              save_epics(epics)
             end
+
+            save_epics(epics)
           end
 
           def cmd_link(args)
@@ -1016,7 +1016,7 @@ module Brainiac
             # 3. Per-project default from config
             # Prefer the project from tasks (set from Fizzy card tags) over basecamp mapping
             # since multiple brainiac projects can share the same basecamp project.
-            project_key = (epic["tasks"] || []).map { |t| t["project"] }.compact.first
+            project_key = (epic["tasks"] || []).filter_map { |t| t["project"] }.first
             project_key ||= Config.brainiac_project_for(epic["basecamp_project_id"])
             project_env = Config.deploy.dig("project_envs", project_key) if project_key
             return project_env if project_env
@@ -1052,9 +1052,7 @@ module Brainiac
                   current_worktree = line.sub("worktree ", "").strip
                 elsif line.start_with?("branch refs/heads/")
                   wt_branch = line.sub("branch refs/heads/", "").strip
-                  if wt_branch == branch_name && current_worktree && current_worktree != repo_path
-                    return current_worktree
-                  end
+                  return current_worktree if wt_branch == branch_name && current_worktree && current_worktree != repo_path
                 end
               end
             end
