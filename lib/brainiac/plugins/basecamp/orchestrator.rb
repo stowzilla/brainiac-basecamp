@@ -16,6 +16,7 @@ module Brainiac
       module Orchestrator
         BRAINIAC_DIR = ENV.fetch("BRAINIAC_DIR", File.join(Dir.home, ".brainiac"))
         EPICS_FILE = File.join(BRAINIAC_DIR, "basecamp_epics.json")
+        COMPLETION_MUTEX = Mutex.new
 
         class << self
           # Start orchestrating an epic from a todolist.
@@ -106,46 +107,51 @@ module Brainiac
           # @return [Boolean] Whether this card was part of an epic
           def on_card_completed(card_number)
             card_number = card_number.to_i
-            epic = find_epic_for_card(card_number)
-            return false unless epic
 
-            # Idempotency check — don't process completion twice
-            task = epic["tasks"].find { |t| t["fizzy_card"] == card_number }
-            if task && task["status"] == "complete"
-              LOG.info "[Basecamp:Orchestrator] Card ##{card_number} already complete, skipping duplicate completion" if defined?(LOG)
-              return true
-            end
+            # Serialize completion processing to prevent duplicate notifications
+            # when multiple hooks fire for the same PR merge event.
+            COMPLETION_MUTEX.synchronize do
+              epic = find_epic_for_card(card_number)
+              return false unless epic
 
-            LOG.info "[Basecamp:Orchestrator] Card ##{card_number} completed, advancing epic '#{epic['title']}'" if defined?(LOG)
-
-            # Mark the task as complete in our state
-            if task
-              TaskState.transition!(task, :complete, triggered_by: "fizzy_card_completed")
-              task["completed_at"] = Time.now.iso8601
-              epic["updated_at"] = Time.now.iso8601
-              log_event(epic, "task_completed", "Card ##{card_number} completed")
-            end
-
-            # Mark the corresponding Basecamp todo as complete
-            mark_todo_complete(epic, card_number)
-
-            # Post a status comment on the Basecamp todo
-            post_completion_comment(epic, card_number)
-
-            # Check if epic is fully done
-            if epic["tasks"].all? { |t| t["status"] == "complete" }
-              complete_epic(epic)
-            else
-              # Dispatch epic review agent before moving to next tasks
-              # This ensures the plan still makes sense after implementation decisions
-              dispatch_epic_review(epic, card_number) do
-                # After review completes, dispatch next unblocked tasks
-                resolve_and_dispatch(epic)
+              # Idempotency check — don't process completion twice
+              task = epic["tasks"].find { |t| t["fizzy_card"] == card_number }
+              if task && task["status"] == "complete"
+                LOG.info "[Basecamp:Orchestrator] Card ##{card_number} already complete, skipping duplicate completion" if defined?(LOG)
+                return true
               end
-            end
 
-            save_epic(epic)
-            true
+              LOG.info "[Basecamp:Orchestrator] Card ##{card_number} completed, advancing epic '#{epic['title']}'" if defined?(LOG)
+
+              # Mark the task as complete in our state
+              if task
+                TaskState.transition!(task, :complete, triggered_by: "fizzy_card_completed")
+                task["completed_at"] = Time.now.iso8601
+                epic["updated_at"] = Time.now.iso8601
+                log_event(epic, "task_completed", "Card ##{card_number} completed")
+              end
+
+              # Mark the corresponding Basecamp todo as complete
+              mark_todo_complete(epic, card_number)
+
+              # Post a status comment on the Basecamp todo
+              post_completion_comment(epic, card_number)
+
+              # Check if epic is fully done
+              if epic["tasks"].all? { |t| t["status"] == "complete" }
+                complete_epic(epic)
+              else
+                # Dispatch epic review agent before moving to next tasks
+                # This ensures the plan still makes sense after implementation decisions
+                dispatch_epic_review(epic, card_number) do
+                  # After review completes, dispatch next unblocked tasks
+                  resolve_and_dispatch(epic)
+                end
+              end
+
+              save_epic(epic)
+              true
+            end
           end
 
           # Find an active epic that contains a given Fizzy card.
