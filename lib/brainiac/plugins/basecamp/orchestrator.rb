@@ -275,7 +275,13 @@ module Brainiac
               # A stale in_flight state is diagnostic state, not liveness evidence.
               # It becomes dispatchable again only after the implementation session has
               # died; in_review/final_decision remain intentionally non-dispatchable.
-              dispatch_status = if TaskState.in?(t, :in_flight) && !SessionRegistry.implementation_alive?(t["fizzy_card"])
+              # Give a newly assigned implementation agent time to register its
+              # session. Without this grace period, a recovery pass that just
+              # re-assigned a stale card can immediately assign it a second time
+              # before Fizzy's normal spawn hook has run.
+              dispatch_status = if TaskState.in?(t, :in_flight) &&
+                                   !SessionRegistry.implementation_alive?(t["fizzy_card"]) &&
+                                   stale_implementation_dispatch?(t)
                                   :pending
                                 else
                                   t["status"].to_sym
@@ -350,6 +356,15 @@ module Brainiac
               )
             end
 
+            true
+          end
+
+          def stale_implementation_dispatch?(task)
+            dispatched_at = task["dispatched_at"]
+            return true unless dispatched_at
+
+            Time.now - Time.parse(dispatched_at) > STALE_DISPATCH_TIMEOUT
+          rescue ArgumentError
             true
           end
 
