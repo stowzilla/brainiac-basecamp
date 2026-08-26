@@ -334,7 +334,6 @@ module Brainiac
             exec ENV.fetch("SHELL", "/bin/bash")
           end
 
-          # rubocop:disable Metrics/MethodLength, Metrics/CyclomaticComplexity, Metrics/PerceivedComplexity
           def cmd_scrap(args)
             todolist_id = args.shift
 
@@ -361,7 +360,8 @@ module Brainiac
               puts "  6. Remove the epic from state"
               puts ""
               puts "Active epics:"
-              load_epics.select { |e| %w[active cancelled].include?(e["status"]) }.each do |e|
+              scrappable_statuses = %w[active cancelled]
+              load_epics.select { |e| scrappable_statuses.include?(e["status"]) }.each do |e|
                 puts "  #{e['basecamp_todolist_id']} — #{e['title']} [#{e['status']}]"
               end
               return
@@ -439,7 +439,7 @@ module Brainiac
             unless confirmed
               print "Proceed? [y/N] "
               answer = $stdin.gets&.strip&.downcase
-              unless answer == "y" || answer == "yes"
+              unless %w[y yes].include?(answer)
                 puts "Aborted."
                 return
               end
@@ -510,7 +510,6 @@ module Brainiac
               errors.each { |e| puts "    - #{e}" }
             end
           end
-          # rubocop:enable Metrics/MethodLength, Metrics/CyclomaticComplexity, Metrics/PerceivedComplexity
 
           def cmd_link(args)
             fizzy_card = args.shift
