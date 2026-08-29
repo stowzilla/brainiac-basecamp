@@ -56,15 +56,25 @@ module Brainiac
 
           # Determine which tasks are unblocked (all dependencies satisfied).
           #
+          # A task's dependency is satisfied when the dependency card is complete
+          # either WITHIN this epic OR in any other epic (cross-epic dependencies).
+          # The orchestrator gathers completed cards from every epic and passes them
+          # in via +external_completed+ so a card can depend on work owned by a
+          # different epic (e.g. "#1306 depends on #1244" where #1244 lives elsewhere).
+          #
           # @param tasks [Array<Task>] All tasks in the epic
+          # @param external_completed [Array<Integer>, Set<Integer>] Card numbers
+          #   completed outside this epic (from other epics or an authoritative
+          #   source such as closed Fizzy cards). Defaults to none.
           # @return [Array<Task>] Tasks ready to be worked on
-          def unblocked_tasks(tasks)
+          def unblocked_tasks(tasks, external_completed: [])
             completed_cards = tasks.select { |t| t.status == :complete }.map(&:fizzy_card).compact
+            satisfied = (completed_cards + external_completed.to_a).uniq
 
             tasks.select do |task|
               task.status == :pending &&
                 task.fizzy_card &&
-                task.depends_on.all? { |dep| completed_cards.include?(dep) }
+                task.depends_on.all? { |dep| satisfied.include?(dep) }
             end
           end
 
@@ -152,6 +162,39 @@ module Brainiac
             end
 
             nil
+          end
+
+          # Extract epic-level dependencies from an epic's title or description.
+          # An epic can depend on one or more OTHER epics (identified by their
+          # Basecamp todolist ID). The dependent epic will not dispatch ANY of its
+          # tasks until every epic it depends on has reached status "complete".
+          #
+          # Supports:
+          #   [depends-epic:10251269253]
+          #   [depends-epic:10251269253,10233212224]
+          #   Depends on epic: 10251269253
+          #
+          # To depend on a single TASK from another epic, use the ordinary
+          # [depends:<card>] marker on the individual task instead — card
+          # dependencies now resolve across all epics.
+          #
+          # @param text [String]
+          # @return [Array<String>] Basecamp todolist IDs this epic depends on
+          def extract_epic_dependencies(text)
+            return [] if text.nil? || text.empty?
+
+            # Try [depends-epic:N,N] format
+            if (match = text.match(/\[depends-epic:([\d,]+)\]/i))
+              return match[1].split(",").map(&:strip).reject(&:empty?)
+            end
+
+            # Try "Depends on epic:" prose format (handles HTML tags around it)
+            stripped = text.gsub(/<[^>]+>/, "")
+            if (match = stripped.match(/Depends on epic:\s*((?:\d+[\s,]*)+)/i))
+              return match[1].scan(/\d+/)
+            end
+
+            []
           end
 
           private

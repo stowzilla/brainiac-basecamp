@@ -40,6 +40,10 @@ module Brainiac
               "updated_at" => Time.now.iso8601,
               "tasks" => [],
               "epic_branches" => {},
+              # Other epics (by Basecamp todolist ID) that must complete before any
+              # of this epic's tasks dispatch. Declared via [depends-epic:<id>] in
+              # the epic/todolist title.
+              "depends_on_epics" => Epic.extract_epic_dependencies(title),
               "history" => []
             }
 
@@ -145,7 +149,34 @@ module Brainiac
             end
 
             save_epic(epic)
+
+            # A card completing here may satisfy a cross-epic dependency in a
+            # DIFFERENT epic. Wake those up too (skips this epic — already handled).
+            dispatch_cross_epic_card_waiters(epic, card_number)
+
             true
+          end
+
+          # When a single card completes, re-dispatch OTHER active epics that have a
+          # task depending on that specific card. Handles "epic B depends on one task
+          # from epic A" without waiting for all of epic A to finish.
+          #
+          # @param source_epic [Hash] Epic that owns the completed card
+          # @param card_number [Integer] The card that just completed
+          def dispatch_cross_epic_card_waiters(source_epic, card_number)
+            active_epics.each do |other|
+              next if other["id"] == source_epic["id"]
+
+              waiting = (other["tasks"] || []).any? do |t|
+                t["status"] == "pending" && (t["depends_on"] || []).include?(card_number)
+              end
+              next unless waiting
+
+              LOG.info "[Basecamp:Orchestrator] Card ##{card_number} completion unblocks " \
+                       "epic '#{other['title']}' — re-dispatching" if defined?(LOG)
+              dispatch_unblocked_tasks(other)
+              save_epic(other)
+            end
           end
 
           # Find an active epic that contains a given Fizzy card.
@@ -271,6 +302,15 @@ module Brainiac
 
           # Dispatch unblocked tasks that do not have a live implementation session.
           def dispatch_unblocked_tasks(epic)
+            # Epic-level gate: if this epic depends on other epics, hold ALL dispatch
+            # until every one of those epics is complete.
+            unless epic_dependencies_satisfied?(epic)
+              pending_epics = unsatisfied_epic_dependencies(epic)
+              LOG.info "[Basecamp:Orchestrator] Epic '#{epic['title']}' blocked on epic " \
+                       "dependencies: #{pending_epics.join(', ')}" if defined?(LOG)
+              return
+            end
+
             tasks = epic["tasks"].map do |t|
               # A stale in_flight state is diagnostic state, not liveness evidence.
               # It becomes dispatchable again only after the implementation session has
@@ -297,9 +337,15 @@ module Brainiac
               )
             end
 
+            # Cross-epic card dependencies: a task may depend on a card owned by a
+            # DIFFERENT epic. Gather every completed card from all other epics so
+            # those dependencies resolve. Without this, a cross-epic dependency
+            # would deadlock the epic (0 dispatched forever).
+            external_completed = completed_cards_from_other_epics(epic)
+
             # The registry, rather than Fizzy assignment or a persisted status field,
             # is the authority for whether an implementation dispatch is already live.
-            unblocked = Epic.unblocked_tasks(tasks)
+            unblocked = Epic.unblocked_tasks(tasks, external_completed: external_completed)
             complete_cards = epic["tasks"].select { |t| t["status"] == "complete" }.map { |t| t["fizzy_card"] }
 
             ready_to_dispatch = unblocked.reject do |task|
@@ -315,6 +361,54 @@ module Brainiac
                      "#{epic['tasks'].count { |t| t['status'] == 'complete' }}/#{epic['tasks'].size} complete, " \
                      "#{ready_to_dispatch.size} dispatched, " \
                      "#{epic['tasks'].count { |t| t['status'] == 'in_flight' }} in-flight" if defined?(LOG)
+          end
+
+          # Collect all completed Fizzy card numbers from every epic OTHER than the
+          # given one. Used to satisfy cross-epic task dependencies.
+          #
+          # @param epic [Hash] The epic currently being dispatched
+          # @return [Array<Integer>] Completed card numbers owned by other epics
+          def completed_cards_from_other_epics(epic)
+            load_epics.reject { |e| e["id"] == epic["id"] }.flat_map do |other|
+              (other["tasks"] || [])
+                .select { |t| t["status"] == "complete" }
+                .map { |t| t["fizzy_card"] }
+            end.compact.uniq
+          end
+
+          # Epic-level dependencies: the todolist IDs of other epics this epic must
+          # wait on before dispatching any of its own tasks.
+          #
+          # @param epic [Hash]
+          # @return [Array<String>]
+          def epic_dependencies(epic)
+            (epic["depends_on_epics"] || []).map(&:to_s)
+          end
+
+          # Return the epic dependencies that are NOT yet complete.
+          #
+          # An epic dependency is satisfied when a matching epic exists (by todolist
+          # ID) and its status is "complete". An unknown/never-started epic is
+          # treated as unsatisfied — we do not dispatch on a dependency we can't
+          # confirm finished.
+          #
+          # @param epic [Hash]
+          # @return [Array<String>] Unsatisfied dependency todolist IDs
+          def unsatisfied_epic_dependencies(epic)
+            deps = epic_dependencies(epic)
+            return [] if deps.empty?
+
+            all = load_epics
+            deps.reject do |todolist_id|
+              dep_epic = all.find { |e| e["basecamp_todolist_id"] == todolist_id.to_s }
+              dep_epic && dep_epic["status"] == "complete"
+            end
+          end
+
+          # @param epic [Hash]
+          # @return [Boolean] true when every epic dependency is complete
+          def epic_dependencies_satisfied?(epic)
+            unsatisfied_epic_dependencies(epic).empty?
           end
 
           # Dispatch a Fizzy card to the appropriate agent.
@@ -756,6 +850,37 @@ module Brainiac
               message: "🎉 Epic completed: **#{epic['title']}** (#{epic['tasks'].size} tasks)",
               agent: epic["agent"]
             )
+
+            # Wake up any epics that were waiting on this one so they can dispatch.
+            # Persist THIS epic's completed status first so dependents that check
+            # our status (via load_epics) see it as complete.
+            save_epic(epic)
+            dispatch_dependent_epics(epic)
+          end
+
+          # After an epic completes, re-evaluate any active epics that declared it
+          # as a dependency (via [depends-epic:<id>]) and dispatch their now-unblocked
+          # work. Also re-runs dispatch for epics with cross-epic CARD dependencies,
+          # since a completed epic may have satisfied an individual card dependency.
+          #
+          # @param completed_epic [Hash] The epic that just finished
+          def dispatch_dependent_epics(completed_epic)
+            completed_todolist = completed_epic["basecamp_todolist_id"].to_s
+
+            active_epics.each do |other|
+              next if other["id"] == completed_epic["id"]
+
+              waits_on_epic = epic_dependencies(other).include?(completed_todolist)
+              has_cross_epic_card_deps = (other["tasks"] || []).any? do |t|
+                (t["depends_on"] || []).any?
+              end
+              next unless waits_on_epic || has_cross_epic_card_deps
+
+              LOG.info "[Basecamp:Orchestrator] Re-dispatching epic '#{other['title']}' " \
+                       "after '#{completed_epic['title']}' completed" if defined?(LOG)
+              dispatch_unblocked_tasks(other)
+              save_epic(other)
+            end
           end
 
           # Fetch todos from the epic's todolist.

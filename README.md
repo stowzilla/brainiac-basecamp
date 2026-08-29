@@ -31,6 +31,34 @@ Todos:
 - **Dependencies:** `[depends:1234,1235]` in the title declares dependencies
 - Cards without dependencies (or with all deps satisfied) dispatch in parallel
 
+### Cross-Epic Dependencies
+
+Dependencies are resolved **globally** across every epic, so a card can depend
+on a card that lives in a *different* epic. This lets you queue up multiple
+epics that build on each other.
+
+**Task depends on a single task from another epic** — just use the ordinary
+`[depends:<card>]` marker. The dependency is satisfied once that card completes,
+regardless of which epic owns it:
+
+```
+Todolist: "Epic: Agent Onboarding"
+  □ #1306 — Agent setup wizard [depends:1244]   # #1244 lives in another epic
+```
+
+**Epic depends on an entire epic** — add `[depends-epic:<todolist-id>]` to the
+epic (todolist) title. None of the dependent epic's tasks dispatch until every
+epic it depends on has reached `complete`:
+
+```
+Todolist: "Epic: Billing Portal [depends-epic:10251269253]"
+```
+
+Multiple epic deps: `[depends-epic:10251269253,10233212224]`. Prose form
+`Depends on epic: 10251269253` also works. When a blocking epic (or a single
+depended-on card) completes, the orchestrator automatically wakes and dispatches
+the waiting epic(s) — no manual reset required.
+
 ## Review Gate Modes
 
 Configure via `brainiac basecamp set review-gate <mode>`:
