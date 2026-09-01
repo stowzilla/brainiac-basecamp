@@ -78,18 +78,44 @@ class TestRecovery < Minitest::Test
   end
 
   def test_final_decision_reconciliation_completes_a_merged_pr
-    decision_task = task(status: "final_decision").merge("pr_number" => 21)
+    decision_task = task(status: "final_decision").merge("pr_number" => 21, "awaiting_final_decision" => true)
     completed_card = nil
+    saved = false
 
     Basecamp.stub(:projects_config, { "brainiac-basecamp" => { "github_repo" => "example/repo" } }) do
       Open3.stub(:capture2, ["MERGED\n", nil]) do
-        Orchestrator.stub(:on_card_completed, ->(card) { completed_card = card }) do
-          assert Basecamp.send(:reconcile_final_decision_task, {}, decision_task)
+        Orchestrator.stub(:save_epic, ->(_epic) { saved = true }) do
+          Orchestrator.stub(:on_card_completed, ->(card) { completed_card = card }) do
+            assert Basecamp.send(:reconcile_final_decision_task, {}, decision_task)
+          end
         end
       end
     end
 
     assert_equal 1226, completed_card
+    # The task is settled and persisted locally before delegating, so a later
+    # revert race can't leave it stuck in final_decision.
+    assert TaskState.in?(decision_task, :complete)
+    refute decision_task["awaiting_final_decision"]
+    assert saved, "the merged-PR path must persist the settled task before delegating"
+  end
+
+  def test_final_decision_reconciliation_is_idempotent_once_task_is_complete
+    # The thrash-loop guard: a task already marked complete (even if it somehow
+    # lingers in the final_decision reconcile path) must not re-fire
+    # on_card_completed on the next 90s sweep.
+    completed_task = task(status: "complete").merge("pr_number" => 21)
+    fired = false
+
+    Basecamp.stub(:projects_config, { "brainiac-basecamp" => { "github_repo" => "example/repo" } }) do
+      Open3.stub(:capture2, ["MERGED\n", nil]) do
+        Orchestrator.stub(:on_card_completed, ->(_card) { fired = true }) do
+          refute Basecamp.send(:reconcile_final_decision_task, {}, completed_task)
+        end
+      end
+    end
+
+    refute fired, "a task already complete must never re-trigger on_card_completed"
   end
 
   def test_final_decision_reconciliation_redispatches_when_no_session_is_live

@@ -203,6 +203,13 @@ module Brainiac
         end
 
         def reconcile_final_decision_task(epic, task)
+          # Idempotency: a task that already reached :complete must never be
+          # re-processed here. Without this guard a revert race — where some
+          # other pass flips the task back to "final_decision" after completion —
+          # lets every subsequent 90s sweep re-fire on_card_completed, which
+          # re-runs complete_epic and re-posts the "🎉 Epic completed" message.
+          return false if TaskState.in?(task, :complete)
+
           pr_number = task["pr_number"]
           project_key = task["project"]
           return false unless pr_number && project_key
@@ -212,6 +219,15 @@ module Brainiac
           if github_repo
             pr_state, = Open3.capture2("gh", "pr", "view", pr_number.to_s, "--repo", github_repo, "--json", "state", "-q", ".state")
             if pr_state.strip == "MERGED"
+              # Settle the local task state FIRST and persist it, so the
+              # completion sticks even if on_card_completed's own save is later
+              # clobbered by a competing sync pass. The next sweep will then hit
+              # the idempotency guard above instead of re-firing.
+              TaskState.transition!(task, :complete, triggered_by: "final_decision_pr_merged")
+              task["completed_at"] ||= Time.now.iso8601
+              task["awaiting_final_decision"] = false
+              Orchestrator.send(:save_epic, epic)
+
               Orchestrator.on_card_completed(task["fizzy_card"])
               return true
             end

@@ -1096,8 +1096,23 @@ module Brainiac
             tasks_to_reset.each { |t| reset_task_to(t, target_status) }
             epic["updated_at"] = Time.now.iso8601
 
+            # If this reset leaves every task complete, finalize the epic in the
+            # same write. Otherwise the epic stays status="active" with all tasks
+            # done — exactly the thrash-prone state where the 90s reconcile loop
+            # re-detects "all complete", re-runs complete_epic, and re-posts the
+            # completion notification. Setting completion_notified here also means
+            # no notification fires for a manual, operator-driven completion.
+            finalized = false
+            if epic["tasks"].any? && epic["tasks"].all? { |t| t["status"] == "complete" }
+              epic["status"] = "complete"
+              epic["completed_at"] ||= Time.now.iso8601
+              epic["completion_notified"] = true
+              finalized = true
+            end
+
             save_epics(epics)
             puts "✓ Reset #{tasks_to_reset.size} task(s) → '#{target_status}' in epic '#{epic['title']}'"
+            puts "✓ All tasks complete — epic finalized (status=complete, notification suppressed)" if finalized
             puts ""
             epic["tasks"].each do |t|
               icon = case t["status"]
@@ -1169,6 +1184,10 @@ module Brainiac
               task["awaiting_final_decision"] = true
             when "complete"
               task["completed_at"] ||= Time.now.iso8601
+              # A completed task is no longer awaiting a final decision. Leaving
+              # this true lets reconcile_final_decision_task treat the task as
+              # unsettled and re-dispatch/re-complete it on the next sweep.
+              task["awaiting_final_decision"] = false
             end
           end
 
