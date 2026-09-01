@@ -732,6 +732,15 @@ module Brainiac
             epic["updated_at"] = Time.now.iso8601
             log_event(epic, "completed", "All tasks complete — epic finished!")
 
+            # Persist the completed status to disk IMMEDIATELY, before any slow
+            # network calls (opening final PRs, posting to Basecamp). Recovery
+            # reconciliation reads epics fresh from disk every 90s; if we defer
+            # the write until after those calls, an overlapping reconcile pass
+            # reads status="active", passes the guard above, and re-runs the
+            # whole completion flow — including the notification below. That's
+            # how the "Epic completed" Discord message fired repeatedly.
+            save_epic(epic)
+
             LOG.info "[Basecamp:Orchestrator] Epic '#{epic['title']}' completed!" if defined?(LOG)
 
             # If epic_branch mode, open final PRs to main
@@ -750,12 +759,20 @@ module Brainiac
               profile: epic["agent"]&.downcase
             )
 
-            # Send notification (Discord or other configured channel)
-            send_notification(
-              event: :epic_completed,
-              message: "🎉 Epic completed: **#{epic['title']}** (#{epic['tasks'].size} tasks)",
-              agent: epic["agent"]
-            )
+            # Send the completion notification at most once, ever. This is a
+            # belt-and-suspenders guard on top of the early status persistence
+            # above — even if two passes somehow race past the status check, the
+            # notification will only go out for the first one to reach here.
+            unless epic["completion_notified"]
+              epic["completion_notified"] = true
+              save_epic(epic)
+
+              send_notification(
+                event: :epic_completed,
+                message: "🎉 Epic completed: **#{epic['title']}** (#{epic['tasks'].size} tasks)",
+                agent: epic["agent"]
+              )
+            end
           end
 
           # Fetch todos from the epic's todolist.
