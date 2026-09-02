@@ -839,6 +839,8 @@ module Brainiac
                 set fizzy-account-id <id>               Set Fizzy account ID (for card URLs)
                 set review-gate <mode>                  Set review gate (on_complete or on_pr_merge)
                 set epic-prefix <prefix>                Set epic todolist prefix (default: "Epic:")
+                set ephemeral-deploys <on|off>          Enable/disable ephemeral Belt env auto-creation
+                set parent-env <project> <env>          Set parent env for ephemeral Belt deploys
                 reset task <card-number> [--to <status>] Reset a task to a given status (default: pending)
                 reset epic <todolist-id> [--to <status>] Reset entire epic or all tasks within it
                 reset gates <card-number>               Clear gate approvals and re-dispatch gates
@@ -859,6 +861,18 @@ module Brainiac
                 4. deploy.project_envs.<project> in config (per-project default)
                 5. deploy.default_env in config (global default)
 
+              Ephemeral Belt Environments:
+                When a Fizzy card with 'deploy' tag is assigned to an agent on a Belt app:
+                1. Creates ephemeral env: belt g environment fizzy-<card> <parent-env>
+                2. Deploys to it: belt deploy fizzy-<card>
+                3. Redeploys on PR push: belt deploy fizzy-<card> [frontend]
+                4. Destroys on PR merge: belt destroy environment fizzy-<card> --full
+
+                Configure with:
+                  brainiac basecamp set ephemeral-deploys on
+                  brainiac basecamp set parent-env stowzilla dev02
+                  brainiac basecamp set parent-env feature-parity dev
+
               Task statuses (for reset --to):
                 pending         — Not yet started, waiting for dependencies
                 in_flight       — Agent is actively working on it
@@ -872,13 +886,15 @@ module Brainiac
             key = args.shift
             value = args.shift
 
-            unless key && value
+            unless key
               puts "Usage: brainiac basecamp set <key> <value>"
               puts ""
               puts "Keys:"
-              puts "  fizzy-account-id <id>      Fizzy account ID (for card URLs)"
-              puts "  review-gate <mode>         on_complete or on_pr_merge"
-              puts "  epic-prefix <prefix>       Todolist prefix for epic detection"
+              puts "  fizzy-account-id <id>           Fizzy account ID (for card URLs)"
+              puts "  review-gate <mode>              on_complete, on_pr_merge, or epic_branch"
+              puts "  epic-prefix <prefix>            Todolist prefix for epic detection"
+              puts "  ephemeral-deploys <on|off>      Enable/disable ephemeral Belt env deploys"
+              puts "  parent-env <project> <env>      Set parent env for ephemeral deploys"
               return
             end
 
@@ -886,11 +902,19 @@ module Brainiac
 
             case key
             when "fizzy-account-id"
+              unless value
+                puts "Usage: brainiac basecamp set fizzy-account-id <id>"
+                return
+              end
               config["fizzy_account_id"] = value
               save_config(config)
               puts "✓ Set fizzy_account_id = #{value}"
               puts "  Card URLs will be: https://app.fizzy.do/#{value}/cards/NNNN"
             when "review-gate"
+              unless value
+                puts "Usage: brainiac basecamp set review-gate <mode>"
+                return
+              end
               unless %w[on_complete on_pr_merge epic_branch].include?(value)
                 puts "Error: review-gate must be 'on_complete', 'on_pr_merge', or 'epic_branch'"
                 return
@@ -908,18 +932,64 @@ module Brainiac
                 puts "  Epic tasks advance immediately when agent completes"
               end
             when "epic-prefix"
+              unless value
+                puts "Usage: brainiac basecamp set epic-prefix <prefix>"
+                return
+              end
               config["epic_prefix"] = value
               save_config(config)
               puts "✓ Set epic_prefix = #{value}"
             when "profile"
+              unless value
+                puts "Usage: brainiac basecamp set profile <name>"
+                return
+              end
               config["basecamp_profile"] = value
               save_config(config)
               puts "✓ Set basecamp_profile = #{value}"
               puts "  All basecamp CLI commands will use --profile #{value}"
               puts "  Set up the profile: basecamp profile create #{value} && basecamp auth login --profile #{value}"
+            when "ephemeral-deploys"
+              unless value
+                puts "Usage: brainiac basecamp set ephemeral-deploys <on|off>"
+                return
+              end
+              enabled = %w[on yes true 1].include?(value.downcase)
+              config["deploy"] ||= {}
+              config["deploy"]["ephemeral_enabled"] = enabled
+              save_config(config)
+              puts "✓ Set ephemeral_enabled = #{enabled}"
+              if enabled
+                puts "  Ephemeral Belt environments will be created for cards with 'deploy' tag"
+                puts "  Make sure parent envs are configured: brainiac basecamp set parent-env <project> <env>"
+              else
+                puts "  Ephemeral Belt environment creation is disabled"
+              end
+            when "parent-env"
+              # Special case: takes two values (project and env)
+              project_key = value
+              parent_env = args.shift
+              unless project_key && parent_env
+                puts "Usage: brainiac basecamp set parent-env <project-key> <parent-env>"
+                puts ""
+                puts "Example:"
+                puts "  brainiac basecamp set parent-env stowzilla dev02"
+                puts "  brainiac basecamp set parent-env feature-parity dev"
+                puts ""
+                puts "This sets the parent environment for ephemeral Belt deploys."
+                puts "When a card with 'deploy' tag is assigned, an ephemeral environment"
+                puts "is created using: belt g environment fizzy-<card> <parent-env>"
+                return
+              end
+              config["deploy"] ||= {}
+              config["deploy"]["project_envs"] ||= {}
+              config["deploy"]["project_envs"][project_key] = parent_env
+              save_config(config)
+              puts "✓ Set parent env for '#{project_key}' = #{parent_env}"
+              puts "  Cards with 'deploy' tag will create: fizzy-<card> from #{parent_env}"
             else
               puts "Unknown key: #{key}"
-              puts "Valid keys: fizzy-account-id, review-gate, epic-prefix, profile"
+              puts "Valid keys: fizzy-account-id, review-gate, epic-prefix, profile, ephemeral-deploys, parent-env"
             end
           end
 
