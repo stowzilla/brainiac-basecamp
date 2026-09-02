@@ -790,12 +790,12 @@ module Brainiac
             return unless project_config && project_config["repo_path"]
 
             agent_name = Orchestrator.send(:resolve_agent_for_project, project_key) || epic["agent"]
-            prompt = <<~PROMPT
-              ## Changes Requested — Fizzy Card ##{card_number}
-
-              Review feedback needs attention on PR ##{task['pr_number']}. Read the review,
-              make the requested fixes, commit and push them, then update the Fizzy card.
-            PROMPT
+            # Only build a "changes requested" prompt when there is a real PR to
+            # act on. A stale in_flight card recovered by the orchestrator has no
+            # PR number yet — handing an agent "...fixes on PR #" with a blank
+            # number is nonsense and the session dies asking for clarification.
+            # In that case dispatch a clean "start implementation" prompt instead.
+            prompt = build_impl_prompt(card_number: card_number, pr_number: task["pr_number"])
             github_repo = project_config["github_repo"]
             agent_env = github_repo ? ReviewGate.send(:resolve_agent_github_env, agent_name, github_repo) : {}
             pid, log_file = method(:run_agent).call(
@@ -822,6 +822,36 @@ module Brainiac
             LOG.warn "[Basecamp:Hooks] run_agent unavailable — implementation recovery skipped" if defined?(LOG)
           rescue StandardError => e
             LOG.error "[Basecamp:Hooks] Direct implementation dispatch failed: #{e.message}" if defined?(LOG)
+          end
+
+          # Build the implementation prompt for a direct dispatch.
+          #
+          # When +pr_number+ is present the card already has an open PR, so the
+          # agent is asked to address review feedback. When it is absent (a stale
+          # in_flight card the orchestrator recovered, or a first dispatch) the
+          # agent is asked to start the implementation from scratch — never with a
+          # blank "PR #" that a real PR would have filled in.
+          #
+          # @param card_number [Integer, String] Fizzy card number
+          # @param pr_number [Integer, String, nil] PR number, if one exists
+          # @return [String] the prompt text
+          def build_impl_prompt(card_number:, pr_number:)
+            if pr_number.to_s.strip.empty?
+              <<~PROMPT
+                ## Implement — Fizzy Card ##{card_number}
+
+                Pick up Fizzy card ##{card_number} and implement it. Read the card for
+                requirements, do the work in a branch, commit and push, open a PR, then
+                update the Fizzy card. There is no existing PR for this card yet.
+              PROMPT
+            else
+              <<~PROMPT
+                ## Changes Requested — Fizzy Card ##{card_number}
+
+                Review feedback needs attention on PR ##{pr_number}. Read the review,
+                make the requested fixes, commit and push them, then update the Fizzy card.
+              PROMPT
+            end
           end
 
           # Find a PR number by branch name pattern.
