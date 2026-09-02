@@ -2,6 +2,13 @@
 
 All notable changes to brainiac-basecamp will be documented in this file.
 
+## [0.0.25] - 2026-09-02
+
+### Fixed
+
+- **Dispatch prompts no longer built with a blank `PR #`.** When a task was re-dispatched but had no PR number, the "changes requested on PR #N" template rendered as "...fixes on PR #" with a hole in it, and the agent couldn't proceed. Dispatch now uses a clean "start implementation" prompt when there's no PR and only the "changes requested on PR #N" prompt when a real PR exists. (#34)
+- **Epic-review no longer claims unverified completions.** `dispatch_epic_review` posted "Card #N just completed" to Basecamp based solely on a ledger flag, with no proof any work shipped. It now checks `card_completion_verified?` (a real tracked PR) before posting the checkpoint; with no PR evidence it skips the claim but still runs the callback so the resolver advances. (#34)
+
 ## [0.1.0] - 2026-08-24
 
 ### Added
