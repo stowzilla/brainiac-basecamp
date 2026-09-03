@@ -593,6 +593,25 @@ module Brainiac
             nil
           end
 
+          # Whether a card's completion is backed by real evidence of shipped work.
+          #
+          # A card genuinely completes when it has an associated PR that merged (or,
+          # at minimum, a tracked PR number). Without any PR evidence the completion
+          # is almost certainly spurious — a stale ledger flag left behind by a
+          # basecamp re-sync that dropped merged cards — and we should not treat it
+          # as a real completion that warrants an epic-review checkpoint.
+          #
+          # @param epic [Hash] epic state
+          # @param card_number [Integer, String] the card claimed complete
+          # @return [Boolean]
+          def card_completion_verified?(epic, card_number)
+            task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
+            return false unless task
+
+            # A tracked PR number is our recorded evidence that work shipped.
+            !task["pr_number"].to_s.strip.empty?
+          end
+
           # Dispatch an agent to review the epic state after a task completes.
           # This ensures the remaining plan still makes sense given implementation decisions.
           # The callback is called after the review completes.
@@ -602,6 +621,22 @@ module Brainiac
 
             # Skip review if no remaining tasks
             if remaining_tasks.empty?
+              callback&.call
+              return
+            end
+
+            # Only post a "just completed" checkpoint when the card actually shipped
+            # work. A ledger flagged `complete` with no PR (and no merge) means the
+            # completion was spurious — usually the basecamp re-sync dropping merged
+            # cards and leaving a stale flag. Posting "Card #N just completed" in that
+            # case is a false claim that spawns a pointless epic-review reflex.
+            # Still run the callback so the resolver can advance (it correctly does
+            # nothing for cards that remain blocked).
+            unless card_completion_verified?(epic, completed_card_number)
+              if defined?(LOG)
+                LOG.warn "[Basecamp:Orchestrator] Skipping epic review after card " \
+                         "##{completed_card_number} — no PR/merge evidence of completion"
+              end
               callback&.call
               return
             end
@@ -732,6 +767,15 @@ module Brainiac
             epic["updated_at"] = Time.now.iso8601
             log_event(epic, "completed", "All tasks complete — epic finished!")
 
+            # Persist the completed status to disk IMMEDIATELY, before any slow
+            # network calls (opening final PRs, posting to Basecamp). Recovery
+            # reconciliation reads epics fresh from disk every 90s; if we defer
+            # the write until after those calls, an overlapping reconcile pass
+            # reads status="active", passes the guard above, and re-runs the
+            # whole completion flow — including the notification below. That's
+            # how the "Epic completed" Discord message fired repeatedly.
+            save_epic(epic)
+
             LOG.info "[Basecamp:Orchestrator] Epic '#{epic['title']}' completed!" if defined?(LOG)
 
             # If epic_branch mode, open final PRs to main
@@ -750,12 +794,20 @@ module Brainiac
               profile: epic["agent"]&.downcase
             )
 
-            # Send notification (Discord or other configured channel)
-            send_notification(
-              event: :epic_completed,
-              message: "🎉 Epic completed: **#{epic['title']}** (#{epic['tasks'].size} tasks)",
-              agent: epic["agent"]
-            )
+            # Send the completion notification at most once, ever. This is a
+            # belt-and-suspenders guard on top of the early status persistence
+            # above — even if two passes somehow race past the status check, the
+            # notification will only go out for the first one to reach here.
+            unless epic["completion_notified"]
+              epic["completion_notified"] = true
+              save_epic(epic)
+
+              send_notification(
+                event: :epic_completed,
+                message: "🎉 Epic completed: **#{epic['title']}** (#{epic['tasks'].size} tasks)",
+                agent: epic["agent"]
+              )
+            end
           end
 
           # Fetch todos from the epic's todolist.

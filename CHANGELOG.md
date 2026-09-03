@@ -2,6 +2,19 @@
 
 All notable changes to brainiac-basecamp will be documented in this file.
 
+## [0.0.26] - 2026-09-03
+
+### Fixed
+
+- **`reset task <card> --to complete` now finalizes the epic when it's the last straggler.** Previously the task went complete but the epic stayed `status="active"`, and the completed task kept `awaiting_final_decision=true`. That left the epic in the "all tasks done but still active" state the 90s reconcile loop re-detects on every sweep — re-running `complete_epic` and re-posting the "🎉 Epic completed" notification (the belt-organizations spam loop). Operators had to hand-edit `basecamp_epics.json` to seal it. Both `reset task` and `reset epic` now seal the epic in the same atomic write (`status=complete`, `completed_at`, `completion_notified=true`) and clear `awaiting_final_decision` on the completed task, via a shared `finalize_epic_if_all_complete!` helper.
+
+## [0.0.25] - 2026-09-02
+
+### Fixed
+
+- **Dispatch prompts no longer built with a blank `PR #`.** When a task was re-dispatched but had no PR number, the "changes requested on PR #N" template rendered as "...fixes on PR #" with a hole in it, and the agent couldn't proceed. Dispatch now uses a clean "start implementation" prompt when there's no PR and only the "changes requested on PR #N" prompt when a real PR exists. (#34)
+- **Epic-review no longer claims unverified completions.** `dispatch_epic_review` posted "Card #N just completed" to Basecamp based solely on a ledger flag, with no proof any work shipped. It now checks `card_completion_verified?` (a real tracked PR) before posting the checkpoint; with no PR evidence it skips the claim but still runs the callback so the resolver advances. (#34)
+
 ## [0.1.0] - 2026-08-24
 
 ### Added

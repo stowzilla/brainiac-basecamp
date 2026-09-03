@@ -1056,9 +1056,15 @@ module Brainiac
             # Reset the task
             reset_task_to(task, target_status)
 
+            # If completing this task leaves every task in the epic complete,
+            # seal the epic in the same atomic write so the reconcile loop never
+            # re-fires the completion notification.
+            finalized = finalize_epic_if_all_complete!(epic)
+
             save_epics(epics)
             puts "✓ Reset card ##{card_number} from '#{old_status}' → '#{target_status}'"
             puts "  Epic: #{epic['title']}"
+            puts "✓ All tasks complete — epic finalized (status=complete, notification suppressed)" if finalized
 
             return unless target_status == "pending"
 
@@ -1166,8 +1172,11 @@ module Brainiac
             tasks_to_reset.each { |t| reset_task_to(t, target_status) }
             epic["updated_at"] = Time.now.iso8601
 
+            finalized = finalize_epic_if_all_complete!(epic)
+
             save_epics(epics)
             puts "✓ Reset #{tasks_to_reset.size} task(s) → '#{target_status}' in epic '#{epic['title']}'"
+            puts "✓ All tasks complete — epic finalized (status=complete, notification suppressed)" if finalized
             puts ""
             epic["tasks"].each do |t|
               icon = case t["status"]
@@ -1239,7 +1248,29 @@ module Brainiac
               task["awaiting_final_decision"] = true
             when "complete"
               task["completed_at"] ||= Time.now.iso8601
+              # A completed task is no longer awaiting a final decision. Leaving
+              # this true lets reconcile_final_decision_task treat the task as
+              # unsettled and re-dispatch/re-complete it on the next sweep.
+              task["awaiting_final_decision"] = false
             end
+          end
+
+          # Seal an epic when a reset leaves every task complete. Without this, an
+          # epic can sit status="active" with all tasks done — exactly the
+          # thrash-prone state where the 90s reconcile loop re-detects "all
+          # complete", re-runs complete_epic, and re-posts the "🎉 Epic completed"
+          # notification on every sweep. Setting completion_notified suppresses a
+          # notification for this manual, operator-driven completion. Returns true
+          # if the epic was finalized.
+          def finalize_epic_if_all_complete!(epic)
+            return false unless epic["tasks"]&.any?
+            return false unless epic["tasks"].all? { |t| t["status"] == "complete" }
+            return false if epic["status"] == "complete"
+
+            epic["status"] = "complete"
+            epic["completed_at"] ||= Time.now.iso8601
+            epic["completion_notified"] = true
+            true
           end
 
           def load_epics
