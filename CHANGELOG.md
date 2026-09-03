@@ -2,6 +2,16 @@
 
 All notable changes to brainiac-basecamp will be documented in this file.
 
+## [0.0.27] - 2026-09-03
+
+### Added
+
+- **CLI commands for ephemeral Belt environment config.** Two new `set` keys let operators configure per-card ephemeral Belt deploys:
+  - `brainiac basecamp set ephemeral-deploys <on|off>` — toggles auto-creation of ephemeral Belt environments for Fizzy cards tagged `deploy` (stored at `deploy.ephemeral_enabled`).
+  - `brainiac basecamp set parent-env <project> <env>` — sets the parent environment a card's ephemeral env is cloned from (stored under `deploy.project_envs.<project>`).
+
+  When a `deploy`-tagged card is assigned on a Belt app, the workflow creates `belt g environment fizzy-<card> <parent-env>`, deploys to it, redeploys on PR push, and destroys it on PR merge. Help output now documents the full flow. The `set` command was also hardened so each key validates its own required arguments instead of failing on a shared `key && value` guard.
+
 ## [0.0.26] - 2026-09-03
 
 ### Fixed
