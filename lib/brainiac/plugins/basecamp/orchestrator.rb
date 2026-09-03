@@ -593,6 +593,25 @@ module Brainiac
             nil
           end
 
+          # Whether a card's completion is backed by real evidence of shipped work.
+          #
+          # A card genuinely completes when it has an associated PR that merged (or,
+          # at minimum, a tracked PR number). Without any PR evidence the completion
+          # is almost certainly spurious — a stale ledger flag left behind by a
+          # basecamp re-sync that dropped merged cards — and we should not treat it
+          # as a real completion that warrants an epic-review checkpoint.
+          #
+          # @param epic [Hash] epic state
+          # @param card_number [Integer, String] the card claimed complete
+          # @return [Boolean]
+          def card_completion_verified?(epic, card_number)
+            task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
+            return false unless task
+
+            # A tracked PR number is our recorded evidence that work shipped.
+            !task["pr_number"].to_s.strip.empty?
+          end
+
           # Dispatch an agent to review the epic state after a task completes.
           # This ensures the remaining plan still makes sense given implementation decisions.
           # The callback is called after the review completes.
@@ -602,6 +621,22 @@ module Brainiac
 
             # Skip review if no remaining tasks
             if remaining_tasks.empty?
+              callback&.call
+              return
+            end
+
+            # Only post a "just completed" checkpoint when the card actually shipped
+            # work. A ledger flagged `complete` with no PR (and no merge) means the
+            # completion was spurious — usually the basecamp re-sync dropping merged
+            # cards and leaving a stale flag. Posting "Card #N just completed" in that
+            # case is a false claim that spawns a pointless epic-review reflex.
+            # Still run the callback so the resolver can advance (it correctly does
+            # nothing for cards that remain blocked).
+            unless card_completion_verified?(epic, completed_card_number)
+              if defined?(LOG)
+                LOG.warn "[Basecamp:Orchestrator] Skipping epic review after card " \
+                         "##{completed_card_number} — no PR/merge evidence of completion"
+              end
               callback&.call
               return
             end

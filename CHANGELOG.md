@@ -2,13 +2,15 @@
 
 All notable changes to brainiac-basecamp will be documented in this file.
 
-## [0.0.25] - 2026-09-01
+## [0.0.26] - 2026-09-02
 
 ### Fixed
 
 - **Epic completion thrash on merged final-decision tasks.** `reconcile_final_decision_task` re-fired `on_card_completed` on every 90s sweep whenever a task sat in `final_decision` with an already-MERGED PR. If a competing sync pass reverted the task back to `final_decision` after completion, the epic kept getting re-completed and the "🎉 Epic completed" notification re-posted. The reconciler now (1) short-circuits when the task is already `complete`, and (2) settles the task locally (`complete`, `completed_at`, `awaiting_final_decision=false`) and persists it *before* delegating to `on_card_completed`, so the completion survives a revert race. (Complements the #31 `completion_notified` guard, which could never take hold while the epic kept reverting to `active`.)
 - **`reset epic --to complete` now finalizes the epic.** The CLI marked tasks complete but left the epic `status="active"` with no `completion_notified` flag — the exact all-tasks-done-but-still-active state that triggers the reconcile thrash loop. When a reset leaves every task complete, the epic is now finalized in the same atomic write (`status=complete`, `completed_at`, `completion_notified=true`), and the notification is suppressed for operator-driven completions.
 - **`reset_task_to(task, "complete")` clears `awaiting_final_decision`.** A completed task left with `awaiting_final_decision=true` was treated as unsettled by the reconciler and could be re-dispatched.
+- **Dispatch prompts no longer built with a blank `PR #`.** When a task was re-dispatched but had no PR number, the "changes requested on PR #N" template rendered as "...fixes on PR #" with a hole in it, and the agent couldn't proceed. Dispatch now uses a clean "start implementation" prompt when there's no PR and only the "changes requested on PR #N" prompt when a real PR exists. (#34)
+- **Epic-review no longer claims unverified completions.** `dispatch_epic_review` posted "Card #N just completed" to Basecamp based solely on a ledger flag, with no proof any work shipped. It now checks `card_completion_verified?` (a real tracked PR) before posting the checkpoint; with no PR evidence it skips the claim but still runs the callback so the resolver advances. (#34)
 
 ## [0.1.0] - 2026-08-24
 
