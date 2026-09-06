@@ -670,6 +670,7 @@ module Brainiac
               1. Read the memory files for completed tasks to understand what was implemented
               2. Check if remaining tasks still make sense given the implementation decisions
               3. Decide whether any structural changes to the plan are needed (see allowed actions below)
+              4. If — and only if — something changed or needs flagging, post to Basecamp (see below). Otherwise, stay silent.
 
               Memory files are at: `~/.brainiac/brain/memory/#{agent_name&.downcase}/card-<number>.md`
 
@@ -696,8 +697,20 @@ module Brainiac
               whoever picks up a card — that is NOT a structural change. Put it in the
               Basecamp summary instead. Do not comment it onto the Fizzy card.
 
-              ### Required: post your summary to Basecamp (the ONLY place your review goes)
-              `basecamp comments create #{epic['basecamp_todolist_id']} "Epic review after ##{completed_card_number}: <your summary, including any scope/heads-up notes for remaining cards>" --in #{epic['basecamp_project_id']}`
+              ### Post to Basecamp ONLY when something changed
+              **Only post to Basecamp if this review resulted in an actual change or a
+              finding worth flagging** — e.g. you edited a dependency, marked a task
+              obsolete, created a new card, or spotted a scope/plan issue the team needs
+              to know about.
+
+              **If nothing changed — the remaining plan still makes sense as-is and you
+              took no structural action — do NOT post anything.** A "no changes needed"
+              checkpoint comment is just noise. Stay silent and let the callback advance
+              the epic. Silence is the correct outcome for a healthy plan.
+
+              When you DO have something to report, post it to Basecamp (the ONLY place
+              your review narrative goes — never a Fizzy card):
+              `basecamp comments create #{epic['basecamp_todolist_id']} "Epic review after ##{completed_card_number}: <what changed and why>" --in #{epic['basecamp_project_id']}`
 
               Keep it concise — this is a checkpoint, not a full analysis.
             PROMPT
