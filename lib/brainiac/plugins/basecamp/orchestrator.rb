@@ -669,17 +669,35 @@ module Brainiac
               ### Your job:
               1. Read the memory files for completed tasks to understand what was implemented
               2. Check if remaining tasks still make sense given the implementation decisions
-              3. **Update dependencies** if implementation created new relationships between tasks
-                 - Add `[depends:NNNN]` to a Fizzy card title if it now depends on another card
-                 - Remove dependencies that are no longer needed
-              4. If a remaining task is now obsolete, update its Fizzy card with a comment explaining why
-              5. If a remaining task needs different scope, update its Fizzy card description
-              6. If new tasks are needed, create new Fizzy cards (tag with the project)
+              3. Decide whether any structural changes to the plan are needed (see allowed actions below)
 
               Memory files are at: `~/.brainiac/brain/memory/#{agent_name&.downcase}/card-<number>.md`
 
-              After reviewing, post a brief summary comment on the Basecamp todolist:
-              `basecamp comments create #{epic['basecamp_todolist_id']} "Epic review after ##{completed_card_number}: <your summary>" --in #{epic['basecamp_project_id']}`
+              ### ⚠️ Where your output goes — READ THIS CAREFULLY
+              This is an **epic-level checkpoint**. Your review summary, observations,
+              scope notes, dependency reasoning, and "heads-up for the implementer"
+              comments belong **ONLY on the Basecamp todolist** — NOT on any Fizzy card.
+
+              **Do NOT post epic-review commentary, scope notes, or "heads-up" comments
+              on Fizzy cards.** Those cards belong to the agents who will implement them;
+              posting review chatter there clutters the card and confuses the implementer.
+              All of your narrative goes to Basecamp via the command below.
+
+              ### Allowed Fizzy edits (structural changes only — NOT commentary)
+              Only touch a Fizzy card when there is a concrete, actionable structural change:
+              - **Dependencies changed:** add/remove `[depends:NNNN]` in the card *title*
+                if implementation created or removed a real dependency.
+              - **Task obsolete:** if a remaining task is now fully redundant, close it or
+                post a one-line comment stating it is obsolete and why.
+              - **New task needed:** create a new Fizzy card (tag with the project) if a gap
+                was discovered.
+
+              If your observation is just context, scope guidance, or a heads-up for
+              whoever picks up a card — that is NOT a structural change. Put it in the
+              Basecamp summary instead. Do not comment it onto the Fizzy card.
+
+              ### Required: post your summary to Basecamp (the ONLY place your review goes)
+              `basecamp comments create #{epic['basecamp_todolist_id']} "Epic review after ##{completed_card_number}: <your summary, including any scope/heads-up notes for remaining cards>" --in #{epic['basecamp_project_id']}`
 
               Keep it concise — this is a checkpoint, not a full analysis.
             PROMPT
