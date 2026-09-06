@@ -646,7 +646,60 @@ module Brainiac
             # Ensure epic memory exists (in case this epic started before the feature)
             EpicMemory.ensure_exists_for(epic)
 
-            # Build the review prompt
+            prompt = build_epic_review_prompt(epic, completed_card_number, remaining_tasks)
+
+            # Get project config for the agent
+            task = epic["tasks"].find { |t| t["fizzy_card"] == completed_card_number.to_i }
+            project_key = task&.dig("project") || Config.brainiac_project_for(epic["basecamp_project_id"])
+            projects_file = File.join(BRAINIAC_DIR, "projects.json")
+            projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
+            project_config = projects[project_key] || {}
+            repo_path = project_config["repo_path"] || Dir.pwd
+
+            # Spawn the review agent
+            Thread.new do
+              card_key = "epic-review-#{epic['basecamp_todolist_id']}"
+
+              begin
+                pid, log_file = if Object.respond_to?(:run_agent, true)
+                                  Object.send(:run_agent,
+                                              prompt,
+                                              project_config: project_config,
+                                              chdir: repo_path,
+                                              log_name: "epic-review-#{completed_card_number}",
+                                              agent_name: agent_name,
+                                              source: :basecamp,
+                                              card_number: completed_card_number)
+                                end
+
+                # Register session in SessionRegistry for liveness tracking
+                if pid
+                  SessionRegistry.register_session(
+                    card_key, pid,
+                    log_file: log_file,
+                    agent_name: agent_name,
+                    epic_id: epic["id"],
+                    card_number: completed_card_number
+                  )
+                end
+
+                # Wait for the review to complete
+                Process.wait(pid) if pid
+
+                LOG.info "[Basecamp:Orchestrator] Epic review completed for card ##{completed_card_number}" if defined?(LOG)
+              rescue StandardError => e
+                LOG.error "[Basecamp:Orchestrator] Epic review failed: #{e.message}" if defined?(LOG)
+              ensure
+                # Call the callback to dispatch next tasks
+                callback&.call
+              end
+            end
+          end
+
+          # Build the epic-review prompt for the dispatched agent. Extracted from
+          # dispatch_epic_review to keep that method focused on orchestration.
+          def build_epic_review_prompt(epic, completed_card_number, remaining_tasks)
+            agent_name = epic["agent"]
             completed_tasks = epic["tasks"].select { |t| t["status"] == "complete" }
             completed_summary = completed_tasks.map { |t| "- ##{t['fizzy_card']}: #{t['title']}" }.join("\n")
             remaining_summary = remaining_tasks.map do |t|
@@ -655,7 +708,7 @@ module Brainiac
               "- ##{t['fizzy_card']}: #{t['title']}#{dep_str}"
             end.join("\n")
 
-            prompt = <<~PROMPT
+            <<~PROMPT
               ## Epic Review: #{epic['title']}
 
               Card ##{completed_card_number} just completed. Before dispatching the next task(s), review the epic state.
@@ -714,56 +767,8 @@ module Brainiac
 
               Keep it concise — this is a checkpoint, not a full analysis.
             PROMPT
-
-            # Get project config for the agent
-            task = epic["tasks"].find { |t| t["fizzy_card"] == completed_card_number.to_i }
-            project_key = task&.dig("project") || Config.brainiac_project_for(epic["basecamp_project_id"])
-            projects_file = File.join(BRAINIAC_DIR, "projects.json")
-            projects = File.exist?(projects_file) ? JSON.parse(File.read(projects_file)) : {}
-            project_config = projects[project_key] || {}
-            repo_path = project_config["repo_path"] || Dir.pwd
-
-            # Spawn the review agent
-            Thread.new do
-              card_key = "epic-review-#{epic['basecamp_todolist_id']}"
-
-              begin
-                pid, log_file = if Object.respond_to?(:run_agent, true)
-                                  Object.send(:run_agent,
-                                              prompt,
-                                              project_config: project_config,
-                                              chdir: repo_path,
-                                              log_name: "epic-review-#{completed_card_number}",
-                                              agent_name: agent_name,
-                                              source: :basecamp,
-                                              card_number: completed_card_number)
-                                end
-
-                # Register session in SessionRegistry for liveness tracking
-                if pid
-                  SessionRegistry.register_session(
-                    card_key, pid,
-                    log_file: log_file,
-                    agent_name: agent_name,
-                    epic_id: epic["id"],
-                    card_number: completed_card_number
-                  )
-                end
-
-                # Wait for the review to complete
-                Process.wait(pid) if pid
-
-                LOG.info "[Basecamp:Orchestrator] Epic review completed for card ##{completed_card_number}" if defined?(LOG)
-              rescue StandardError => e
-                LOG.error "[Basecamp:Orchestrator] Epic review failed: #{e.message}" if defined?(LOG)
-              ensure
-                # Call the callback to dispatch next tasks
-                callback&.call
-              end
-            end
           end
 
-          # Mark a Basecamp todo as complete.
           def mark_todo_complete(epic, card_number)
             task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
             return unless task && task["todo_id"]
