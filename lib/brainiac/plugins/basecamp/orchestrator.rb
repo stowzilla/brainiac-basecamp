@@ -646,43 +646,7 @@ module Brainiac
             # Ensure epic memory exists (in case this epic started before the feature)
             EpicMemory.ensure_exists_for(epic)
 
-            # Build the review prompt
-            completed_tasks = epic["tasks"].select { |t| t["status"] == "complete" }
-            completed_summary = completed_tasks.map { |t| "- ##{t['fizzy_card']}: #{t['title']}" }.join("\n")
-            remaining_summary = remaining_tasks.map do |t|
-              deps = t["depends_on"] || []
-              dep_str = deps.any? ? " [depends: #{deps.map { |d| "##{d}" }.join(', ')}]" : ""
-              "- ##{t['fizzy_card']}: #{t['title']}#{dep_str}"
-            end.join("\n")
-
-            prompt = <<~PROMPT
-              ## Epic Review: #{epic['title']}
-
-              Card ##{completed_card_number} just completed. Before dispatching the next task(s), review the epic state.
-
-              ### Completed tasks:
-              #{completed_summary}
-
-              ### Remaining tasks (with current dependencies):
-              #{remaining_summary}
-
-              ### Your job:
-              1. Read the memory files for completed tasks to understand what was implemented
-              2. Check if remaining tasks still make sense given the implementation decisions
-              3. **Update dependencies** if implementation created new relationships between tasks
-                 - Add `[depends:NNNN]` to a Fizzy card title if it now depends on another card
-                 - Remove dependencies that are no longer needed
-              4. If a remaining task is now obsolete, update its Fizzy card with a comment explaining why
-              5. If a remaining task needs different scope, update its Fizzy card description
-              6. If new tasks are needed, create new Fizzy cards (tag with the project)
-
-              Memory files are at: `~/.brainiac/brain/memory/#{agent_name&.downcase}/card-<number>.md`
-
-              After reviewing, post a brief summary comment on the Basecamp todolist:
-              `basecamp comments create #{epic['basecamp_todolist_id']} "Epic review after ##{completed_card_number}: <your summary>" --in #{epic['basecamp_project_id']}`
-
-              Keep it concise — this is a checkpoint, not a full analysis.
-            PROMPT
+            prompt = build_epic_review_prompt(epic, completed_card_number, remaining_tasks)
 
             # Get project config for the agent
             task = epic["tasks"].find { |t| t["fizzy_card"] == completed_card_number.to_i }
@@ -732,7 +696,79 @@ module Brainiac
             end
           end
 
-          # Mark a Basecamp todo as complete.
+          # Build the epic-review prompt for the dispatched agent. Extracted from
+          # dispatch_epic_review to keep that method focused on orchestration.
+          def build_epic_review_prompt(epic, completed_card_number, remaining_tasks)
+            agent_name = epic["agent"]
+            completed_tasks = epic["tasks"].select { |t| t["status"] == "complete" }
+            completed_summary = completed_tasks.map { |t| "- ##{t['fizzy_card']}: #{t['title']}" }.join("\n")
+            remaining_summary = remaining_tasks.map do |t|
+              deps = t["depends_on"] || []
+              dep_str = deps.any? ? " [depends: #{deps.map { |d| "##{d}" }.join(', ')}]" : ""
+              "- ##{t['fizzy_card']}: #{t['title']}#{dep_str}"
+            end.join("\n")
+
+            <<~PROMPT
+              ## Epic Review: #{epic['title']}
+
+              Card ##{completed_card_number} just completed. Before dispatching the next task(s), review the epic state.
+
+              ### Completed tasks:
+              #{completed_summary}
+
+              ### Remaining tasks (with current dependencies):
+              #{remaining_summary}
+
+              ### Your job:
+              1. Read the memory files for completed tasks to understand what was implemented
+              2. Check if remaining tasks still make sense given the implementation decisions
+              3. Decide whether any structural changes to the plan are needed (see allowed actions below)
+              4. If — and only if — something changed or needs flagging, post to Basecamp (see below). Otherwise, stay silent.
+
+              Memory files are at: `~/.brainiac/brain/memory/#{agent_name&.downcase}/card-<number>.md`
+
+              ### ⚠️ Where your output goes — READ THIS CAREFULLY
+              This is an **epic-level checkpoint**. Your review summary, observations,
+              scope notes, dependency reasoning, and "heads-up for the implementer"
+              comments belong **ONLY on the Basecamp todolist** — NOT on any Fizzy card.
+
+              **Do NOT post epic-review commentary, scope notes, or "heads-up" comments
+              on Fizzy cards.** Those cards belong to the agents who will implement them;
+              posting review chatter there clutters the card and confuses the implementer.
+              All of your narrative goes to Basecamp via the command below.
+
+              ### Allowed Fizzy edits (structural changes only — NOT commentary)
+              Only touch a Fizzy card when there is a concrete, actionable structural change:
+              - **Dependencies changed:** add/remove `[depends:NNNN]` in the card *title*
+                if implementation created or removed a real dependency.
+              - **Task obsolete:** if a remaining task is now fully redundant, close it or
+                post a one-line comment stating it is obsolete and why.
+              - **New task needed:** create a new Fizzy card (tag with the project) if a gap
+                was discovered.
+
+              If your observation is just context, scope guidance, or a heads-up for
+              whoever picks up a card — that is NOT a structural change. Put it in the
+              Basecamp summary instead. Do not comment it onto the Fizzy card.
+
+              ### Post to Basecamp ONLY when something changed
+              **Only post to Basecamp if this review resulted in an actual change or a
+              finding worth flagging** — e.g. you edited a dependency, marked a task
+              obsolete, created a new card, or spotted a scope/plan issue the team needs
+              to know about.
+
+              **If nothing changed — the remaining plan still makes sense as-is and you
+              took no structural action — do NOT post anything.** A "no changes needed"
+              checkpoint comment is just noise. Stay silent and let the callback advance
+              the epic. Silence is the correct outcome for a healthy plan.
+
+              When you DO have something to report, post it to Basecamp (the ONLY place
+              your review narrative goes — never a Fizzy card):
+              `basecamp comments create #{epic['basecamp_todolist_id']} "Epic review after ##{completed_card_number}: <what changed and why>" --in #{epic['basecamp_project_id']}`
+
+              Keep it concise — this is a checkpoint, not a full analysis.
+            PROMPT
+          end
+
           def mark_todo_complete(epic, card_number)
             task = epic["tasks"].find { |t| t["fizzy_card"] == card_number.to_i }
             return unless task && task["todo_id"]
