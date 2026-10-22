@@ -310,11 +310,44 @@ module Brainiac
               dispatch_card(epic, task)
             end
 
-            # Log summary
-            LOG.info "[Basecamp:Orchestrator] Epic '#{epic['title']}': " \
-                     "#{epic['tasks'].count { |t| t['status'] == 'complete' }}/#{epic['tasks'].size} complete, " \
-                     "#{ready_to_dispatch.size} dispatched, " \
-                     "#{epic['tasks'].count { |t| t['status'] == 'in_flight' }} in-flight" if defined?(LOG)
+            # Log summary.
+            #
+            # The in-flight number reports *live* implementation sessions, not the
+            # raw count of tasks whose persisted status is "in_flight". Those two
+            # diverge whenever a session dies but its status has not yet been walked
+            # back to :pending (which only happens once stale_dispatch? ages the task
+            # out past STALE_DISPATCH_TIMEOUT on a later recovery sweep). Logging the
+            # raw status count made the summary claim N agents were working when the
+            # sessions were already dead. When the counts disagree, we surface the
+            # stale-status tally in parentheses so the lag is visible rather than
+            # silently misleading.
+            if defined?(LOG)
+              live = live_inflight_count(epic)
+              stale = status_inflight_count(epic)
+              inflight_desc = live == stale ? "#{live} in-flight" : "#{live} in-flight (#{stale} status, stale)"
+              LOG.info "[Basecamp:Orchestrator] Epic '#{epic['title']}': " \
+                       "#{epic['tasks'].count { |t| t['status'] == 'complete' }}/#{epic['tasks'].size} complete, " \
+                       "#{ready_to_dispatch.size} dispatched, " \
+                       "#{inflight_desc}"
+            end
+          end
+
+          # Number of tasks currently marked :in_flight that have a *live*
+          # implementation session. This is the truthful "how many agents are
+          # actually working" count — it defers to SessionRegistry, the same
+          # authority the dispatcher uses, instead of trusting the status field.
+          def live_inflight_count(epic)
+            epic["tasks"].count do |t|
+              t["status"] == "in_flight" && SessionRegistry.implementation_alive?(t["fizzy_card"])
+            end
+          end
+
+          # Number of tasks whose persisted status is :in_flight, regardless of
+          # session liveness. Diagnostic only — a value larger than
+          # live_inflight_count means some sessions died but their status has not
+          # yet aged out via stale_dispatch?.
+          def status_inflight_count(epic)
+            epic["tasks"].count { |t| t["status"] == "in_flight" }
           end
 
           # Dispatch a Fizzy card to the appropriate agent.
