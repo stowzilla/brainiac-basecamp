@@ -78,7 +78,7 @@ This prevents wasted work when early implementation decisions change the plan.
 
 ## Prerequisites
 
-- [Basecamp CLI](https://github.com/stowzilla/basecamp-cli) installed and authenticated
+- [Basecamp CLI](https://github.com/basecamp/basecamp-cli) installed (`curl -fsSL https://basecamp.com/install-cli | bash`) and authenticated (`basecamp auth login`)
 - A Basecamp bot user account (for webhook-triggered orchestration)
 - brainiac-fizzy plugin (cards already exist in Fizzy)
 - brainiac-github plugin (required for `on_pr_merge` and `epic_branch` modes)
@@ -98,19 +98,7 @@ brainiac basecamp setup
 brainiac basecamp set fizzy-account-id <your-fizzy-org-id>
 ```
 
-### Step 2: Register Bot Account
-
-Find your bot's Basecamp person ID:
-```bash
-basecamp people list --jq '.data[] | select(.name | contains("Galen")) | {id, name}'
-```
-
-Register it:
-```bash
-brainiac basecamp bot add my-server <person-id> Galen
-```
-
-### Step 3: Map Projects
+### Step 2: Map Projects
 
 Find your Basecamp project ID:
 ```bash
@@ -120,6 +108,22 @@ basecamp projects list --jq '.data[] | {id, name}'
 Map it to your Brainiac project:
 ```bash
 brainiac basecamp projects map stowzilla <basecamp-project-id>
+```
+
+### Step 3: Register Bot Account
+
+**Adding an agent:** if the agent is created with Brainiac core, you can skip this step. `brainiac agent create "Galen"` (or `brainiac agent setup galen --only basecamp` for an existing agent) finds the agent's Basecamp person by name — or, after a confirm prompt, invites it by email (`--email` / `agent_email_template`) — adds it to every mapped project, and writes the `bot_accounts` entry. It's idempotent; map projects first. Pass `--skip basecamp` to leave Basecamp out.
+
+**Alternative (manual):** register an existing Basecamp person yourself:
+```bash
+brainiac basecamp bot add Galen                       # auto-resolves the person ID by name
+brainiac basecamp bot add my-server <person-id> Galen # explicit person ID
+brainiac basecamp bot sync                            # resolve every agent in ~/.brainiac/agents.json
+```
+
+Find a person ID by hand with:
+```bash
+basecamp people list --jq '.data[] | select(.name | contains("Galen")) | {id, name}'
 ```
 
 ### Step 4: Set Review Gate Mode
@@ -169,8 +173,10 @@ The `channel` can be any notification backend that subscribes to the `:notify` h
 
 ```bash
 basecamp webhooks create "https://your-ngrok.ngrok-free.app/basecamp" \
-  --types "Todo,Todolist" --in <basecamp-project-id>
+  --types "Todo,Todolist,Comment" --in <basecamp-project-id>
 ```
+
+Already have webhooks? `brainiac basecamp webhook sync` adds any missing event types to the existing `/basecamp` webhooks on every mapped project.
 
 ### Step 8: Restart Brainiac
 
@@ -289,15 +295,27 @@ brainiac basecamp setup                              # Interactive setup
 brainiac basecamp config                             # Show config
 brainiac basecamp status                             # Plugin health check
 brainiac basecamp epics                              # List active epics
-brainiac basecamp epics --all                        # Include completed
+brainiac basecamp epics --all [-v]                   # Include completed (-v for detail)
 brainiac basecamp deploy <epic-id> [env]             # Deploy epic to environment
-brainiac basecamp bot add <name> <id> <agent>        # Add bot account
+brainiac basecamp link <card> <url>                  # Link a Fizzy card to a Basecamp todo
+brainiac basecamp bot add <agent>                    # Add bot account (auto-resolves person ID)
+brainiac basecamp bot add <name> <id> <agent>        # Add bot account with explicit person ID
+brainiac basecamp bot sync                           # Re-resolve bot person IDs from agents.json
 brainiac basecamp bot list                           # List bot accounts
+brainiac basecamp bot remove <name>                  # Remove a bot account
 brainiac basecamp projects map <key> <bc-id>         # Map project
 brainiac basecamp projects list                      # List mappings
+brainiac basecamp projects unmap <key>               # Remove a mapping
 brainiac basecamp set fizzy-account-id <id>          # Set Fizzy account ID
 brainiac basecamp set review-gate <mode>             # on_complete, on_pr_merge, epic_branch
 brainiac basecamp set epic-prefix <prefix>           # Epic detection prefix
+brainiac basecamp set ephemeral-deploys <on|off>     # Ephemeral Belt envs for `deploy`-tagged cards
+brainiac basecamp set parent-env <project> <env>     # Parent env ephemeral envs are cloned from
+brainiac basecamp reset task <card> [--to <status>]  # Reset a task (default: pending)
+brainiac basecamp reset epic <todolist-id> [--to <status>]
+brainiac basecamp reset gates <card>                 # Clear gate approvals and re-dispatch
+brainiac basecamp scrap <todolist-id> [--confirm]    # Tear down an epic (cards, branches, state)
+brainiac basecamp webhook sync                       # Ensure webhooks have required event types
 ```
 
 ## API Endpoints
@@ -312,6 +330,14 @@ curl "http://localhost:4567/api/basecamp/epics?status=all"
 
 # Specific epic
 curl http://localhost:4567/api/basecamp/epics/<todolist-id>
+
+# Start an epic manually (no webhook)
+curl -X POST http://localhost:4567/api/basecamp/epics \
+  -d '{"todolist_id": "...", "project_id": "...", "agent": "Galen", "title": "Epic: ..."}'
+
+# Pause / resume
+curl -X POST http://localhost:4567/api/basecamp/epics/<todolist-id>/pause
+curl -X POST http://localhost:4567/api/basecamp/epics/<todolist-id>/resume
 ```
 
 ## Self-Healing on Restart
@@ -336,6 +362,7 @@ No manual intervention needed — just restart and it picks up where it left off
 | `:pr_merged` | Advances epic if review gate = `on_pr_merge` |
 | `:pr_merged_to_branch` | Advances epic when PR merges to epic branch |
 | `:pr_review_received` | Tracks gate approvals; triggers final decision when all gates pass |
+| `:pr_synchronized` | Re-triggers review gates after fixes are pushed |
 | `:build_brain_context` | Injects epic context + memory references into agent prompts |
 | `:resolve_base_branch` | Returns epic branch as worktree base |
 | `:resolve_pr_target` | Returns epic branch as PR target |
