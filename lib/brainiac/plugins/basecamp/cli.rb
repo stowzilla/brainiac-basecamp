@@ -2,6 +2,7 @@
 
 require "json"
 require "open3"
+require_relative "agent_setup"
 require_relative "config"
 require_relative "epic"
 
@@ -1534,6 +1535,14 @@ module Brainiac
 
       def self.cli(args)
         Cli.run(args)
+      end
+
+      # Called by brainiac CLI after `agent create` / `agent setup` — finds or
+      # invites the agent's Basecamp person (see AgentSetup). Safe to re-run.
+      def self.on_agent_created(agent_key, entry)
+        AgentSetup.run(agent_key, entry)
+      rescue JSON::ParserError => e
+        puts "  ⚠ Could not update basecamp.json: #{e.message}"
       end
 
       def self.completions
