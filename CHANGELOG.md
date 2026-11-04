@@ -2,6 +2,12 @@
 
 All notable changes to brainiac-basecamp will be documented in this file.
 
+## [0.0.29] - 2026-11-04
+
+### Added
+
+- **Agent onboarding (`on_agent_created`).** `brainiac agent create` / `brainiac agent setup` now find the agent's Basecamp person by name, or invite it by email (after a y/N confirm), grant it every mapped project, and write its `bot_accounts` entry. Idempotent; skipped quietly when no email is available.
+
 ## [0.0.27] - 2026-09-03
 
 ### Added
